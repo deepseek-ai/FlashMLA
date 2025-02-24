@@ -1,0 +1,7 @@
+recursive-include flash_mla *.pyi
+recursive-include flash_mla *.typed
+include LICENSE
+
+# Include source files in sdist
+include .gitmodules
+recursive-include csrc *

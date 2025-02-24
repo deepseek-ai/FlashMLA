@@ -2,7 +2,7 @@ from typing import Optional, Tuple
 
 import torch
 
-import flash_mla_cuda
+from flash_mla import flash_mla_cuda
 
 
 def get_mla_metadata(
