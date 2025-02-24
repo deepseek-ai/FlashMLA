@@ -28,7 +28,7 @@ constexpr auto getSmemLayoutK() {
     }
 }
 
-template<int kHeadDim_, int kBlockM_, int kBlockN_, int kNWarps_, typename elem_type = cutlass::bfloat16_t, int kHeadDimV_ = 0>
+template<int kHeadDim_, int kBlockM_, int kBlockN_, int kNWarps_, typename elem_type=cutlass::bfloat16_t, int kHeadDimV_ = 0>
 struct Flash_fwd_kernel_traits_mla {
     using Element = elem_type;
     using ElementAccum = float;
