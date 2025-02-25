@@ -11,7 +11,9 @@ Currently released:
 ### Install
 
 ```bash
-python setup.py install
+python3 -m pip install --upgrade pip setuptools
+python3 -m pip install torch pybind11 --index-url https://download.pytorch.org/whl/cu126
+python3 -m pip install --no-build-isolation --editable .
 ```
 
 ### Benchmark
@@ -52,7 +54,7 @@ FlashMLA is inspired by [FlashAttention 2&3](https://github.com/dao-AILab/flash-
 
 ```bibtex
 @misc{flashmla2025,
-      title={FlashMLA: Efficient MLA decoding kernel}, 
+      title={FlashMLA: Efficient MLA decoding kernel},
       author={Jiashi Li},
       year={2025},
       publisher = {GitHub},

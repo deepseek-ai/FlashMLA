@@ -3,7 +3,7 @@ from pathlib import Path
 from datetime import datetime
 import subprocess
 
-from setuptools import setup, find_packages
+from setuptools import setup
 
 from torch.utils.cpp_extension import (
     BuildExtension,
@@ -51,7 +51,7 @@ else:
 ext_modules = []
 ext_modules.append(
     CUDAExtension(
-        name="flash_mla_cuda",
+        name="flash_mla.flash_mla_cuda",
         sources=get_sources(),
         extra_compile_args={
             "cxx": cxx_args + get_features_args(),
@@ -92,9 +92,8 @@ except Exception as _:
 
 
 setup(
-    name="flash_mla",
+    name="flash-mla",
     version="1.0.0" + rev,
-    packages=find_packages(include=['flash_mla']),
     ext_modules=ext_modules,
     cmdclass={"build_ext": BuildExtension},
 )

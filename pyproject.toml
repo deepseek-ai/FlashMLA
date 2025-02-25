@@ -1,0 +1,64 @@
+# Package ######################################################################
+
+[build-system]
+requires = ["setuptools", "pybind11", "torch ~= 2.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "flash-mla"
+description = "FlashMLA: An efficient MLA decoding kernel for Hopper GPUs."
+readme = "README.md"
+requires-python = ">= 3.8"
+authors = [
+    { name = "FlashMLA Contributors" },
+    { name = "Jiashi Li", email = "450993438@qq.com" },
+]
+license = { text = "MIT" }
+keywords = [
+    "Multi-head Latent Attention",
+    "MLA",
+    "Flash MLA",
+    "Flash Attention",
+    "CUDA",
+    "kernel",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: C++",
+    "Programming Language :: CUDA",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: Implementation :: CPython",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux",
+    "Environment :: GPU :: NVIDIA CUDA :: 12",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Education",
+    "Intended Audience :: Science/Research",
+]
+dependencies = ["torch ~= 2.0"]
+dynamic = ["version"]
+
+[project.urls]
+Homepage = "https://github.com/deepseek-ai/FlashMLA"
+Repository = "https://github.com/deepseek-ai/FlashMLA"
+"Bug Report" = "https://github.com/deepseek-ai/FlashMLA/issues"
+
+[project.optional-dependencies]
+test = ["triton"]
+benchmark = ["triton"]
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+include = ["flash_mla", "flash_mla.*"]
+
+[tool.setuptools.package-data]
+flash_mla = ['*.so', '*.pyd']
