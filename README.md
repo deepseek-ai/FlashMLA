@@ -51,6 +51,12 @@ FlashMLA is inspired by [FlashAttention 2&3](https://github.com/dao-AILab/flash-
 
 ## Community Support
 
+### AMD Instinct
+For AMD Instinct GPUs, visit the official website: [AMD Instinct](https://www.amd.com/en/products/accelerators/instinct.html).
+
+The corresponding FlashMLA version can be found at: [AITER/MLA](https://github.com/ROCm/aiter/blob/main/aiter/mla.py)
+
+
 ### MetaX
 For MetaX GPUs, visit the official website: [MetaX](https://www.metax-tech.com).
 
