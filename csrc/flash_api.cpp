@@ -71,7 +71,9 @@ mha_fwd_kvcache_mla(
     const float softmax_scale,
     bool is_causal,
     const at::Tensor &tile_scheduler_metadata,   // num_sm_parts x TileSchedulerMetaDataSize
-    const at::Tensor &num_splits                 // batch_size + 1
+    const at::Tensor &num_splits,                 // batch_size + 1
+    c10::optional<const at::Tensor> &descale_q_,  // batch_size
+    c10::optional<const at::Tensor> &descale_k_  // batch_size
 ) {
     auto dprops = at::cuda::getCurrentDeviceProperties();
     bool is_sm90 = dprops->major == 9 && dprops->minor == 0;
@@ -79,8 +81,9 @@ mha_fwd_kvcache_mla(
 
     at::Tensor vcache = vcache_.has_value() ? vcache_.value() : kcache;
 
-    auto q_dtype = q.dtype();
-    TORCH_CHECK(kcache.dtype() == q_dtype, "query and key must have the same dtype");
+    auto q_dtype = q.scalar_type();
+    TORCH_CHECK(q_dtype == torch::kBFloat16 || q_dtype == torch::kHalf || q_dtype == torch::kFloat8_e4m3fn);
+    TORCH_CHECK(kcache.scalar_type() == q_dtype, "query and key must have the same dtype");
 
     CHECK_DEVICE(q); CHECK_DEVICE(kcache); CHECK_DEVICE(vcache);
 
@@ -107,6 +110,20 @@ mha_fwd_kvcache_mla(
     TORCH_CHECK(batch_size > 0, "batch size must be postive");
     TORCH_CHECK(num_heads_ori % num_heads_k == 0, "Number of heads in key/value must divide number of heads in query");
 
+    if (q_dtype == torch::kFloat8_e4m3fn) {
+        TORCH_CHECK(descale_q_.has_value() && descale_k_.has_value(), "descale is required when input dtype is fp8");
+        auto descale_q = descale_q_.value();
+        auto descale_k = descale_k_.value();
+        CHECK_DEVICE(descale_q);
+        CHECK_DEVICE(descale_k);
+        TORCH_CHECK(descale_q.stride(-1) == 1);
+        TORCH_CHECK(descale_k.stride(-1) == 1);
+        TORCH_CHECK(descale_q.dtype() == torch::kFloat);
+        TORCH_CHECK(descale_k.dtype() == torch::kFloat);
+        CHECK_SHAPE(descale_q, 1);
+        CHECK_SHAPE(descale_k, 1);
+    }
+
     if (seqlen_q_ori == 1) { is_causal = false; }
 
     const int ngroups = num_heads_ori / num_heads_k;
@@ -130,7 +147,8 @@ mha_fwd_kvcache_mla(
     at::cuda::CUDAGuard device_guard{(char)q.get_device()};
 
     auto opts = q.options();
-    at::Tensor out = torch::empty({batch_size, seqlen_q, num_heads, head_size_v}, opts);
+    auto out_type = (q_dtype == torch::kFloat8_e4m3fn) ? torch::kBFloat16 : q_dtype;
+    at::Tensor out = torch::empty({batch_size, seqlen_q, num_heads, head_size_v}, opts.dtype(out_type));
     at::Tensor softmax_lse = torch::empty({batch_size, num_heads, seqlen_q}, opts.dtype(at::kFloat));
 
     Flash_fwd_mla_params params = {};
@@ -170,6 +188,11 @@ mha_fwd_kvcache_mla(
     params.block_table_batch_stride = block_table.stride(0);
     params.page_block_size = page_block_size;
 
+    if (q_dtype == torch::kFloat8_e4m3fn) {
+        params.descale_q_ptr = reinterpret_cast<float*>(descale_q_.value().data_ptr());
+        params.descale_k_ptr = reinterpret_cast<float*>(descale_k_.value().data_ptr());
+    }
+
     TORCH_CHECK(tile_scheduler_metadata.dtype() == torch::kInt32, "tile_scheduler_metadata must have dtype int32");
     TORCH_CHECK(tile_scheduler_metadata.size(1) == TileSchedulerMetaDataSize);
     CHECK_DEVICE(tile_scheduler_metadata);
@@ -189,12 +212,18 @@ mha_fwd_kvcache_mla(
     auto stream = at::cuda::getCurrentCUDAStream().stream();
     TORCH_CHECK(head_size == 576);
 
+    
     if (q_dtype == torch::kBFloat16) {
-        run_mha_fwd_splitkv_mla<cutlass::bfloat16_t, 576>(params, stream);
+        run_mha_fwd_splitkv_mla<cutlass::bfloat16_t, cutlass::bfloat16_t, 576>(params, stream);
     }
     #ifndef FLASH_MLA_DISABLE_FP16
     else if (q_dtype == torch::kHalf) {
-        run_mha_fwd_splitkv_mla<cutlass::half_t, 576>(params, stream);
+        run_mha_fwd_splitkv_mla<cutlass::half_t, cutlass::half_t, 576>(params, stream);
+    }
+    #endif
+    #ifndef FLASH_MLA_DISABLE_FP8
+    else if (q_dtype == torch::kFloat8_e4m3fn) {
+        run_mha_fwd_splitkv_mla<cutlass::float_e4m3_t, cutlass::bfloat16_t, 576>(params, stream);
     }
     #endif
     else {

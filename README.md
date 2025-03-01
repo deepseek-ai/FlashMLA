@@ -3,7 +3,7 @@
 FlashMLA is an efficient MLA decoding kernel for Hopper GPUs, optimized for variable-length sequences serving.
 
 Currently released:
-- BF16, FP16
+- BF16, FP16, E4M3
 - Paged kvcache with block size of 64
 
 ## Quick start

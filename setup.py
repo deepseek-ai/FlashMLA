@@ -12,6 +12,7 @@ from torch.utils.cpp_extension import (
 )
 
 DISABLE_FP16 = os.getenv("FLASH_MLA_DISABLE_FP16", "FALSE") == "TRUE"
+DISABLE_FP8  = os.getenv("FLASH_MLA_DISABLE_FP8", "FALSE") == "TRUE"
 
 
 def append_nvcc_threads(nvcc_extra_args):
@@ -28,6 +29,8 @@ def get_sources():
 
     if not DISABLE_FP16:
         sources.append("csrc/flash_fwd_mla_fp16_sm90.cu")
+    if not DISABLE_FP8:
+        sources.append("csrc/flash_fwd_mla_fp8_sm90.cu")
 
     return sources
 
@@ -36,6 +39,8 @@ def get_features_args():
     features_args = []
     if DISABLE_FP16:
         features_args.append("-DFLASH_MLA_DISABLE_FP16")
+    if DISABLE_FP8:
+        features_args.append("-DFLASH_MLA_DISABLE_FP8")
     return features_args
 
 
@@ -73,7 +78,8 @@ ext_modules.append(
                     "--expt-relaxed-constexpr",
                     "--expt-extended-lambda",
                     "--use_fast_math",
-                    "--ptxas-options=-v,--register-usage-level=10"
+                    "--ptxas-options=-v,--register-usage-level=10",
+                    "--ftemplate-backtrace-limit=0"
                 ]
                 + cc_flag
             ) + get_features_args(),

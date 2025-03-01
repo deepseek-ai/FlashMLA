@@ -12,27 +12,42 @@ using namespace cute;
 #include "softmax.h"
 #include "static_switch.h"
 #include "flash_mla.h"
+#include "fp8_transpose_v.h"
 
 
-template<typename PrecType, int DIM, int DIM2 = DIM>
+template<typename PrecType, int DIM, int DIM2 = DIM, cute::GMMA::Major major = GMMA::Major::K>
 constexpr auto getSmemLayoutK() {
     constexpr int headSizeBytes = sizeof(PrecType) * DIM;
     constexpr int headSizeBytes2 = sizeof(PrecType) * DIM2;
 
-    if constexpr (headSizeBytes % 128 == 0 && headSizeBytes2 % 128 == 0) {
-        return GMMA::Layout_K_SW128_Atom<PrecType>{};
-    } else if constexpr (headSizeBytes % 64 == 0 && headSizeBytes2 % 64 == 0) {
-        return GMMA::Layout_K_SW64_Atom<PrecType>{};
+    if constexpr (major == GMMA::Major::K) {
+        if constexpr (headSizeBytes % 128 == 0 && headSizeBytes2 % 128 == 0) {
+            return GMMA::Layout_K_SW128_Atom<PrecType>{};
+        } else if constexpr (headSizeBytes % 64 == 0 && headSizeBytes2 % 64 == 0) {
+            return GMMA::Layout_K_SW64_Atom<PrecType>{};
+        } else {
+            return GMMA::Layout_K_SW32_Atom<PrecType>{};
+        }
     } else {
-        return GMMA::Layout_K_SW32_Atom<PrecType>{};
+        if constexpr (headSizeBytes % 128 == 0 && headSizeBytes2 % 128 == 0) {
+            return GMMA::Layout_MN_SW128_Atom<PrecType>{};
+        } else if constexpr (headSizeBytes % 64 == 0 && headSizeBytes2 % 64 == 0) {
+            return GMMA::Layout_MN_SW64_Atom<PrecType>{};
+        } else {
+            return GMMA::Layout_MN_SW32_Atom<PrecType>{};
+        }
     }
+    
 }
 
-template<int kHeadDim_, int kBlockM_, int kBlockN_, int kNWarps_, typename elem_type=cutlass::bfloat16_t, int kHeadDimV_ = 0>
+template<int kHeadDim_, int kBlockM_, int kBlockN_, int kNWarps_, typename elem_type=cutlass::bfloat16_t, typename elem_type_o = cutlass::bfloat16_t, int kHeadDimV_ = 0>
 struct Flash_fwd_kernel_traits_mla {
     using Element = elem_type;
+    using ElementO = elem_type_o;
     using ElementAccum = float;
     using index_t = int64_t;
+    
+    static constexpr bool Is_FP8 = cute::is_same_v<Element, cutlass::float_e4m3_t>;
 
     static constexpr int kNWarps = kNWarps_;
     static constexpr int kNThreads = kNWarps * 32;
@@ -46,8 +61,12 @@ struct Flash_fwd_kernel_traits_mla {
     static constexpr int kHeadDimV = kHeadDimV_ != 0 ? kHeadDimV_ : kHeadDim;
     static_assert(kHeadDimV % 32 == 0);
     static_assert(kHeadDimV <= kHeadDim);
-    static constexpr int kBlockKSmem = kHeadDim % 64 == 0 ? 64 : 32;
-    static constexpr int kSwizzle = kBlockKSmem == 32 ? 2 : 3;
+
+    static constexpr int kBlockKSmem = Is_FP8 ? (kHeadDim % 128 == 0 ? 128 : 64) : (kHeadDim % 64 == 0 ? 64 : 32);
+    static constexpr int kBlockKSmemO = kHeadDim % 64 == 0 ? 64 : 32;
+    static constexpr int kSwizzleO = kBlockKSmemO == 32 ? 2 : 3;
+
+    static constexpr cute::GMMA::Major MmaMajorV = !Is_FP8 ? GMMA::Major::MN : GMMA::Major::K;
 
     using TiledMma = decltype(make_tiled_mma(
             cute::GMMA::ss_op_selector<Element, Element, ElementAccum, Shape<Int<kBlockM>, Int<kBlockN>, Int<kHeadDim>>,
@@ -57,7 +76,7 @@ struct Flash_fwd_kernel_traits_mla {
     static constexpr int AtomLayoutNO = kNThreads / kNThreadsS;
     using TiledMmaO = decltype(make_tiled_mma(
             cute::GMMA::rs_op_selector<Element, Element, ElementAccum, Shape<Int<kBlockM>, Int<kHeadDimV / AtomLayoutNO>, Int<kBlockN>>,
-                    GMMA::Major::K, GMMA::Major::MN>(),
+                    GMMA::Major::K, MmaMajorV>(),
             Layout<Shape<Int<kNWarpsS / 4>, Int<AtomLayoutNO>, _1>>{}));
 
     using SmemLayoutQ = decltype(tile_to_shape(
@@ -73,16 +92,20 @@ struct Flash_fwd_kernel_traits_mla {
             Shape<Int<kBlockN>, Int<kHeadDimV>>{}));
     using SmemLayoutVtransposed = decltype(composition(SmemLayoutV{}, make_layout(Shape<Int<kHeadDimV>, Int<kBlockN>>{}, GenRowMajor{})));
 
-    using SmemLayoutP = Layout<Shape<Shape<_2, _2>, Int<kNThreadsS>, _1, Int<kBlockN / 8>>>;
+    using SmemLayoutP = std::conditional_t<
+        Is_FP8,
+        Layout<Shape<Shape<_4, _2>, Int<kNThreadsS>, _1, _2, Int<kBlockN / 32>>>,
+        Layout<Shape<Shape<_2, _2>, Int<kNThreadsS>, _1, _2, Int<kBlockN / 16>>>
+    >;
     using SmemLayoutRow = Layout<Shape<_2, Int<kNThreadsS>>, Stride<_1, _2>>;
 
     using SmemLayoutAtomO = decltype(composition(
-            Swizzle<kSwizzle, 3, 3>{},
-            Layout<Shape<Int<8>, Int<kBlockKSmem>>, Stride<Int<kBlockKSmem>, _1>>{}));
+            Swizzle<kSwizzleO, 3, 3>{},
+            Layout<Shape<Int<8>, Int<kBlockKSmemO>>, Stride<Int<kBlockKSmemO>, _1>>{}));
     using SmemLayoutO = decltype(tile_to_shape(
             SmemLayoutAtomO{},
             Shape<Int<kBlockM>, Int<kHeadDimV>>{}));
-    using SmemCopyAtomO = Copy_Atom<SM90_U32x4_STSM_N, Element>;
+    using SmemCopyAtomO = Copy_Atom<SM90_U32x4_STSM_N, ElementO>;
     using SmemCopyAtomOaccum = Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<128>, ElementAccum>;
 
     static constexpr int kGmemElemsPerLoad = sizeof(cute::uint128_t) / sizeof(Element);
@@ -92,31 +115,43 @@ struct Flash_fwd_kernel_traits_mla {
     static constexpr int kNThreadsLoad = kNThreads - kNThreadsS;
     static_assert(kNThreadsLoad % kGmemThreadsPerRow == 0, "kNThreads must be a multiple of kGmemThreadsPerRow");
 
+    static constexpr int kGmemElemsPerLoadO = sizeof(cute::uint128_t) / sizeof(ElementO);
+    static_assert(kHeadDim % kGmemElemsPerLoadO == 0, "kHeadDim must be a multiple of kGmemElemsPerLoadO");
+    static constexpr int kGmemThreadsPerRowO = kBlockKSmemO / kGmemElemsPerLoadO;
+    static_assert(kNThreadsLoad % kGmemThreadsPerRowO == 0, "kNThreads must be a multiple of kGmemThreadsPerRowO");
+
     using GmemLayoutAtom = Layout<
             Shape<Int<kNThreadsLoad / kGmemThreadsPerRow>, Int<kGmemThreadsPerRow>>,
             Stride<Int<kGmemThreadsPerRow>, _1>>;
+
+
     using GmemTiledCopy = decltype(make_tiled_copy(
             Copy_Atom<Gmem_copy_struct, Element>{},
             GmemLayoutAtom{},
-            Layout<Shape<_1, _8>>{}));  // Val layout, 8 vals per read
+            Layout<Shape<_1, Int<kGmemElemsPerLoad>>>{}));  // Val layout, 8 vals per read
 
     using GmemLayoutAtomO = Layout<
-            Shape<Int<kNThreadsS / kGmemThreadsPerRow>, Int<kGmemThreadsPerRow>>,
-            Stride<Int<kGmemThreadsPerRow>, _1>>;
+            Shape<Int<kNThreadsS / kGmemThreadsPerRowO>, Int<kGmemThreadsPerRowO>>,
+            Stride<Int<kGmemThreadsPerRowO>, _1>>;
     using GmemTiledCopyO = decltype(make_tiled_copy(
-            Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<128>, Element>{},
+            Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<128>, ElementO>{},
             GmemLayoutAtomO{},
-            Layout<Shape<_1, _8>>{}));  // Val layout, 8 vals per store
+            Layout<Shape<_1, Int<kGmemElemsPerLoadO>>>{}));  // Val layout, 8 vals per store
 
     static constexpr int kGmemElemsPerLoadAccum = sizeof(cute::uint128_t) / sizeof(ElementAccum);
-    static constexpr int kGmemThreadsPerRowAccum = kBlockKSmem / kGmemElemsPerLoadAccum;
+    static constexpr int kGmemThreadsPerRowAccum = kBlockKSmemO / kGmemElemsPerLoadAccum;
     using GmemLayoutAtomOaccum = Layout<
             Shape<Int<kNThreadsS / kGmemThreadsPerRowAccum>, Int<kGmemThreadsPerRowAccum>>,
             Stride<Int<kGmemThreadsPerRowAccum>, _1>>;
     using GmemTiledCopyOaccum = decltype(make_tiled_copy(
             Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<128>, ElementAccum>{},
             GmemLayoutAtomOaccum{},
-            Layout<Shape<_1, _4>>{}));  // Val layout, 4 vals per store
+            Layout<Shape<_1, Int<kGmemElemsPerLoadAccum>>>{}));  // Val layout, 4 vals per store
+
+
+    // ------ for f8 ------
+    using SmemFp8Tranpose = SmemTransposeFp8_64x64<kBlockN, kHeadDimV, SmemLayoutK>;
+    using SmemLayoutVtMMa = typename SmemFp8Tranpose::SmemLayoutVt;
 };
 
 namespace flash {
@@ -125,10 +160,14 @@ using namespace cute;
 
 template<typename Kernel_traits>
 struct SharedStorageMLA {
+    using SmemV_t = std::conditional_t<Kernel_traits::Is_FP8,
+                                    cute::array_aligned<typename Kernel_traits::Element, cute::cosize_v<typename Kernel_traits::SmemLayoutVtMMa>>,
+                                    cute::array_aligned<typename Kernel_traits::Element, 0>>;
     union {
         struct {
             cute::array_aligned<typename Kernel_traits::Element, cute::cosize_v<typename Kernel_traits::SmemLayoutQ>> smem_q;
             cute::array_aligned<typename Kernel_traits::Element, cute::cosize_v<typename Kernel_traits::SmemLayoutK> * 2> smem_k;  // Double buffer
+            SmemV_t smem_vt;
             cute::array_aligned<typename Kernel_traits::Element, cute::cosize_v<typename Kernel_traits::SmemLayoutP>> smem_p;
             cute::array_aligned<typename Kernel_traits::ElementAccum, cute::cosize_v<typename Kernel_traits::SmemLayoutRow>> smem_scale;
         };
@@ -144,11 +183,11 @@ struct SharedStorageMLA {
 
 template<typename Kernel_traits, bool Split, typename SharedStorage, typename AccO, typename Softmax>
 __forceinline__ __device__ void store(const Flash_fwd_mla_params &params, const int bidb, const int bidh, const int m_block, const int n_split_idx,
-                                      SharedStorage &shared_storage, AccO tOrO, Softmax softmax) {
+                                      SharedStorage &shared_storage, AccO tOrO, Softmax softmax, float descale_k, float scale_softmax) {
     constexpr int kBlockM = Kernel_traits::kBlockM;
     constexpr int kHeadDimV = Kernel_traits::kHeadDimV;
     constexpr int kNThreadsS = Kernel_traits::kNThreadsS;
-    using Element = typename Kernel_traits::Element;
+    using Element = typename Kernel_traits::ElementO;
     using ElementAccum = typename Kernel_traits::ElementAccum;
     using index_t = typename Kernel_traits::index_t;
 
@@ -161,7 +200,7 @@ __forceinline__ __device__ void store(const Flash_fwd_mla_params &params, const 
 
     const int split_offset = __ldg(params.num_splits_ptr + bidb);
 
-    Tensor lse = softmax.template normalize_softmax_lse</*Is_dropout=*/false, Split>(tOrO, params.scale_softmax);
+    Tensor lse = softmax.template normalize_softmax_lse</*Is_dropout=*/false, Split>(tOrO, scale_softmax, descale_k);
 
     using ElementO = std::conditional_t<!Split, Element, ElementAccum>;
     Tensor sOaccum = make_tensor(make_smem_ptr(reinterpret_cast<ElementO *>(shared_storage.smem_o.data())), typename Kernel_traits::SmemLayoutO{}); // (SMEM_M,SMEM_N)
@@ -233,7 +272,7 @@ __forceinline__ __device__ void compute_attn_1rowblock_splitkv_mla(const Flash_f
                                                                    const int bidb, const int bidh, const int m_block,
                                                                    const int n_split_idx, const int seqlen_k,
                                                                    const int n_block_min, const int n_block_max, const bool NoSplit,
-                                                                   SharedStorage &shared_storage) {
+                                                                   SharedStorage &shared_storage, const float descale_k, const float scale_softmax, const float scale_softmax_log2) {
     constexpr int kBlockM = Kernel_traits::kBlockM;
     constexpr int kBlockN = Kernel_traits::kBlockN;
     constexpr int kHeadDim = Kernel_traits::kHeadDim;
@@ -249,11 +288,18 @@ __forceinline__ __device__ void compute_attn_1rowblock_splitkv_mla(const Flash_f
 
     Tensor sQ = make_tensor(make_smem_ptr(shared_storage.smem_q.data()), typename Kernel_traits::SmemLayoutQ{});
     Tensor sK = make_tensor(make_smem_ptr(shared_storage.smem_k.data()), typename Kernel_traits::SmemLayoutK{});
-    Tensor sV = make_tensor(make_smem_ptr(shared_storage.smem_k.data()), typename Kernel_traits::SmemLayoutV{});
-    Tensor sVt = make_tensor(make_smem_ptr(shared_storage.smem_k.data()), typename Kernel_traits::SmemLayoutVtransposed{});
+
+    auto sV = make_tensor(make_smem_ptr(shared_storage.smem_k.data()), typename Kernel_traits::SmemLayoutV{});
+    auto sVt = [&](){
+        if constexpr(Kernel_traits::Is_FP8){
+            return make_tensor(make_smem_ptr(shared_storage.smem_vt.data()), typename Kernel_traits::SmemLayoutVtMMa{});
+        } else {
+            return make_tensor(make_smem_ptr(shared_storage.smem_k.data()), typename Kernel_traits::SmemLayoutVtransposed{});
+        }
+    }();
 
     Tensor sP = make_tensor(make_smem_ptr(shared_storage.smem_p.data()), typename Kernel_traits::SmemLayoutP{});
-    Tensor tPsP = sP(_, tidx % kNThreadsS, _, _);
+    Tensor tPsP = sP(_, tidx % kNThreadsS, _, _, _);
     Tensor sScale_o = make_tensor(make_smem_ptr(shared_storage.smem_scale.data()), typename Kernel_traits::SmemLayoutRow{});
     Tensor tScale_osScale_o = sScale_o(_, tidx % kNThreadsS);
     Tensor sRow_max = make_tensor(make_smem_ptr(shared_storage.smem_max.data()), typename Kernel_traits::SmemLayoutRow{});
@@ -279,8 +325,13 @@ __forceinline__ __device__ void compute_attn_1rowblock_splitkv_mla(const Flash_f
         if (n_block % 2 == 1) {
             // Double buffer for sK
             constexpr int sK_offset = size(sK);
-            tSrK.data() = tSrK.data() + sK_offset / 8;
-            tOrVt.data() = tOrVt.data() + sK_offset / 8;
+            
+            if constexpr (Kernel_traits::Is_FP8) {
+                tSrK.data() = tSrK.data() + sK_offset / 16;
+            } else {
+                tSrK.data() = tSrK.data() + sK_offset / 8;
+                tOrVt.data() = tOrVt.data() + sK_offset / 8;
+            }
         }
 
         // We need masking on S for the very last block when K and V has length not multiple of kBlockN.
@@ -318,26 +369,37 @@ __forceinline__ __device__ void compute_attn_1rowblock_splitkv_mla(const Flash_f
 
             // We have key_padding_mask so we'll need to Check_inf
             Tensor scale_o = is_first_masking_step
-                             ? softmax.template softmax</*Is_first=*/true,  /*Check_inf=*/Is_causal>(tSrS, params.scale_softmax_log2)
+                             ? softmax.template softmax</*Is_first=*/true,  /*Check_inf=*/Is_causal>(tSrS, scale_softmax_log2)
                              : is_masking_step ?
-                               softmax.template softmax</*Is_first=*/false, /*Check_inf=*/Is_causal>(tSrS, params.scale_softmax_log2)
-                                               : softmax.template softmax</*Is_first=*/false, /*Check_inf=*//*Is_local=*/false>(tSrS, params.scale_softmax_log2);
+                               softmax.template softmax</*Is_first=*/false, /*Check_inf=*/Is_causal>(tSrS, scale_softmax_log2)
+                                               : softmax.template softmax</*Is_first=*/false, /*Check_inf=*//*Is_local=*/false>(tSrS, scale_softmax_log2);
 
-            Tensor rP = flash::convert_type<Element>(tSrS);
-            cute::copy(rP, tPsP);
+            if constexpr (Kernel_traits::Is_FP8) { flash::permute_Cregs_fp8(tSrS); }
+            Tensor tOrP_acc = make_tensor(tSrS.data(), flash::convert_layout_acc_Aregs<typename Kernel_traits::TiledMmaO>(tSrS.layout()));
+            Tensor tOrP = make_tensor_like<Element>(tOrP_acc);
+            convert_type_out(tOrP_acc, tOrP);
+            
+            cute::copy(tOrP, tPsP); // send Aregs of MMA1 instead of Cregs of MMA0
             cute::copy(scale_o, tScale_osScale_o);
 
             cutlass::arch::NamedBarrier::arrive(kNThreads, static_cast<int>(NamedBarriers::SReady));
 
             flash::rescale_o(tOrO, scale_o);
 
-            Tensor tOrP = make_tensor(rP.data(), flash::convert_layout_acc_Aregs<Kernel_traits::TiledMma>(rP.layout()));
+            if constexpr (Kernel_traits::Is_FP8) {
+                cutlass::arch::NamedBarrier::sync(kNThreads, static_cast<int>(NamedBarriers::TransVReady));
+                __syncthreads();
+            }
             flash::gemm</*zero_init=*/false, /*wg_wait=*/0>(tiled_mma_o, tOrP, tOrVt, tOrO);
 
             // Double buffer for sK
             const int sK_offset = n_block % 2 == 0 ? size(sK) : -size(sK);
-            tSrK.data() = tSrK.data() + sK_offset / 8;
-            tOrVt.data() = tOrVt.data() + sK_offset / 8;
+            if constexpr (Kernel_traits::Is_FP8) {
+                tSrK.data() = tSrK.data() + sK_offset / 16;
+            } else {
+                tSrK.data() = tSrK.data() + sK_offset / 8;
+                tOrVt.data() = tOrVt.data() + sK_offset / 8;
+            }
         }
 
         cute::copy(softmax.row_max, tRow_maxsRow_max);
@@ -379,7 +441,9 @@ __forceinline__ __device__ void compute_attn_1rowblock_splitkv_mla(const Flash_f
             // Double buffer for sK
             constexpr int sK_offset = size(sK);
             tKsK.data() = tKsK.data() + sK_offset;
-            tOrVt.data() = tOrVt.data() + sK_offset / 8;
+            if constexpr (!Kernel_traits::Is_FP8) {
+                tOrVt.data() = tOrVt.data() + sK_offset / 8;
+            }
         }
 
         // We need to clear the sK smem tiles because K is V.
@@ -411,6 +475,32 @@ __forceinline__ __device__ void compute_attn_1rowblock_splitkv_mla(const Flash_f
                 cute::cp_async_fence();
             }
 
+            if constexpr (Kernel_traits::Is_FP8) {
+                auto TransV = [&]() {
+                    using SmemFp8Tranpose = typename Kernel_traits::SmemFp8Tranpose;
+                    SmemFp8Tranpose smem_transpose_V;
+                    Tensor sV_divide = as_position_independent_swizzle_tensor(
+                        make_tensor(make_smem_ptr(shared_storage.smem_k.data()), typename SmemFp8Tranpose::SmemLayoutTransposeV{}));
+                    Tensor sVt_divide = as_position_independent_swizzle_tensor(
+                        make_tensor(make_smem_ptr(shared_storage.smem_vt.data()), typename SmemFp8Tranpose::SmemLayoutTransposeVt{}));
+
+                    if (n_block % 2 == 1) {
+                        sV_divide.data() = sV_divide.data() + size(sK);   
+                    }
+                    
+                    CUTLASS_PRAGMA_UNROLL
+                    for (int j = 0; j < shape<2>(typename SmemFp8Tranpose::SmemLayoutTransposeV{}); ++j) {
+                        CUTLASS_PRAGMA_UNROLL
+                        for (int i = 0; i < shape<1>(typename SmemFp8Tranpose::SmemLayoutTransposeV{}); ++i) {
+                            smem_transpose_V.transpose(flatten(sV_divide(_, i, j)), flatten(sVt_divide(_, i, j)));
+                        }
+                    }
+                };
+
+                TransV();
+                cutlass::arch::NamedBarrier::arrive(kNThreads, static_cast<int>(NamedBarriers::TransVReady));
+            }
+
             cutlass::arch::NamedBarrier::sync(kNThreads, static_cast<int>(NamedBarriers::SReady));
 
             if (n_block - 2 >= n_block_min) {
@@ -418,20 +508,22 @@ __forceinline__ __device__ void compute_attn_1rowblock_splitkv_mla(const Flash_f
             }
 
             typename Kernel_traits::TiledMma tiled_mma;
-            auto tSrS_layout = partition_fragment_C(tiled_mma, Shape<Int<kBlockM>, Int<kBlockN>>{}).layout();
-            Tensor rP = make_tensor<Element>(tSrS_layout);
+            auto tSrS_layout = flash::convert_layout_acc_Aregs<Kernel_traits::TiledMmaO>(partition_fragment_C(tiled_mma, Shape<Int<kBlockM>, Int<kBlockN>>{}).layout());
+            Tensor tOrP = make_tensor<Element>(tSrS_layout);
             Tensor scale_o = make_tensor<float>(Shape<_2>{});
             cute::copy(tScale_osScale_o, scale_o);
-            cute::copy(tPsP, rP);
+            cute::copy(tPsP, tOrP);
 
             flash::rescale_o(tOrO, scale_o);
 
-            Tensor tOrP = make_tensor(rP.data(), flash::convert_layout_acc_Aregs<Kernel_traits::TiledMma>(rP.layout()));
+            if constexpr (Kernel_traits::Is_FP8) __syncthreads();
             flash::gemm</*zero_init=*/false, /*wg_wait=*/0>(tiled_mma_o, tOrP, tOrVt, tOrO);
 
-            // Double buffer for sK
-            const int sK_offset = n_block % 2 == 0 ? size(sK) : -size(sK);
-            tOrVt.data() = tOrVt.data() + sK_offset / 8;
+            if constexpr (!Kernel_traits::Is_FP8) {
+                // Double buffer for sK
+                const int sK_offset = n_block % 2 == 0 ? size(sK) : -size(sK);
+                tOrVt.data() = tOrVt.data() + sK_offset / 8;
+            }
         }
 
         cutlass::arch::NamedBarrier::sync(kNThreads, static_cast<int>(NamedBarriers::SoftmaxReady));
@@ -440,9 +532,9 @@ __forceinline__ __device__ void compute_attn_1rowblock_splitkv_mla(const Flash_f
     }
 
     if (NoSplit)
-        store<Kernel_traits, false>(params, bidb, bidh, m_block, n_split_idx, shared_storage, tOrO, softmax);
+        store<Kernel_traits, false>(params, bidb, bidh, m_block, n_split_idx, shared_storage, tOrO, softmax, descale_k, scale_softmax);
     else
-        store<Kernel_traits, true>(params, bidb, bidh, m_block, n_split_idx, shared_storage, tOrO, softmax);
+        store<Kernel_traits, true>(params, bidb, bidh, m_block, n_split_idx, shared_storage, tOrO, softmax, descale_k, scale_softmax);
 }
 
 template<typename Kernel_traits, bool Is_causal, typename SharedStorage>
@@ -465,6 +557,16 @@ flash_fwd_splitkv_mla_kernel(__grid_constant__ const Flash_fwd_mla_params params
     if (begin_idx >= params.b) return;
     int begin_n_split_idx = __ldg(tile_scheduler_metadata_ptr + 4);
 
+    float descale_k = 1.f;
+    float scale_softmax = params.scale_softmax;
+    float scale_softmax_log2 = params.scale_softmax_log2;
+    if constexpr (Kernel_traits::Is_FP8) {
+        float descale_q = __ldg(params.descale_q_ptr);
+        descale_k = __ldg(params.descale_k_ptr);
+        scale_softmax = scale_softmax * descale_q * descale_k;
+        scale_softmax_log2 = scale_softmax_log2 * descale_q * descale_k;
+    }
+
 #pragma unroll 1
     for (int batch_id = begin_idx; batch_id <= end_idx; ++batch_id) {
         const int n_split_idx = batch_id == begin_idx ? begin_n_split_idx : 0;
@@ -475,7 +577,7 @@ flash_fwd_splitkv_mla_kernel(__grid_constant__ const Flash_fwd_mla_params params
         if (batch_id > begin_idx) {
             __syncthreads();  // Barrier between two tiles.
         }
-        flash::compute_attn_1rowblock_splitkv_mla<Kernel_traits, Is_causal>(params, batch_id, bidh, m_block, n_split_idx, seqlen_k, n_block_min, n_block_max, NoSplit, shared_storage);
+        flash::compute_attn_1rowblock_splitkv_mla<Kernel_traits, Is_causal>(params, batch_id, bidh, m_block, n_split_idx, seqlen_k, n_block_min, n_block_max, NoSplit, shared_storage, descale_k, scale_softmax, scale_softmax_log2);
     }
 }
 
@@ -587,17 +689,17 @@ void run_flash_splitkv_fwd_mla(Flash_fwd_mla_params &params, cudaStream_t stream
     dim3 grid_combine(params.b * params.h * params.seqlen_q);
     MLA_NUM_SPLITS_SWITCH(params.num_sm_parts, kMaxSplits, [&] {
         auto combine_kernel = &flash::flash_fwd_splitkv_mla_combine_kernel<
-                typename Kernel_traits::Element, typename Kernel_traits::ElementAccum, typename Kernel_traits::index_t, Kernel_traits::kHeadDimV, kMaxSplits>;
+                typename Kernel_traits::ElementO, typename Kernel_traits::ElementAccum, typename Kernel_traits::index_t, Kernel_traits::kHeadDimV, kMaxSplits>;
         combine_kernel<<<grid_combine, 128, 0, stream>>>(params);
     });
     CHECK_CUDA_KERNEL_LAUNCH();
 }
 
-template<typename T, int Headdim>
+template<typename T, typename To, int Headdim>
 void run_mha_fwd_splitkv_mla(Flash_fwd_mla_params &params, cudaStream_t stream) {
     static_assert(Headdim == 576);
     FLASH_ASSERT(params.d_v == 512);
     FLASH_ASSERT(params.k_ptr == params.v_ptr);  // Shared_KV
-    using Kernel_traits = Flash_fwd_kernel_traits_mla<576, 64, 64, 8, T, 512>;
+    using Kernel_traits = Flash_fwd_kernel_traits_mla<576, 64, 64, 8, T, To, 512>;
     run_flash_splitkv_fwd_mla<Kernel_traits, flash::SharedStorageMLA<Kernel_traits>>(params, stream);
 }
