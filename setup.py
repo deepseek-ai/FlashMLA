@@ -65,6 +65,7 @@ ext_modules.append(
                     "-std=c++17",
                     "-DNDEBUG",
                     "-D_USE_MATH_DEFINES",
+                    "-DUNFUSE_FMA",
                     "-Wno-deprecated-declarations",
                     "-U__CUDA_NO_HALF_OPERATORS__",
                     "-U__CUDA_NO_HALF_CONVERSIONS__",
