@@ -5,3 +5,4 @@ __pycache__/
 dist/
 *perf.csv
 *.png
+/.vscode

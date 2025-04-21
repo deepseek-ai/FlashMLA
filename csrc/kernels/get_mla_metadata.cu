@@ -1,8 +1,11 @@
-#include "flash_fwd_mla_kernel.h"
+#include "get_mla_metadata.h"
 
-static constexpr int MaxBatchSize = 4096;
+#include <cuda_runtime_api.h>
+#include <cutlass/fast_math.h>
 
-__global__ void __launch_bounds__(256, 1, 1)
+#include "utils.h"
+
+__global__ void __launch_bounds__(32, 1, 1)
 get_mla_metadata_kernel(__grid_constant__ const Mla_metadata_params params) {
     int *seqlens_k_ptr = params.seqlens_k_ptr;
     int *tile_scheduler_metadata_ptr = params.tile_scheduler_metadata_ptr;
@@ -12,8 +15,9 @@ get_mla_metadata_kernel(__grid_constant__ const Mla_metadata_params params) {
     int fixed_overhead_num_blocks = params.fixed_overhead_num_blocks;
     int num_sm_parts = params.num_sm_parts;
 
-    __shared__ int num_blocks_shared[MaxBatchSize];
-    __shared__ int num_splits_shared[MaxBatchSize];
+    extern __shared__ int shared_mem[];
+    int* num_blocks_shared = shared_mem; // [batch_size]
+    int* num_splits_shared = shared_mem + batch_size; // [batch_size+1]
 
     int total_num_blocks = 0;
     for (int i = threadIdx.x; i < batch_size; i += 32) {
@@ -27,7 +31,7 @@ get_mla_metadata_kernel(__grid_constant__ const Mla_metadata_params params) {
     __syncwarp();
 
     if (threadIdx.x == 0) {
-        int payload = cutlass::ceil_div(total_num_blocks, num_sm_parts) + fixed_overhead_num_blocks;
+        int payload = max(cutlass::ceil_div(total_num_blocks, num_sm_parts) + fixed_overhead_num_blocks, 2*fixed_overhead_num_blocks);
 
         int now_idx = 0, now_block = 0, now_n_split_idx = 0, cum_num_splits = 0;
         num_splits_shared[0] = 0;
@@ -70,8 +74,9 @@ get_mla_metadata_kernel(__grid_constant__ const Mla_metadata_params params) {
     }
 }
 
-void get_mla_metadata_func(Mla_metadata_params &params, cudaStream_t stream) {
-    FLASH_ASSERT(params.batch_size < MaxBatchSize);
-    get_mla_metadata_kernel<<<1, 32, 0, stream>>>(params);
+void run_get_mla_metadata_kernel(Mla_metadata_params &params, cudaStream_t stream) {
+    int smem_size = sizeof(int) * (params.batch_size*2+1);
+    CHECK_CUDA(cudaFuncSetAttribute(get_mla_metadata_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+    get_mla_metadata_kernel<<<1, 32, smem_size, stream>>>(params);
     CHECK_CUDA_KERNEL_LAUNCH();
 }
