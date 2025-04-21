@@ -1,10 +1,27 @@
 # FlashMLA
 
+## Performance Update (2025.04.22)
+
+We're excited to announce the new release of Flash MLA, which delivers 5% ~ 15% performance improvement on compute-bound workloads, achieving up to 660 TFlops on NVIDIA H800 SXM5 GPUs. The interface of the new version is fully compatible with the old one. Just switch to the new version and enjoy the instant speedup! 🚀🚀🚀
+
+Besides, we'd love to share the technical details behind the new kernel! Check out our deep-dive write-up here: <LINK>
+
+The new kernel primarily targets compute-intensive settings (where the number of q heads $\times$ the number of q sequences per request (if MTP is disabled then it's 1) $\ge 64$). For memory-bound cases, we recommend using version [b31bfe7](https://github.com/deepseek-ai/FlashMLA/tree/b31bfe72a83ea205467b3271a5845440a03ed7cb) for optimal performance.
+
+## Introduction
+
 FlashMLA is an efficient MLA decoding kernel for Hopper GPUs, optimized for variable-length sequences serving.
 
 Currently released:
 - BF16, FP16
 - Paged kvcache with block size of 64
+
+## Requirements
+
+- Hopper GPUs
+- CUDA 12.3 and above
+    - **But we highly recommend 12.8 or above for the best performance**
+- PyTorch 2.0 and above
 
 ## Quick start
 
@@ -20,7 +37,9 @@ python setup.py install
 python tests/test_flash_mla.py
 ```
 
-Achieving up to 3000 GB/s in memory-bound configuration and 580 TFLOPS in computation-bound configuration on H800 SXM5, using CUDA 12.8.
+It is able up to 3000 GB/s in memory-bound configuration and 660 TFLOPS in computation-bound configuration on H800 SXM5, using CUDA 12.8.
+
+Note. For memory-bound cases, we recommend using version [b31bfe7](https://github.com/deepseek-ai/FlashMLA/tree/b31bfe72a83ea205467b3271a5845440a03ed7cb) for optimal performance.
 
 ### Usage
 
@@ -37,13 +56,6 @@ for i in range(num_layers):
     )
     ...
 ```
-
-## Requirements
-
-- Hopper GPUs
-- CUDA 12.3 and above
-    - **But we highly recommend 12.8 or above for the best performance**
-- PyTorch 2.0 and above
 
 ## Acknowledgement
 
@@ -91,7 +103,7 @@ The corresponding FlashMLA version can be found at: [AITER/MLA](https://github.c
 ```bibtex
 @misc{flashmla2025,
       title={FlashMLA: Efficient MLA decoding kernels},
-      author={Jiashi Li},
+      author={Jiashi Li, Shengyu Liu},
       year={2025},
       publisher = {GitHub},
       howpublished = {\url{https://github.com/deepseek-ai/FlashMLA}},
