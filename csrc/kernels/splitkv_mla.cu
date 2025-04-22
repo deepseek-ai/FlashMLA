@@ -1,6 +1,6 @@
 #include <cutlass/cutlass.h>
 
-#include "flash_mla.h"
+#include "params.h"
 #include "utils.h"
 #include "config.h"
 #include "traits.h"

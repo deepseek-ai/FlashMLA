@@ -13,6 +13,7 @@
 #include "kernels/config.h"
 #include "kernels/get_mla_metadata.h"
 #include "kernels/mla_combine.h"
+#include "kernels/params.h"
 #include "kernels/splitkv_mla.h"
 
 #define CHECK_DEVICE(x) TORCH_CHECK(x.is_cuda(), #x " must be on CUDA")

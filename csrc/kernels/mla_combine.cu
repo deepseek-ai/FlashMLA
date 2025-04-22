@@ -5,7 +5,7 @@
 #include <cutlass/array.h>
 #include <cutlass/numeric_types.h>
 
-#include "flash_mla.h"
+#include "params.h"
 #include "utils.h"
 #include "config.h"  // for BLOCK_SIZE_M and HEAD_DIM_V
 
