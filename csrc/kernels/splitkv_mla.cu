@@ -938,6 +938,7 @@ __forceinline__ __device__ void wg1_subroutine(
     // We put the `cute::warpgroup_wait<0>()` out of the `if` statement above, otherwise
     // nvcc cannot correctly analyse the loop, and will think that we are using accumulator
     // registers during the WGMMA pipeline, which results in `WARPGROUP.ARRIVE` and `WARPGROUP.DEPBAR.LE` being inserted in SASS and WGMMA instructions being serialized.
+    // This is also the reason why we put QK^T here, instead of the first operation in the loop
     cute::warpgroup_wait<0>();
 }
 
