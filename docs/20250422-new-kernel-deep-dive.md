@@ -43,7 +43,7 @@ This schedule can be viewed as a "ping-pong" variant using one output matrix—w
 
 The complete schedule is shown below (remember that in MLA, $K$ and $V$ are the same with different names):
 
-![MLA Kernel Sched](https://raw.githubusercontent.com/deepseek-ai/FlashMLA/refs/heads/main/docs/assets/MLA%20Kernel%20Sched.drawio.svg)
+![MLA Kernel Sched](assets/MLA%20Kernel%20Sched.drawio.svg)
 
 ## Discussion of Technical Details
 
