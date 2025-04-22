@@ -6,7 +6,7 @@ We're excited to announce the new release of Flash MLA, which delivers 5% ~ 15% 
 
 Besides, we'd love to share the technical details behind the new kernel! Check out our deep-dive write-up here: <LINK>
 
-The new kernel primarily targets compute-intensive settings (where the number of q heads $\times$ the number of q sequences per request (if MTP is disabled then it's 1) $\ge 64$). For memory-bound cases, we recommend using version [b31bfe7](https://github.com/deepseek-ai/FlashMLA/tree/b31bfe72a83ea205467b3271a5845440a03ed7cb) for optimal performance.
+The new kernel primarily targets compute-intensive settings (where the number of q heads $\times$ the number of q tokens per request (if MTP is disabled then it's 1) $\ge 64$). For memory-bound cases, we recommend using version [b31bfe7](https://github.com/deepseek-ai/FlashMLA/tree/b31bfe72a83ea205467b3271a5845440a03ed7cb) for optimal performance.
 
 ## Introduction
 
