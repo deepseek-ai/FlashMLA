@@ -1236,7 +1236,7 @@ flash_fwd_splitkv_mla_kernel(__grid_constant__ const Flash_fwd_mla_params params
             int i = threadIdx.x;
             if (i < num_valid_seq_q) {
                 float cur_L = sL_reduction_wksp[i];
-                gSoftmaxLse(i) = (cur_L == 0.0f || cur_L != cur_L) ? INFINITY : logf(cur_L) + sM(i) / (float)M_LOG2E;
+                gSoftmaxLse(i) = (cur_L == 0.0f || cur_L != cur_L) ? -INFINITY : logf(cur_L) + sM(i) / (float)M_LOG2E;
             }
 
             cute::tma_store_wait<0>();
