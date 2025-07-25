@@ -1,172 +1,324 @@
 #pragma once
 
-#include <cstdint>
-
-#include "cutlass/kernel_hardware_info.h"
-
 #include "collective/fmha_fusion.hpp"
 #include "collective/sm100_fmha_fwd_epilogue_tma_warpspecialized.hpp"
 #include "collective/sm100_fmha_fwd_mainloop_tma_warpspecialized.hpp"
+#include "collective/sm100_fmha_mla_fwd_mainloop_tma_warpspecialized.hpp"
+#include "cutlass/cutlass.h"
+#include "cutlass/kernel_hardware_info.h"
 #include "device/fmha.hpp"
-#include "kernel/fmha_tile_scheduler.hpp"
 #include "kernel/fmha_causal_tile_scheduler.hpp"
+#include "kernel/fmha_options.hpp"
+#include "kernel/fmha_tile_scheduler.hpp"
 #include "kernel/sm100_fmha_fwd_kernel_tma_warpspecialized.hpp"
+
+#include <torch/library.h>
+#include <c10/cuda/CUDAStream.h>
 
 using namespace cute;
 using namespace cutlass::fmha::collective;
 using namespace cutlass::fmha::kernel;
 using namespace cutlass::fmha::device;
 
+struct FmhaOptions {
+  int b = 1;
+  int h = 1;
+  int h_k = 1;
+  int q = 256;
+  int k = 256;
+  int d = 128;
+};
 
-template <typename DTypeIn, 
-          typename DTypeOut, 
-          bool kIsVarlen,
-          bool kIsMaskTileSchedulerValid,
-          class TileShape, 
-          class ActiveMask,
-          class... KernelOptions>
+struct MlaOptions {
+  int b = 1;
+  int h = 1;
+  int h_k = 1;
+  int q = 256;
+  int k = 256;
+  int dl = 128; // headdim latent
+  int dr = 64;  // headdim rope
+};
+
+template <bool kIsMla, bool kIsMaskTileSchedulerValid, bool kIsVarlen, class Element_,
+          class ElementOut_, class ActiveMask, class... KernelOptions>
 struct FwdRunner {
-    using Element = DTypeIn;
-    using ElementAccumulatorQK = float;
-    using ElementAccumulatorPV = float;
-    using ElementOut = DTypeOut;
 
-    // Q K D ((H_R, H_KV), B)
-    using ProblemShapeRegular = cute::tuple<int, int, int, cute::tuple<cute::tuple<int, int>, int>>;
-    using ProblemShapeVarlen = cute::tuple<VariableLength, VariableLength, int, cute::tuple<cute::tuple<int, int>, int>>;
-    using ProblemShapeType = std::conditional_t<kIsVarlen, ProblemShapeVarlen, ProblemShapeRegular>;
+  using Element = Element_;
+  using ElementAccumulatorQK = float;
+  using ElementAccumulatorPV = float;
+  using ElementOut = ElementOut_;
 
-    using StrideQ = cute::tuple<int, _1, cute::tuple<cute::tuple<int, int>, int>>;  // Q D ((H_G H_R), B)
-    using StrideK = cute::tuple<int, _1, cute::tuple<cute::tuple<_0, int>, int>>;  // K D ((H_G H_R), B)
-    using StrideV = StrideK;
-    // NOTE(Zihao): use markus's trick for tma store
-    using StrideO = StrideQ;
-    using StrideLSE = cute::tuple<_1, cute::tuple<cute::tuple<int, int>, int>>;  // Q ((H_G H_R), B)
+  using HeadDimLatent = _128;
+  using HeadDim = Shape<HeadDimLatent, _64>;
+  using TileShapeMla = Shape<_256, _128, HeadDim>;
+  using TileShapeFmha = Shape<_256, _128, _128>;
+  using TileShape = std::conditional_t<kIsMla, TileShapeMla, TileShapeFmha>;
 
-    static constexpr bool kIsPersistent = find_option_t<Tag::kIsPersistent, true_type, KernelOptions...>::value;
+  using ProblemShapeRegular = std::conditional_t<
+      kIsMla,
+      cute::tuple<int, int, cute::tuple<int, int>, cute::tuple<cute::tuple<int, int>, int>>,
+      cute::tuple<int, int, int, cute::tuple<cute::tuple<int, int>, int>>>;
 
-  using TileScheduler = std::conditional_t<kIsPersistent, 
-                                          std::conditional_t<std::is_same_v<ActiveMask, CausalMask<false>> 
-                                                                          || std::is_same_v<ActiveMask, CausalMask<true>>, 
-                                                            cutlass::fmha::kernel::CausalPersistentTileScheduler,
-                                                            cutlass::fmha::kernel::PersistentTileScheduler>,
-                                          std::conditional_t<kIsMaskTileSchedulerValid, 
-                                                            cutlass::fmha::kernel::CausalIndividualTileScheduler,
-                                                            cutlass::fmha::kernel::IndividualTileScheduler>>;
+  using ProblemShapeVarlen =
+      std::conditional_t<kIsMla,
+                         cute::tuple<VariableLength, VariableLength, cute::tuple<int, int>,
+                                     cute::tuple<cute::tuple<int, int>, int>>,
+                         cute::tuple<VariableLength, VariableLength, int,
+                                     cute::tuple<cute::tuple<int, int>, int>>>;
 
-    using Mainloop = 
-        cutlass::fmha::collective::Sm100FmhaFwdMainloopTmaWarpspecialized<
-        Element, ElementAccumulatorQK, ElementAccumulatorPV,
-        TileShape, StrideQ, StrideK, StrideV,
-        ActiveMask
-        >;
-    using Operation = cutlass::fmha::device::FMHA<
-        cutlass::fmha::kernel::Sm100FmhaFwdKernelTmaWarpspecialized<
-        ProblemShapeType,
-        Mainloop,
-        cutlass::fmha::collective::Sm100FmhaFwdEpilogueTmaWarpspecialized<
-            ElementOut, ElementAccumulatorPV,
-            typename Mainloop::TileShapePV,
-            StrideO, StrideLSE
-        >,
-        TileScheduler
-        >>;
+  using ProblemShapeType =
+      std::conditional_t<kIsVarlen, ProblemShapeVarlen, ProblemShapeRegular>;
 
-    static void run(at::Tensor workspace_buffer, at::Tensor q, at::Tensor k, at::Tensor v,
-                  at::Tensor cumulative_seqlen_q, at::Tensor cumulative_seqlen_kv,
-                  at::Tensor o, at::Tensor lse,
-                  float softmax_scale, int max_seqlen_q, int max_seqlen_kv) {
-    cutlass::KernelHardwareInfo hw_info;
-    hw_info.device_id = 0;
-    hw_info.sm_count = cutlass::KernelHardwareInfo::query_device_multiprocessor_count(hw_info.device_id);
+  using StrideQ = cute::tuple<int, _1, cute::tuple<cute::tuple<int, int>, int>>;
+  using StrideK = cute::tuple<int, _1, cute::tuple<cute::tuple<_0, int>, int>>;
+  using StrideV = StrideK;
+  using StrideO = StrideQ;
+  using StrideLSE = cute::tuple<_1, cute::tuple<cute::tuple<int, int>, int>>;
 
-    ProblemShapeRegular problem_size;
-    ProblemShapeType problem_shape;
-    //varlen: q: [Q, H, D]
-    //fixedlen: q: [B, H, Q, D] 
-    if constexpr (kIsVarlen) {
-        int d = q.size(-1);
-        int d_vo = v.size(-1);
-        int batch_size = cumulative_seqlen_q.size(0) - 1;
-        int num_qo_heads = q.size(1);
-        int num_kv_heads = k.size(1);
-        int h_r = num_qo_heads / num_kv_heads;
-        int total_seqlen_q = q.size(0);
-        int total_seqlen_kv = k.size(0);
+  static constexpr bool kIsPersistent =
+      find_option_t<Tag::kIsPersistent, true_type, KernelOptions...>::value;
 
-        problem_size = make_shape(total_seqlen_q, total_seqlen_kv, d, make_shape(make_shape(h_r,num_kv_heads), 1));
-        problem_shape = make_shape(
-            VariableLength{max_seqlen_q, static_cast<int*>(cumulative_seqlen_q.data_ptr()), total_seqlen_q},
-            VariableLength{max_seqlen_kv, static_cast<int*>(cumulative_seqlen_kv.data_ptr()), total_seqlen_kv}, 
-            d, make_shape(make_shape(h_r, num_kv_heads), batch_size));
+  using TileScheduler = std::conditional_t<
+      kIsPersistent,
+      std::conditional_t<std::is_same_v<ActiveMask, CausalMask<false>> ||
+                             std::is_same_v<ActiveMask, CausalMask<true>>,
+                         cutlass::fmha::kernel::CausalPersistentTileScheduler,
+                         cutlass::fmha::kernel::PersistentTileScheduler>,
+      std::conditional_t<kIsMaskTileSchedulerValid,
+                         cutlass::fmha::kernel::CausalIndividualTileScheduler,
+                         cutlass::fmha::kernel::IndividualTileScheduler>>;
+
+  static constexpr bool IsOrderLoadEpilogue =
+      kIsPersistent && (sizeof(Element) == sizeof(ElementOut));
+  using OrderLoadEpilogue = std::conditional_t<IsOrderLoadEpilogue, true_type, false_type>;
+
+  using MainloopMla = cutlass::fmha::collective::Sm100MlaFwdMainloopTmaWarpspecialized<
+      Element, ElementAccumulatorQK, ElementAccumulatorPV, TileShapeMla, StrideQ, StrideK,
+      StrideV, ActiveMask, Shape<_2, _1, _1>, OrderLoadEpilogue>;
+
+  using OperationMla =
+      cutlass::fmha::device::FMHA<cutlass::fmha::kernel::Sm100FmhaFwdKernelTmaWarpspecialized<
+          ProblemShapeType, MainloopMla,
+          cutlass::fmha::collective::Sm100FmhaFwdEpilogueTmaWarpspecialized<
+              ElementOut, ElementAccumulatorPV, typename MainloopMla::TileShapePV, StrideO,
+              StrideLSE, OrderLoadEpilogue>,
+          TileScheduler, cutlass::fmha::kernel::Sm100MlaFwdCtxKernelWarpspecializedSchedule>>;
+
+  using MainloopFmha = cutlass::fmha::collective::Sm100FmhaFwdMainloopTmaWarpspecialized<
+      Element, ElementAccumulatorQK, ElementAccumulatorPV, TileShapeFmha, StrideQ, StrideK,
+      StrideV, ActiveMask>;
+
+  using OperationFmha =
+      cutlass::fmha::device::FMHA<cutlass::fmha::kernel::Sm100FmhaFwdKernelTmaWarpspecialized<
+          ProblemShapeType, MainloopFmha,
+          cutlass::fmha::collective::Sm100FmhaFwdEpilogueTmaWarpspecialized<
+              ElementOut, ElementAccumulatorPV, typename MainloopFmha::TileShapePV, StrideO,
+              StrideLSE>,
+          TileScheduler>>;
+
+  using Mainloop = std::conditional_t<kIsMla, MainloopMla, MainloopFmha>;
+  using Operation = std::conditional_t<kIsMla, OperationMla, OperationFmha>;
+
+  //
+  // Data members
+  //
+
+  /// Initialization
+  StrideQ stride_Q;
+  StrideK stride_K;
+  StrideV stride_V;
+  StrideO stride_O;
+  StrideLSE stride_LSE;
+
+  template <class ProblemShape>
+  auto initialize_varlen(const ProblemShape &problem_size, int max_seqlen_q, int max_seqlen_kv,
+                         int total_seqlen_q, int total_seqlen_kv) {
+
+    int num_batches = get<3, 1>(problem_size);
+
+    ProblemShape problem_size_for_init = problem_size;
+    get<3, 1>(problem_size_for_init) = 1;
+    get<0>(problem_size_for_init) = total_seqlen_q;
+    get<1>(problem_size_for_init) = total_seqlen_kv;
+
+    ProblemShapeType problem_size_for_launch;
+
+    get<0>(problem_size_for_launch) = VariableLength{max_seqlen_q};
+    get<1>(problem_size_for_launch) = VariableLength{max_seqlen_kv};
+    get<2>(problem_size_for_launch) = get<2>(problem_size);
+    get<3>(problem_size_for_launch) = get<3>(problem_size);
+
+    return cute::make_tuple(problem_size_for_init, problem_size_for_launch);
+  }
+
+  template <class Options>
+  static constexpr auto get_problem_shape(const Options &options) {
+    int h_r = options.h / options.h_k;
+    if constexpr (std::is_same_v<Options, MlaOptions>) {
+      return cute::make_tuple(options.q, options.k, cute::make_tuple(options.dl, options.dr),
+                              cute::make_tuple(cute::make_tuple(h_r, options.h_k), options.b));
     } else {
-        int q_len = q.size(1);
-        int kv_len = k.size(1);
-        int d = q.size(-1); 
-        int batch_size = q.size(0);
-        int num_qo_heads = q.size(2);
-        int num_kv_heads = k.size(2);
-        int h_r = num_qo_heads / num_kv_heads;
+      return cute::make_tuple(options.q, options.k, options.d,
+                              cute::make_tuple(cute::make_tuple(h_r, options.h_k), options.b));
+    }
+  }
 
-        problem_size = make_shape(q_len, kv_len, d, make_shape(make_shape(h_r, num_kv_heads), batch_size));
-        problem_shape = problem_size;
+  template <class Options>
+  ProblemShapeType initialize(const Options &options, int max_seqlen_q, int max_seqlen_kv,
+                                   int total_seqlen_q, int total_seqlen_kv,
+                                   void *cumulative_length_q, void *cumulative_length_kv) {
+    assert(options.h % options.h_k == 0);
+    auto problem_shape_in = get_problem_shape(options);
+
+    ProblemShapeType problem_shape;
+    decltype(problem_shape_in) problem_size;
+
+    if constexpr (kIsVarlen) {
+      auto [problem_shape_init, problem_shape_launch] = initialize_varlen(
+          problem_shape_in, max_seqlen_q, max_seqlen_kv, total_seqlen_q, total_seqlen_kv);
+      problem_shape = problem_shape_launch;
+      problem_size = problem_shape_init;
+    } else {
+      problem_size = problem_shape_in;
+      problem_shape = problem_shape_in;
     }
 
-    get<2>(problem_size) = cutlass::round_up(get<2>(problem_size), 8);  // alignment
+    auto get_head_dimension = [&]() {
+      if constexpr (rank_v<decltype(get<2>(problem_shape))> == 2) {
+        return cute::make_tuple(size<2, 0>(problem_shape) + size<2, 1>(problem_shape),
+                                size<2, 0>(problem_shape));
+      } else {
+        return cute::make_tuple(size<2>(problem_size), size<2>(problem_size));
+      }
+    };
 
+    auto [DQ, DV] = get_head_dimension();
     int SQ = size<0>(problem_size);
     int SK = size<1>(problem_size);
-    int D = size<2>(problem_size);
-    int H  = size<3,0>(problem_size);
-    int H_K = size<3,0,1>(problem_size);
-    int H_Q = size<3,0,0>(problem_size);
-    int B = size<3,1>(problem_size);
+    int H = size<3, 0>(problem_size);
+    int H_K = size<3, 0, 1>(problem_size);
+    int H_Q = size<3, 0, 0>(problem_size);
+    int B = size<3, 1>(problem_size);
 
-    StrideQ stride_Q = make_stride(H*D , _1{}, make_stride(make_stride(D, H_Q*D), H*D*SQ));
-    StrideO stride_O = stride_Q;
-    StrideK stride_K = make_stride(H_K*D , _1{}, make_stride(make_stride(_0{}, D), H_K*D*SK));
-    StrideV stride_V = stride_K;
-    StrideLSE stride_LSE = make_stride(_1{}, make_stride(make_stride(SQ, SQ*H_Q), SQ*H));
+    stride_Q = make_stride(H * DQ, _1{}, make_stride(make_stride(DQ, H_Q * DQ), H * DQ * SQ));
+    stride_O = make_stride(H * DV, _1{}, make_stride(make_stride(DV, H_Q * DV), H * DV * SQ));
+    stride_K = make_stride(H_K * DQ, _1{}, make_stride(make_stride(_0{}, DQ), H_K * DQ * SK));
+    stride_V = make_stride(H_K * DV, _1{}, make_stride(make_stride(_0{}, DV), H_K * DV * SK));
+    stride_LSE = make_stride(_1{}, make_stride(make_stride(SQ, SQ * H_Q), SQ * H));
 
     if (kIsVarlen) {
-        get<2,1>(stride_Q) = 0;
-        get<2,1>(stride_K) = 0;
-        get<2,1>(stride_V) = 0;
-        get<2,1>(stride_O) = 0;
-        get<1,1>(stride_LSE) = 0;
+      get<2, 1>(stride_Q) = 0;
+      get<2, 1>(stride_K) = 0;
+      get<2, 1>(stride_V) = 0;
+      get<2, 1>(stride_O) = 0;
+      get<1, 1>(stride_LSE) = 0;
     }
+
+    if constexpr (kIsVarlen) {
+      get<0>(problem_shape).cumulative_length = static_cast<int *>(cumulative_length_q);
+      get<1>(problem_shape).cumulative_length = static_cast<int *>(cumulative_length_kv);
+    }
+
+    return problem_shape;
+  }
+
+  auto get_arguments(const ProblemShapeType &problem_shape,
+                     const cutlass::KernelHardwareInfo &hw_info, float scale_softmax,
+                     void *q_ptr, void *k_ptr, void *v_ptr, void *o_ptr, void *lse_ptr,
+                     void *cumulative_length_q, void *cumulative_length_kv) {
+    auto problem_shape_ = problem_shape;
+    if constexpr (kIsVarlen) {
+      get<0>(problem_shape_).cumulative_length = static_cast<int *>(cumulative_length_q);
+      get<1>(problem_shape_).cumulative_length = static_cast<int *>(cumulative_length_kv);
+    }
+
     typename Operation::Arguments arguments{
-        problem_shape,
-        {static_cast<Element*>(q.data_ptr()), stride_Q, 
-         static_cast<Element*>(k.data_ptr()), stride_K, 
-         static_cast<Element*>(v.data_ptr()), stride_V, 
-         softmax_scale},
-        {static_cast<ElementOut*>(o.data_ptr()), stride_O,
-         static_cast<ElementAccumulatorPV*>(lse.data_ptr()), stride_LSE},
+        problem_shape_,
+        {static_cast<Element *>(q_ptr), stride_Q, static_cast<Element *>(k_ptr), stride_K,
+         static_cast<Element *>(v_ptr), stride_V, scale_softmax},
+        {static_cast<ElementOut *>(o_ptr), stride_O,
+         static_cast<ElementAccumulatorPV *>(lse_ptr), stride_LSE},
         hw_info};
+
+    return arguments;
+  }
+
+  template <class Options>
+  void run(const Options &options, const cutlass::KernelHardwareInfo &hw_info, at::Tensor q,
+           at::Tensor k, at::Tensor v, at::Tensor o, at::Tensor lse, float scale_softmax,
+           at::Tensor workspace, at::Tensor cumulative_seqlen_q,
+           at::Tensor cumulative_seqlen_kv, int max_seqlen_q, int max_seqlen_kv) {
+
+    int total_seqlen_q = q.size(0);
+    int total_seqlen_kv = k.size(0);
+
+    ProblemShapeType problem_shape =
+        initialize(options, max_seqlen_q, max_seqlen_kv, total_seqlen_q, total_seqlen_kv,
+                        cumulative_seqlen_q.data_ptr(), cumulative_seqlen_kv.data_ptr());
+
+    typename Operation::Arguments arguments =
+        get_arguments(problem_shape, hw_info, scale_softmax, q.data_ptr(), k.data_ptr(),
+                      v.data_ptr(), o.data_ptr(), lse.data_ptr(),
+                      cumulative_seqlen_q.data_ptr(), cumulative_seqlen_kv.data_ptr());
+
     Operation op;
 
+    // size_t workspace_size = 0;
+    // workspace_size = Operation::get_workspace_size(arguments);
+
+    // todo: if use workspace, need check workspace size first.
+    // we don't use workspace in current version.
+
     CUTLASS_CHECK(op.can_implement(arguments));
-    // CUTLASS_CHECK(op.initialize(arguments, workspace.get()));
     CUTLASS_CHECK(op.initialize(arguments, nullptr));
     CUTLASS_CHECK(op.run(at::cuda::getCurrentCUDAStream()));
   }
 };
 
-template <typename DTypeIn, typename DTypeOut, bool kIsVarlen, class TileShape, 
-          class ActiveMask, class... KernelOptions>
-void run_fmha_fwd(at::Tensor workspace_buffer, at::Tensor q, at::Tensor k, at::Tensor v,
-                  at::Tensor cumulative_seqlen_q, at::Tensor cumulative_seqlen_kv,
-                  at::Tensor o, at::Tensor lse,
-                  float softmax_scale, int max_seqlen_q, int max_seqlen_kv) {
+template <class DTypeIn, class DTypeOut, bool kIsVarlen, bool kIsMla, class ActiveMask,
+          class... KernelOptions>
+void run_fmha_fwd(at::Tensor workspace, at::Tensor q, at::Tensor k, at::Tensor v,
+                  at::Tensor cumulative_seqlen_q, at::Tensor cumulative_seqlen_kv, at::Tensor o,
+                  at::Tensor lse, float scale_softmax, int max_seqlen_q, int max_seqlen_kv) {
 
-    if(q.size(1) % cutlass::fmha::kernel::CausalIndividualTileScheduler::TileH == 0 && (!std::is_same_v<ActiveMask, NoMask>)) {
-        FwdRunner<DTypeIn, DTypeOut, kIsVarlen, true, TileShape, ActiveMask, KernelOptions...>::run(
-        workspace_buffer, q, k, v, cumulative_seqlen_q, cumulative_seqlen_kv, o, lse,
-        softmax_scale, max_seqlen_q, max_seqlen_kv);
+  cutlass::KernelHardwareInfo hw_info;
+  hw_info.device_id = 0;
+  hw_info.sm_count =
+      cutlass::KernelHardwareInfo::query_device_multiprocessor_count(hw_info.device_id);
+
+  auto get_options = [&]() {
+    if constexpr (kIsMla) {
+      MlaOptions options;
+      options.b = cumulative_seqlen_q.size(0) - 1;
+      options.h = q.size(1);
+      options.h_k = k.size(1);
+      options.q = q.size(0) / options.b;
+      options.k = k.size(0) / options.b;
+      options.dl = v.size(-1);
+      options.dr = q.size(-1) - v.size(-1);
+      return options;
     } else {
-        FwdRunner<DTypeIn, DTypeOut, kIsVarlen, false, TileShape, ActiveMask, KernelOptions...>::run(
-        workspace_buffer, q, k, v, cumulative_seqlen_q, cumulative_seqlen_kv, o, lse,
-        softmax_scale, max_seqlen_q, max_seqlen_kv);
+      FmhaOptions options;
+      options.b = cumulative_seqlen_q.size(0) - 1;
+      options.h = q.size(1);
+      options.h_k = k.size(1);
+      options.q = q.size(0) / options.b;
+      options.k = k.size(0) / options.b;
+      options.d = q.size(-1);
+      return options;
     }
+  };
+
+  auto options = get_options();
+
+  if (options.h % cutlass::fmha::kernel::CausalIndividualTileScheduler::TileH == 0 &&
+      (!std::is_same_v<ActiveMask, NoMask>)) {
+    FwdRunner<kIsMla, true, kIsVarlen, DTypeIn, DTypeOut, ActiveMask, KernelOptions...> runner;
+    runner.run(options, hw_info, q, k, v, o, lse, scale_softmax, workspace, cumulative_seqlen_q,
+               cumulative_seqlen_kv, max_seqlen_q, max_seqlen_kv);
+  } else {
+    FwdRunner<kIsMla, false, kIsVarlen, DTypeIn, DTypeOut, ActiveMask, KernelOptions...> runner;
+    runner.run(options, hw_info, q, k, v, o, lse, scale_softmax, workspace, cumulative_seqlen_q,
+               cumulative_seqlen_kv, max_seqlen_q, max_seqlen_kv);
+  }
 }
