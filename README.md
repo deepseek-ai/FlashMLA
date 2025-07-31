@@ -28,13 +28,21 @@ Currently released:
 ### Install
 
 ```bash
-python setup.py install
+pip install -v .
 ```
 
 ### Benchmark
 
+#### Testing MLA Decoding 
+
 ```bash
-python tests/test_flash_mla.py
+python tests/test_flash_mla_sm90.py
+```
+
+#### Testing MLA Forward/Backward
+
+```bash
+python tests/test_fmha_sm100.py
 ```
 
 It is able up to 3000 GB/s in memory-bound configuration and 660 TFLOPS in computation-bound configuration on H800 SXM5, using CUDA 12.8.
