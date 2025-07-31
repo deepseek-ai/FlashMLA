@@ -192,27 +192,6 @@ struct FwdRunner {
       }
     };
 
-    auto [DQ, DV] = get_head_dimension();
-    int SQ = size<0>(problem_size);
-    int SK = size<1>(problem_size);
-    int H = size<3, 0>(problem_size);
-    int H_K = size<3, 0, 1>(problem_size);
-    int H_Q = size<3, 0, 0>(problem_size);
-    int B = size<3, 1>(problem_size);
-
-    stride_Q = make_stride(H * DQ, _1{}, make_stride(make_stride(DQ, H_Q * DQ), H * DQ * SQ));
-    stride_O = make_stride(H * DV, _1{}, make_stride(make_stride(DV, H_Q * DV), H * DV * SQ));
-    stride_K = make_stride(H_K * DQ, _1{}, make_stride(make_stride(_0{}, DQ), H_K * DQ * SK));
-    stride_V = make_stride(H_K * DV, _1{}, make_stride(make_stride(_0{}, DV), H_K * DV * SK));
-    stride_LSE = make_stride(_1{}, make_stride(make_stride(SQ, SQ * H_Q), SQ * H));
-
-    if (kIsVarlen) {
-      get<2, 1>(stride_Q) = 0;
-      get<2, 1>(stride_K) = 0;
-      get<2, 1>(stride_V) = 0;
-      get<2, 1>(stride_O) = 0;
-      get<1, 1>(stride_LSE) = 0;
-    }
 
     if constexpr (kIsVarlen) {
       get<0>(problem_shape).cumulative_length = static_cast<int *>(cumulative_length_q);
@@ -251,10 +230,41 @@ struct FwdRunner {
 
     int total_seqlen_q = q.size(0);
     int total_seqlen_kv = k.size(0);
-
     ProblemShapeType problem_shape =
         initialize(options, max_seqlen_q, max_seqlen_kv, total_seqlen_q, total_seqlen_kv,
                         cumulative_seqlen_q.data_ptr(), cumulative_seqlen_kv.data_ptr());
+    
+    int SQ = size<0>(problem_shape);
+    int SK = size<1>(problem_shape);
+    int B = size<3, 1>(problem_shape);
+    int H = size<3, 0>(problem_shape);
+    int H_K = size<3, 0, 1>(problem_shape);
+    int H_Q = size<3, 0, 0>(problem_shape);
+
+    int q_stride0 = q.stride(0), q_stride1 = q.stride(1), q_stride2 = q.stride(2);
+    int k_stride0 = k.stride(0), k_stride1 = k.stride(1), k_stride2 = k.stride(2);
+    int v_stride0 = v.stride(0), v_stride1 = v.stride(1), v_stride2 = v.stride(2);
+    int o_stride0 = o.stride(0), o_stride1 = o.stride(1), o_stride2 = o.stride(2);
+    int lse_stride0 = lse.stride(0), lse_stride1 = lse.stride(1);
+    TORCH_CHECK(q_stride2 == 1);
+    TORCH_CHECK(k_stride2 == 1);
+    TORCH_CHECK(v_stride2 == 1);
+    TORCH_CHECK(o_stride2 == 1);
+    TORCH_CHECK(lse_stride0 == 1);
+
+    stride_Q = make_stride(q_stride0, _1{}, make_stride(make_stride(q_stride1, H_Q * q_stride1), SQ * q_stride0));
+    stride_O = make_stride(o_stride0, _1{}, make_stride(make_stride(o_stride1, H_Q * o_stride1), SQ * o_stride0));
+    stride_K = make_stride(k_stride0, _1{}, make_stride(make_stride(_0{}, k_stride1), SK * k_stride0));
+    stride_V = make_stride(v_stride0, _1{}, make_stride(make_stride(_0{}, v_stride1), SK * v_stride0));
+    stride_LSE = make_stride(_1{}, make_stride(make_stride(lse_stride1, lse_stride1 * H_Q), SQ));
+
+    if constexpr (kIsVarlen) {
+      get<2, 1>(stride_Q) = 0;
+      get<2, 1>(stride_K) = 0;
+      get<2, 1>(stride_V) = 0;
+      get<2, 1>(stride_O) = 0;
+      get<1, 1>(stride_LSE) = 0;
+    }
 
     typename Operation::Arguments arguments =
         get_arguments(problem_shape, hw_info, scale_softmax, q.data_ptr(), k.data_ptr(),

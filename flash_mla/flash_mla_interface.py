@@ -6,6 +6,13 @@ import flash_mla_sm90
 import flash_mla_sm100
 
 
+def check_is_varlen(cu_seqtensor: torch.Tensor) -> bool:
+    for i in range(len(cu_seqtensor) - 2):
+        if cu_seqtensor[i + 1] - cu_seqtensor[i] != cu_seqtensor[i + 2] - cu_seqtensor[i + 1]:
+            return True
+    return False
+
+
 def get_mla_metadata(
     cache_seqlens: torch.Tensor,
     num_heads_per_head_k: int,
@@ -82,6 +89,8 @@ def _flash_attn_varlen_forward(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     qo_total_len, num_qo_heads, head_dim_qk = q.shape
     kv_total_len, num_kv_heads, head_dim_vo = v.shape
+    
+    is_varlen = check_is_varlen(cu_seqlens_qo) or check_is_varlen(cu_seqlens_kv)
 
     mask_mode_code = 1 if causal else 0
     if softmax_scale is None:
@@ -107,7 +116,7 @@ def _flash_attn_varlen_forward(
         softmax_scale,
         max_seqlen_qo,
         max_seqlen_kv,
-        True,
+        is_varlen,
     )
 
     return out, lse
@@ -132,6 +141,8 @@ def _flash_attn_varlen_backward(
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     qo_total_len, num_qo_heads, head_dim_qk = q.shape
     kv_total_len, num_kv_heads, head_dim_vo = v.shape
+
+    is_varlen = check_is_varlen(cu_seqlens_qo) or check_is_varlen(cu_seqlens_kv)
 
     # TODO: fix bwd GQA
     if num_qo_heads != num_kv_heads:
@@ -173,7 +184,7 @@ def _flash_attn_varlen_backward(
         softmax_scale,
         max_seqlen_qo,
         max_seqlen_kv,
-        True,
+        is_varlen,
     )
 
     return dq, dk, dv
@@ -245,6 +256,7 @@ def flash_attn_varlen_qkvpacked_func(
     qkv: torch.Tensor,
     cu_seqlens: torch.Tensor,
     max_seqlen: int,
+    head_dim_qk: int,
     dropout_p: float = 0.0,
     softmax_scale: Optional[float] = None,
     causal: bool = False,
@@ -253,7 +265,7 @@ def flash_attn_varlen_qkvpacked_func(
     assert dropout_p == 0.0
     assert not deterministic
     return FlashAttnVarlenFunc.apply(
-        qkv[:, 0], qkv[:, 1], qkv[:, 2],
+        qkv[:, :, :head_dim_qk], qkv[:, :, head_dim_qk:head_dim_qk * 2], qkv[:, :, head_dim_qk * 2:],
         cu_seqlens, cu_seqlens, max_seqlen, max_seqlen,
         causal, softmax_scale,
     )
@@ -266,6 +278,7 @@ def flash_attn_varlen_kvpacked_func(
     cu_seqlens_kv: torch.Tensor,
     max_seqlen_qo: int,
     max_seqlen_kv: int,
+    head_dim_qk: int,
     dropout_p: float = 0.0,
     softmax_scale: Optional[float] = None,
     causal: bool = False,
@@ -274,7 +287,7 @@ def flash_attn_varlen_kvpacked_func(
     assert dropout_p == 0.0
     assert not deterministic
     return FlashAttnVarlenFunc.apply(
-        q, kv[:, 0], kv[:, 1],
+        q, kv[:, :, :head_dim_qk], kv[:, :, head_dim_qk:],
         cu_seqlens_qo, cu_seqlens_kv, max_seqlen_qo, max_seqlen_kv,
         causal, softmax_scale,
     )

@@ -100,30 +100,26 @@ struct BwdRunner {
     hw_info.sm_count = cutlass::KernelHardwareInfo::query_device_multiprocessor_count(hw_info.device_id);
     ProblemShape problem_shape;
     cute::tuple<int, int, int, int, cute::tuple<int, int>> tensor_shape;
+
+
+    int d = q.size(-1);
+    int d_vo = v.size(-1);
+    int batch_size = cumulative_seqlen_q.size(0) - 1;
+    int num_qo_heads = q.size(1);
+    int total_seqlen_q = q.size(0);
+    int total_seqlen_kv = k.size(0);
     
     //varlen: q: [Q, H, D]
     //fixedlen: q: [B, H, Q, D] 
     if constexpr (kIsVarlen) {
-      int d = q.size(-1);
-      int d_vo = v.size(-1);
-      int batch_size = cumulative_seqlen_q.size(0) - 1;
-      int num_qo_heads = q.size(1);
-      int total_seqlen_q = q.size(0);
-      int total_seqlen_kv = k.size(0);
-
       problem_shape = cute::make_tuple(
         VariableLength{max_seqlen_q, static_cast<int*>(cumulative_seqlen_q.data_ptr()), total_seqlen_q},
         VariableLength{max_seqlen_kv, static_cast<int*>(cumulative_seqlen_kv.data_ptr()), total_seqlen_kv},
         d, d_vo, cute::make_tuple(num_qo_heads, batch_size));
       tensor_shape = make_shape(total_seqlen_q, total_seqlen_kv, d, d_vo, make_shape(num_qo_heads, 1));
     } else {
-      int q_len = q.size(1);
-      int kv_len = k.size(1);
-      int d = q.size(-1);
-      int d_vo = v.size(-1);
-      int batch_size = q.size(0);
-      int num_qo_heads = q.size(2);
-
+      int q_len = total_seqlen_q / batch_size;
+      int kv_len = total_seqlen_kv / batch_size;
       problem_shape = cute::make_tuple(q_len, kv_len, d, d_vo, cute::make_tuple(num_qo_heads, batch_size));
       tensor_shape = problem_shape;
     }
@@ -131,16 +127,35 @@ struct BwdRunner {
     auto [Q, K, D, D_VO, HB] = tensor_shape;
     auto [H, B] = HB;
 
-    StrideQ stride_Q = make_stride(H*D, _1{}, make_stride(D, B == 1 ? 0 : D*Q*H));
-    StrideK stride_K = make_stride(H*D, _1{}, make_stride(D, B == 1 ? 0 : D*K*H));
-    StrideV stride_V = make_stride(H*D_VO, _1{}, make_stride(D_VO, B == 1 ? 0 : D_VO*K*H));
-    StrideO stride_O = make_stride(H*D_VO, _1{}, make_stride(D_VO, B == 1 ? 0 : D_VO*Q*H));
-    StrideLSE stride_LSE = make_stride(_1{}, make_stride(Q, B == 1 ? 0 : Q*H));
+    int q_stride0 = q.stride(0), q_stride1 = q.stride(1), q_stride2 = q.stride(2);
+    int k_stride0 = k.stride(0), k_stride1 = k.stride(1), k_stride2 = k.stride(2);
+    int v_stride0 = v.stride(0), v_stride1 = v.stride(1), v_stride2 = v.stride(2);
+    int o_stride0 = o.stride(0), o_stride1 = o.stride(1), o_stride2 = o.stride(2);
+    int lse_stride0 = lse.stride(0), lse_stride1 = lse.stride(1);
+    int dq_stride0 = dq.stride(0), dq_stride1 = dq.stride(1), dq_stride2 = dq.stride(2);
+    int dk_stride0 = dk.stride(0), dk_stride1 = dk.stride(1), dk_stride2 = dk.stride(2);
+    int dv_stride0 = dv.stride(0), dv_stride1 = dv.stride(1), dv_stride2 = dv.stride(2);
+    int do_stride0 = d_o.stride(0), do_stride1 = d_o.stride(1), do_stride2 = d_o.stride(2);
+    TORCH_CHECK(q_stride2 == 1);
+    TORCH_CHECK(k_stride2 == 1);
+    TORCH_CHECK(v_stride2 == 1);
+    TORCH_CHECK(o_stride2 == 1);
+    TORCH_CHECK(lse_stride0 == 1);
+    TORCH_CHECK(dq_stride2 == 1);
+    TORCH_CHECK(dk_stride2 == 1);
+    TORCH_CHECK(dv_stride2 == 1);
+    TORCH_CHECK(do_stride2 == 1);
 
-    StrideDQ stride_dQ = stride_Q;
-    StrideDK stride_dK = stride_K;
-    StrideDV stride_dV = stride_V;
-    StrideDO stride_dO = stride_O;
+    StrideQ stride_Q = make_stride(q_stride0, _1{}, make_stride(q_stride1, B == 1 ? 0 : q_stride0*Q));
+    StrideK stride_K = make_stride(k_stride0, _1{}, make_stride(k_stride1, B == 1 ? 0 : k_stride0*K));
+    StrideV stride_V = make_stride(v_stride0, _1{}, make_stride(v_stride1, B == 1 ? 0 : v_stride0*K));
+    StrideO stride_O = make_stride(o_stride0, _1{}, make_stride(o_stride1, B == 1 ? 0 : o_stride0*Q));
+    StrideLSE stride_LSE = make_stride(_1{}, make_stride(lse_stride1, B == 1 ? 0 : Q));
+
+    StrideDQ stride_dQ = make_stride(dq_stride0, _1{}, make_stride(dq_stride1, B == 1 ? 0 : dq_stride0*Q));
+    StrideDK stride_dK = make_stride(dk_stride0, _1{}, make_stride(dk_stride1, B == 1 ? 0 : dk_stride0*K));
+    StrideDV stride_dV = make_stride(dv_stride0, _1{}, make_stride(dv_stride1, B == 1 ? 0 : dv_stride0*K));
+    StrideDO stride_dO = make_stride(do_stride0, _1{}, make_stride(do_stride1, B == 1 ? 0 : do_stride0*Q));
 
     typename Operation::Arguments arguments{
       problem_shape,
