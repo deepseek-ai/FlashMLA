@@ -107,7 +107,7 @@ def test_flash_attention(b, mean_sq, mean_sk, varlen, h, h_k, d, dv, causal, win
         if window != 0:
             kwargs["window_size"] = get_window_size(causal, window)
         return flash_attn_varlen_func(q1, k1, v1, cu_seqlens_q, cu_seqlens_k, max_seqlen_q,
-                                      max_seqlen_k, softmax_scale=softmax_scale, **kwargs)
+                                      max_seqlen_k, softmax_scale=softmax_scale, is_varlen=varlen, **kwargs)
 
     def torch_attn():
         q2.grad = k2.grad = v2.grad = None

@@ -6,12 +6,6 @@ import flash_mla_sm90
 import flash_mla_sm100
 
 
-def check_is_varlen(cu_seqtensor: torch.Tensor) -> bool:
-    for i in range(len(cu_seqtensor) - 2):
-        if cu_seqtensor[i + 1] - cu_seqtensor[i] != cu_seqtensor[i + 2] - cu_seqtensor[i + 1]:
-            return True
-    return False
-
 
 def get_mla_metadata(
     cache_seqlens: torch.Tensor,
@@ -86,11 +80,10 @@ def _flash_attn_varlen_forward(
     lse: Optional[torch.Tensor] = None,
     causal: bool = False,
     softmax_scale: Optional[float] = None,
+    is_varlen: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     qo_total_len, num_qo_heads, head_dim_qk = q.shape
     kv_total_len, num_kv_heads, head_dim_vo = v.shape
-    
-    is_varlen = check_is_varlen(cu_seqlens_qo) or check_is_varlen(cu_seqlens_kv)
 
     mask_mode_code = 1 if causal else 0
     if softmax_scale is None:
@@ -138,11 +131,10 @@ def _flash_attn_varlen_backward(
     dv: Optional[torch.Tensor] = None,
     causal: bool = False,
     softmax_scale: Optional[float] = None,
+    is_varlen: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     qo_total_len, num_qo_heads, head_dim_qk = q.shape
     kv_total_len, num_kv_heads, head_dim_vo = v.shape
-
-    is_varlen = check_is_varlen(cu_seqlens_qo) or check_is_varlen(cu_seqlens_kv)
 
     # TODO: fix bwd GQA
     if num_qo_heads != num_kv_heads:
@@ -202,17 +194,20 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         max_seqlen_kv: int,
         causal: bool = False,
         softmax_scale: Optional[float] = None,
+        is_varlen: bool = True,
     ):
         out, lse = _flash_attn_varlen_forward(
             q, k, v,
             cu_seqlens_qo, cu_seqlens_kv, max_seqlen_qo, max_seqlen_kv,
             causal=causal, softmax_scale=softmax_scale,
+            is_varlen=is_varlen,
         )
         ctx.save_for_backward(q, k, v, out, lse, cu_seqlens_qo, cu_seqlens_kv)
         ctx.max_seqlen_qo = max_seqlen_qo
         ctx.max_seqlen_kv = max_seqlen_kv
         ctx.causal = causal
         ctx.softmax_scale = softmax_scale
+        ctx.is_varlen = is_varlen
         return out, lse
 
     def backward(
@@ -226,8 +221,9 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             do, q, k, v, out, lse,
             cu_seqlens_qo, cu_seqlens_kv, ctx.max_seqlen_qo, ctx.max_seqlen_kv,
             causal=ctx.causal, softmax_scale=ctx.softmax_scale,
+            is_varlen=ctx.is_varlen,
         )
-        return dq, dk, dv, None, None, None, None, None, None
+        return dq, dk, dv, None, None, None, None, None, None, None
 
 
 def flash_attn_varlen_func(
@@ -242,13 +238,14 @@ def flash_attn_varlen_func(
     softmax_scale: Optional[float] = None,
     causal: bool = False,
     deterministic: bool = False,
+    is_varlen: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     assert dropout_p == 0.0
     assert not deterministic
     return FlashAttnVarlenFunc.apply(
         q, k, v,
         cu_seqlens_qo, cu_seqlens_kv, max_seqlen_qo, max_seqlen_kv,
-        causal, softmax_scale,
+        causal, softmax_scale, is_varlen,
     )
 
 
@@ -261,13 +258,14 @@ def flash_attn_varlen_qkvpacked_func(
     softmax_scale: Optional[float] = None,
     causal: bool = False,
     deterministic: bool = False,
+    is_varlen: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     assert dropout_p == 0.0
     assert not deterministic
     return FlashAttnVarlenFunc.apply(
         qkv[:, :, :head_dim_qk], qkv[:, :, head_dim_qk:head_dim_qk * 2], qkv[:, :, head_dim_qk * 2:],
         cu_seqlens, cu_seqlens, max_seqlen, max_seqlen,
-        causal, softmax_scale,
+        causal, softmax_scale, is_varlen,
     )
 
 
@@ -283,13 +281,14 @@ def flash_attn_varlen_kvpacked_func(
     softmax_scale: Optional[float] = None,
     causal: bool = False,
     deterministic: bool = False,
+    is_varlen: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     assert dropout_p == 0.0
     assert not deterministic
     return FlashAttnVarlenFunc.apply(
         q, kv[:, :, :head_dim_qk], kv[:, :, head_dim_qk:],
         cu_seqlens_qo, cu_seqlens_kv, max_seqlen_qo, max_seqlen_kv,
-        causal, softmax_scale,
+        causal, softmax_scale, is_varlen,
     )
 
 
