@@ -33,6 +33,8 @@ def flash_mla_with_kvcache(
     num_splits: torch.Tensor,
     softmax_scale: Optional[float] = None,
     causal: bool = False,
+    descale_q: Optional[torch.Tensor] = None,
+    descale_k: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Arguments:
@@ -62,5 +64,7 @@ def flash_mla_with_kvcache(
         causal,
         tile_scheduler_metadata,
         num_splits,
+        descale_q,
+        descale_k,
     )
     return out, softmax_lse

@@ -14,6 +14,7 @@ struct Flash_fwd_mla_params {
     int q_head_per_hk;  // The number of q_head(s) per KV head, = h_q / h_k
     bool is_causal;
     float scale_softmax, scale_softmax_log2;
+    float descale_q, descale_k;
     
     void *__restrict__ q_ptr;
     void *__restrict__ k_ptr;

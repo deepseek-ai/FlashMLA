@@ -53,6 +53,7 @@ ext_modules.append(
             "nvcc": append_nvcc_threads(
                 [
                     "-O3",
+                    "-lineinfo",
                     "-std=c++17",
                     "-DNDEBUG",
                     "-D_USE_MATH_DEFINES",
@@ -64,7 +65,8 @@ ext_modules.append(
                     "--expt-relaxed-constexpr",
                     "--expt-extended-lambda",
                     "--use_fast_math",
-                    "--ptxas-options=-v,--register-usage-level=10"
+                    "--ptxas-options=-v,--register-usage-level=10",
+                    "-ftemplate-backtrace-limit=0"
                 ]
                 + cc_flag
             ) + get_features_args(),
