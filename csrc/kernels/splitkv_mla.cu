@@ -811,7 +811,7 @@ __forceinline__ __device__ void wg0_subroutine(
         }
         NamedBarrier::arrive_and_wait(T::NUM_THREADS, NamedBarriers::rO1sP0sV0RIssued);
         wg0_rescale_rO0(rO0, sScale1, rL, idx_in_warpgroup);
-        //warpgroup_cooperative_pv_gemm_remoteP<T>(sP1, sV1L, rO0, idx_in_warpgroup);
+        //warpgroup_cooperative_pv_gemm_remoteP<T>(sP1, sV1L, rO0, idx_in_warpgroup); // replace
         load_sP_to_rPb<T>(sP1_ptr, rPb, idx_in_warpgroup);
         warpgroup_cooperative_pv_gemm_localP<T>(rPb, sV1L, rO0, idx_in_warpgroup);
     }
@@ -937,7 +937,7 @@ __forceinline__ __device__ void wg1_subroutine(
         cutlass::arch::fence_view_async_shared();
     }
 
-    //warpgroup_cooperative_pv_gemm_remoteP<T>(sP0, sV0R, rO1, idx_in_warpgroup);
+    //warpgroup_cooperative_pv_gemm_remoteP<T>(sP0, sV0R, rO1, idx_in_warpgroup); // replace
     load_sP_to_rPb<T>(sP0_ptr, rP1b, idx_in_warpgroup);
     warpgroup_cooperative_pv_gemm_localP<T>(rP1b, sV0R, rO1, idx_in_warpgroup);
     if constexpr (!IS_BLK0_LAST) {
@@ -1036,7 +1036,7 @@ flash_fwd_splitkv_mla_kernel(__grid_constant__ const Flash_fwd_mla_params params
     Tensor sL_reduction_wksp = make_tensor(make_smem_ptr(plan.sL_reduction_wksp.data()), make_shape(Int<2*T::BLOCK_SIZE_M>{}));
     Tensor sScale0 = make_tensor(make_smem_ptr(plan.smem_sScale0.data()), make_shape(Int<T::BLOCK_SIZE_M>{}));
     Tensor sScale1 = make_tensor(make_smem_ptr(plan.smem_sScale1.data()), make_shape(Int<T::BLOCK_SIZE_M>{}));
-    char* sO_addr = (char*)plan.smem_sK0;	// Overlap with sK0 and sK1
+    char* sO_addr = (char*)plan.smem_sK0;	// Overlap with sK0 sK1 sV0 sV1
     // Prefetch TMA descriptors
     if (threadIdx.x == 0) {
         cute::prefetch_tma_descriptor(tma_params.tma_Q.get_tma_descriptor());

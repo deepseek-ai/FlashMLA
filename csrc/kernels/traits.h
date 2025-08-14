@@ -98,10 +98,10 @@ struct Traits {
 
     struct SharedMemoryPlan {
         alignas(16) InputT smem_sQ[BLOCK_SIZE_M * HEAD_DIM_K];
-        alignas(16) InputT smem_sK0[PAGE_BLOCK_SIZE * HEAD_DIM_K * 2];
-        alignas(16) InputT smem_sK1[PAGE_BLOCK_SIZE * HEAD_DIM_K];
-        alignas(16) InputT smem_vt1[PAGE_BLOCK_SIZE * HEAD_DIM_V];
-        alignas(16) InputT smem_vt0[PAGE_BLOCK_SIZE * HEAD_DIM_V];
+        alignas(16) InputT smem_sK0[PAGE_BLOCK_SIZE * HEAD_DIM_K]; // overlap Sout
+        alignas(16) InputT smem_sK1[PAGE_BLOCK_SIZE * HEAD_DIM_K]; // overlap Sout
+        alignas(16) InputT smem_vt0[PAGE_BLOCK_SIZE * HEAD_DIM_V]; // overlap Sout
+        alignas(16) InputT smem_vt1[PAGE_BLOCK_SIZE * HEAD_DIM_V]; // overlap Sout
         alignas(16) uint16_t smem_sP0[64 * 32];
         alignas(16) uint16_t smem_sP1[64 * 32];
 

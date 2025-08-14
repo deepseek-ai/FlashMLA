@@ -135,6 +135,20 @@ mha_fwd_kvcache_mla(
     TORCH_CHECK(batch_size > 0, "batch size must be postive");
     TORCH_CHECK(num_heads_q % num_heads_k == 0, "Number of heads in key/value must divide number of heads in query");
 
+    if (q_dtype == torch::kFloat8_e4m3fn) {
+        TORCH_CHECK(descale_q.has_value() && descale_k.has_value(), "descale is required when input dtype is fp8");
+        auto descale_q_value = descale_q.value();
+        auto descale_k_value = descale_k.value();
+        CHECK_DEVICE(descale_q_value);
+        CHECK_DEVICE(descale_k_value);
+        TORCH_CHECK(descale_q_value.stride(-1) == 1);
+        TORCH_CHECK(descale_k_value.stride(-1) == 1);
+        TORCH_CHECK(descale_q_value.dtype() == torch::kFloat);
+        TORCH_CHECK(descale_k_value.dtype() == torch::kFloat);
+        CHECK_SHAPE(descale_q_value, 1);
+        CHECK_SHAPE(descale_k_value, 1);
+    }
+
     if (seqlen_q_ori == 1) { is_causal = false; }
 
     const int num_q_heads_per_hk = num_heads_q / num_heads_k;
@@ -175,8 +189,10 @@ mha_fwd_kvcache_mla(
     params.scale_softmax = softmax_scale;
     params.scale_softmax_log2 = float(softmax_scale * M_LOG2E);
     if (q_dtype == torch::kFloat8_e4m3fn) {
-        params.descale_q = get_scalar_f32_cpu_only(descale_q);
-        params.descale_k = get_scalar_f32_cpu_only(descale_q);
+        // params.descale_q = get_scalar_f32_cpu_only(descale_q); // cpu scalar faster ,but need change sglang api used
+        // params.descale_k = get_scalar_f32_cpu_only(descale_q); // cpu scalar faster ,but need change sglang api used
+        params.descale_q_ptr = reinterpret_cast<float*>(descale_q.value().data_ptr());
+        params.descale_k_ptr = reinterpret_cast<float*>(descale_k.value().data_ptr());
     }
 
     // Set the pointers and strides.
