@@ -136,10 +136,7 @@ __forceinline__ __device__ void qkt_gemm_one_tile_sQ(
     barrier->wait(cur_phase ? 1 : 0);
 
     if constexpr (T::IsFp8) {
-        Tensor sK = make_tensor(make_smem_ptr(sK_ptr), (typename T::SmemLayoutK){});
         using Fp8Trans = SmemTransposeFp8_64x64<T::PAGE_BLOCK_SIZE, T::HEAD_DIM_V>;
-        Tensor sV0 = make_tensor(make_smem_ptr(sVt_ptr), typename Fp8Trans::SmemLayoutVt{});
-
         if(tile_idx != 8){ // V: (0~7) tiles
             fp8_transpose_v<T>(sK_ptr, sVt_ptr, tile_idx); // transpose sK
             cutlass::arch::fence_view_async_shared(); 
@@ -169,6 +166,7 @@ __forceinline__ __device__ void qkt_gemm_one_tile_sQ(
 template<
     typename T, // Traits
     int PHASE_IDX,	// See comments in the code
+    int pipeline_id,
     typename Engine0, typename Layout0,
     typename Engine1, typename Layout1,
     typename Engine2, typename Layout2
@@ -198,6 +196,11 @@ __forceinline__ __device__ void warpgroup_cooperative_qkt_gemm(
         QKT_GEMM_ONE_TILE(1);
         QKT_GEMM_ONE_TILE(2);
         QKT_GEMM_ONE_TILE(3);
+        if constexpr (pipeline_id == 0) {
+            NamedBarrier::arrive(T::NUM_THREADS, NamedBarriers::sV0LReady);
+        } else {
+            NamedBarrier::arrive(T::NUM_THREADS, NamedBarriers::sV1LReady);
+        }
     } else if constexpr (PHASE_IDX == 1) {
         // In PHASE-1, warpgroup 1 calculates Q K^T for all the 9 tiles
         tiled_mma_sQ.accumulate_ = GMMA::ScaleOut::Zero;
@@ -211,6 +214,13 @@ __forceinline__ __device__ void warpgroup_cooperative_qkt_gemm(
         QKT_GEMM_ONE_TILE(2);
         QKT_GEMM_ONE_TILE(3);
         cur_phase ^= 1;
+        if constexpr (pipeline_id == 0) {
+            NamedBarrier::arrive(T::NUM_THREADS, NamedBarriers::sV0LReady);
+            NamedBarrier::arrive(T::NUM_THREADS, NamedBarriers::sV0RReady);
+        } else {
+            NamedBarrier::arrive(T::NUM_THREADS, NamedBarriers::sV1LReady);
+            NamedBarrier::arrive(T::NUM_THREADS, NamedBarriers::sV1RReady);
+        }
     } else {
         // In PHASE-2, warpgroup 0 calculates Q K^T for the last 5 tiles
         static_assert(PHASE_IDX == 2);
@@ -221,6 +231,11 @@ __forceinline__ __device__ void warpgroup_cooperative_qkt_gemm(
         QKT_GEMM_ONE_TILE(7);
         QKT_GEMM_ONE_TILE(8);
         cur_phase ^= 1;
+        if constexpr (pipeline_id == 0) {
+            NamedBarrier::arrive(T::NUM_THREADS, NamedBarriers::sV0RReady);
+        } else {
+            NamedBarrier::arrive(T::NUM_THREADS, NamedBarriers::sV1RReady);
+        }
     }
 }
 
@@ -553,17 +568,19 @@ template<
     typename Engine0, typename Layout0
 >
 __forceinline__ __device__ void fill_oob_V(
-    Tensor<Engine0, Layout0> &sV,
+    Tensor<Engine0, Layout0> &sV, // tile_to_shape(Shape<Int<T::HEAD_DIM_V/2>,Int<T::PAGE_BLOCK_SIZE>>{});
     int valid_window_size,
     int idx_in_warpgroup
 ) {
+
+    using TransposeShapeAtomV = Shape<_8, _64>;
+    using SmemLayoutAtomVt = decltype(tile_to_shape(GMMA::Layout_K_SW64_Atom<uint64_t>{}, TransposeShapeAtomV{}));
+    using SmemLayoutVtHalf = 
+        decltype(tile_to_shape(SmemLayoutAtomVt{},
+                 Shape<Int<32>, Int<64>>{})); // Shape<Int<T::HEAD_DIM_V/2/(64/8)>, Int<T::PAGE_BLOCK_SIZE>>{})
     Tensor sV_int64 = make_tensor(
-        make_smem_ptr((int64_t*)(sV.data().get().get())),
-        tile_to_shape(
-            GMMA::Layout_MN_SW128_Atom<cute::int64_t>{},
-            Shape<Int<256/(64/8)>, Int<T::PAGE_BLOCK_SIZE>>{},
-            LayoutRight{}
-        )
+        make_smem_ptr((uint64_t*)(sV.data().get().get())),
+        SmemLayoutVtHalf{}
     );
     valid_window_size = max(valid_window_size, 0);
     int head_dim_size = size<0>(sV_int64);	// 128%head_dim_size == 0 should holds
@@ -582,7 +599,7 @@ template<
     typename Engine1, typename Layout1
 >
 __forceinline__ __device__ void store_o(
-    Tensor<Engine0, Layout0> &rO,	// ((2, 2, 32), 1, 1)
+    Tensor<Engine0, Layout0> &rO,	//((_2,_2,_32),_1,_1):((_1,_2,_4),_0,_0)
     Tensor<Engine1, Layout1> &gOorAccum,	// (BLOCK_SIZE_M, HEAD_DIM_V)
     float rL[2],
     char* sO_addr,        
@@ -763,6 +780,7 @@ __forceinline__ __device__ void wg0_subroutine(
 
     convert_type_out(tOrP_acc, rPb);
 
+    NamedBarrier::arrive_and_wait(T::NUM_THREADS, NamedBarriers::sV0LReady);
     // Issue rO0 += rPb @ sV0L
     if constexpr (IS_BLK0_LAST) {
         fill_oob_V<T>(sV0L, seqlen_k-start_token_idx, idx_in_warpgroup);
@@ -786,52 +804,22 @@ __forceinline__ __device__ void wg0_subroutine(
     
     // Wait for warpgroup 1, rescale O0, issue rO0 += rPb @ sV1L
     if constexpr (!IS_BLK0_LAST) {
+        NamedBarrier::arrive_and_wait(T::NUM_THREADS, NamedBarriers::sV1LReady);
         if constexpr (IS_BLK1_LAST) {
             fill_oob_V<T>(sV1L, seqlen_k-start_token_idx-T::PAGE_BLOCK_SIZE, idx_in_warpgroup);
             cutlass::arch::fence_view_async_shared();
         }
         NamedBarrier::arrive_and_wait(T::NUM_THREADS, NamedBarriers::rO1sP0sV0RIssued);
         wg0_rescale_rO0(rO0, sScale1, rL, idx_in_warpgroup);
-
-
-// if((idx_in_warpgroup == 0 || idx_in_warpgroup == 1|| idx_in_warpgroup == 32|| idx_in_warpgroup == 33) && blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 1) {
-//     for(int block_idx_id = 21; block_idx_id < 22; ++block_idx_id) {
-//         if(block_idx == block_idx_id){
-//             cute::warpgroup_fence_operand(rO0);
-//             float sum_rO0 = 0;
-//             for (int i = 0; i < size(rO0); ++i) {
-//                 printf("wg0 after warpgroup_cooperative_pv_gemm_localP : block_idx = %d, blockIdx.z = %d, threadIdx.x = %d, rO0(%2d) = %f\n", block_idx, blockIdx.z, threadIdx.x, i, (float)(rO0(i)));
-//                 sum_rO0 += (float)(rO0(i));
-//             }
-//             printf("wg0 warpgroup_cooperative_pv_gemm_localP: block_idx = %d, blockIdx.z = %d, threadIdx.x = %d, sum_rO0 = %f\n", block_idx, blockIdx.z, threadIdx.x, sum_rO0);
-//         }
-//     }
-// }
-
         //warpgroup_cooperative_pv_gemm_remoteP<T>(sP1, sV1L, rO0, idx_in_warpgroup);
         load_sP_to_rPb<T>(sP1_ptr, rPb, idx_in_warpgroup);
         warpgroup_cooperative_pv_gemm_localP<T>(rPb, sV1L, rO0, idx_in_warpgroup);
-
-// if((idx_in_warpgroup == 0 || idx_in_warpgroup == 1|| idx_in_warpgroup == 32|| idx_in_warpgroup == 33) && blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 1) {
-//     for(int block_idx_id = 21; block_idx_id < 64; ++block_idx_id) {
-//         if(block_idx == block_idx_id){
-//             cute::warpgroup_fence_operand(rO0);
-//             float sum_rO0 = 0;
-//             for (int i = 0; i < size(rO0); ++i) {
-//                 printf("wg0 after warpgroup_cooperative_pv_gemm_remoteP : block_idx = %d, blockIdx.z = %d, threadIdx.x = %d, rO0(%2d) = %f\n", block_idx, blockIdx.z, threadIdx.x, i, (float)(rO0(i)));
-//                 sum_rO0 += (float)(rO0(i));
-//             }
-//             printf("wg0 warpgroup_cooperative_pv_gemm_remoteP: block_idx = %d, blockIdx.z = %d, threadIdx.x = %d, sum_rO0 = %f\n", block_idx, blockIdx.z, threadIdx.x, sum_rO0);
-//         }
-//    }
-// }
-
     }
     
     // Issue P0 = Q @ K0^T
     // Since TMAs for these 4 tiles are launched right after rO0 += rPb @ sV0L finishes, they should have already finished. Therefore, we issue the first 4 tiles to fill the pipeline.
     if constexpr (!IS_BLK0_LAST && !IS_BLK1_LAST) {
-        warpgroup_cooperative_qkt_gemm<T, 0>(sQ, sK0, rP0, sVt0_ptr, barriers_K0, cur_phase_K0, idx_in_warpgroup);
+        warpgroup_cooperative_qkt_gemm<T, 0, 0>(sQ, sK0, rP0, sVt0_ptr, barriers_K0, cur_phase_K0, idx_in_warpgroup);
     }
 
     // Wait for rO0 += rPb @ sV1L, launch TMA
@@ -842,7 +830,7 @@ __forceinline__ __device__ void wg0_subroutine(
     
     // Issue P0 = Q @ K0^T
     if constexpr (!IS_BLK0_LAST && !IS_BLK1_LAST) {
-        warpgroup_cooperative_qkt_gemm<T, 2>(sQ, sK0, rP0, sVt0_ptr, barriers_K0, cur_phase_K0, idx_in_warpgroup);
+        warpgroup_cooperative_qkt_gemm<T, 2, 0>(sQ, sK0, rP0, sVt0_ptr, barriers_K0, cur_phase_K0, idx_in_warpgroup);
     }
 
     // Wait for P0 = Q @ K0^T
@@ -926,29 +914,14 @@ __forceinline__ __device__ void wg1_subroutine(
     // We do this after notifying warpgroup 1, since both "saving rPb to sP" and "issuing" WGMMA are high-latency operations
     if constexpr (!IS_BLK0_LAST) {
         save_rPb_to_sP<T>(rP1b, sP1_ptr, idx_in_warpgroup);
-        cutlass::arch::fence_view_async_shared();
     }
     if constexpr (!IS_BLK0_LAST) {
+        NamedBarrier::arrive_and_wait(T::NUM_THREADS, NamedBarriers::sV1RReady);
         if constexpr (IS_BLK1_LAST) {
             fill_oob_V<T>(sV1R, seqlen_k-start_token_idx-T::PAGE_BLOCK_SIZE, idx_in_warpgroup);
             cutlass::arch::fence_view_async_shared();
         }
         warpgroup_cooperative_pv_gemm_localP<T>(rP1b, sV1R, rO1, idx_in_warpgroup);
-
-// if((idx_in_warpgroup == 0 || idx_in_warpgroup == 1|| idx_in_warpgroup == 32|| idx_in_warpgroup == 33) && blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 1) {
-//     for(int block_idx_id = 21; block_idx_id < 22; ++block_idx_id) {
-//         if(block_idx == block_idx_id){
-//             cute::warpgroup_fence_operand(rO1);
-//             float sum_rO1 = 0;
-//             for (int i = 0; i < size(rO1); ++i) {
-//                 printf("wg1 after warpgroup_cooperative_pv_gemm_localP : block_idx = %d, blockIdx.z = %d, threadIdx.x = %d, rO1(%2d) = %f\n", block_idx, blockIdx.z, threadIdx.x, i, (float)(rO1(i)));
-//                 sum_rO1 += (float)(rO1(i));
-//             }
-//             printf("wg1 warpgroup_cooperative_pv_gemm_localP: block_idx = %d, blockIdx.z = %d, threadIdx.x = %d, sum_rO1 = %f\n", block_idx, blockIdx.z, threadIdx.x, sum_rO1);
-//         }
-//     }
-// }
-
         if constexpr (!IS_BLK1_LAST) {
             // We use this proxy for making sP1 visible to the async proxy
             // We skip it if IS_BLK1_LAST, since in that case we have already put a fence
@@ -958,6 +931,7 @@ __forceinline__ __device__ void wg1_subroutine(
     
     // Wait for sP0, issue rO1 += sP0 @ sV0R, notify warpgroup 0
     NamedBarrier::arrive_and_wait(T::NUM_THREADS, NamedBarriers::sP0Ready);
+    NamedBarrier::arrive_and_wait(T::NUM_THREADS, NamedBarriers::sV0RReady);
     if constexpr (IS_BLK0_LAST) {
         fill_oob_V<T>(sV0R, seqlen_k-start_token_idx, idx_in_warpgroup);
         cutlass::arch::fence_view_async_shared();
@@ -966,23 +940,6 @@ __forceinline__ __device__ void wg1_subroutine(
     //warpgroup_cooperative_pv_gemm_remoteP<T>(sP0, sV0R, rO1, idx_in_warpgroup);
     load_sP_to_rPb<T>(sP0_ptr, rP1b, idx_in_warpgroup);
     warpgroup_cooperative_pv_gemm_localP<T>(rP1b, sV0R, rO1, idx_in_warpgroup);
-
-
-// if((idx_in_warpgroup == 0 || idx_in_warpgroup == 1|| idx_in_warpgroup == 32|| idx_in_warpgroup == 33) && blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 1) {
-//     for(int block_idx_id = 21; block_idx_id < 64; ++block_idx_id) {
-//         if(block_idx == block_idx_id){
-//             cute::warpgroup_fence_operand(rO1);
-//             float sum_rO1 = 0;
-//             for (int i = 0; i < size(rO1); ++i) {
-//                 sum_rO1 += (float)(rO1(i));
-//             }
-//             printf("wg1 warpgroup_cooperative_pv_gemm_remoteP: block_idx = %d, blockIdx.z = %d, threadIdx.x = %d, sum_rO1 = %f\n", block_idx, blockIdx.z, threadIdx.x, sum_rO1);
-//         }
-//    }
-// }
-
-
-
     if constexpr (!IS_BLK0_LAST) {
         NamedBarrier::arrive(T::NUM_THREADS, NamedBarriers::rO1sP0sV0RIssued);
     }
@@ -1001,7 +958,7 @@ __forceinline__ __device__ void wg1_subroutine(
 
     if constexpr (!IS_BLK0_LAST && !IS_BLK1_LAST && !IS_BLK2_LAST) {
         // Issue rP1 = sQ @ sK1, wait
-        warpgroup_cooperative_qkt_gemm<T, 1>(sQ, sK1, rP1, sVt1_ptr, barriers_K1, cur_phase_K1, idx_in_warpgroup);
+        warpgroup_cooperative_qkt_gemm<T, 1, 1>(sQ, sK1, rP1, sVt1_ptr, barriers_K1, cur_phase_K1, idx_in_warpgroup);
     }
 
     // We put the `cute::warpgroup_wait<0>()` out of the `if` statement above, otherwise
@@ -1215,8 +1172,10 @@ flash_fwd_splitkv_mla_kernel(__grid_constant__ const Flash_fwd_mla_params params
                         fp8_transpose_v<T>(sK0.data().get().get(), sVt0_ptr, i); // transpose sK
                         cutlass::arch::fence_view_async_shared();  
                     }
-                }                
+                }
             }
+            NamedBarrier::arrive(T::NUM_THREADS, NamedBarriers::sV0LReady);
+            NamedBarrier::arrive(T::NUM_THREADS, NamedBarriers::sV0RReady);
             cur_phase_K0 ^= 1;
             
             // Issue P0 = Q @ K0^T, wait
@@ -1252,7 +1211,7 @@ flash_fwd_splitkv_mla_kernel(__grid_constant__ const Flash_fwd_mla_params params
             
             if (start_block_idx+1 < end_block_idx) {
                 // Issue rP1 = sQ @ sK1, wait
-                warpgroup_cooperative_qkt_gemm<T, 1>(sQ, sK1, rP1, sVt1_ptr, barriers_K1, cur_phase_K1, idx_in_warpgroup);
+                warpgroup_cooperative_qkt_gemm<T, 1, 1>(sQ, sK1, rP1, sVt1_ptr, barriers_K1, cur_phase_K1, idx_in_warpgroup);
                 cute::warpgroup_wait<0>();
             }
 

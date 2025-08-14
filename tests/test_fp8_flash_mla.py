@@ -33,7 +33,7 @@ def cal_diff(x: torch.Tensor, y: torch.Tensor, name: str, use_fp8: bool=False) -
     RMSE = ((x - y) * (x - y)).mean().sqrt().item()
     cos_diff = 1 - 2 * (x * y).sum().item() / max((x * x + y * y).sum().item(), 1e-12)
     amax_diff = (x - y).abs().max().item()
-    #print(f"{name}: {cos_diff=}, {RMSE=}, {amax_diff=}")
+    print(f"{name}: {cos_diff=}, {RMSE=}, {amax_diff=}")
 
     if use_fp8:
         assert cos_diff < 1e-2
@@ -149,6 +149,13 @@ def test_flash_mla(b, s_q, mean_sk, h_q, h_kv, d, dv, causal, varlen, torch_dtyp
     out_flash, lse_flash = flash_mla()
     out_torch, lse_torch = ref_mla()
 
+    # print("out_flash.shape: ", out_flash.shape)
+    # print("out_flash: ", out_flash)
+    # print("out_torch: ", out_torch)
+    # print("lse_flash: ", lse_flash)
+    # print("lse_torch: ", lse_torch)
+
+
     #for i in range(1,2):
     # for i in range(out_flash.shape[0]):
     #     diff_nums = 0
@@ -159,25 +166,17 @@ def test_flash_mla(b, s_q, mean_sk, h_q, h_kv, d, dv, causal, varlen, torch_dtyp
     #                     #print(f"out_flash[{i}, {j}, {k}, {l}] = {out_flash[i, j, k, l]}, out_torch[{i}, {j}, {k}, {l}] = {out_torch[i, j, k, l]}")
     #                     diff_nums+=1
     #     print("batch : ", i , " ,diff_nums: ", diff_nums)
+
     # for i in range(out_flash.shape[0]):
     #     diff_nums = 0
     #     for j in range(out_flash.shape[1]):
     #         for k in range(out_flash.shape[2]):
     #             for l in range(out_flash.shape[3]):
-    #                 if abs(abs(out_flash[i, j, k, l] - out_torch[i, j, k, l])/ out_torch[i, j, k, l])> 0.2:
+    #                 if abs(abs(out_flash[i, j, k, l] - out_torch[i, j, k, l])/ out_torch[i, j, k, l])> 0.3:
     #                     #print(f"out_flash[{i}, {j}, {k}, {l}] = {out_flash[i, j, k, l]}, out_torch[{i}, {j}, {k}, {l}] = {out_torch[i, j, k, l]}")
     #                     diff_nums+=1
     #     print("batch : ", i , " ,diff_nums: ", diff_nums)
 
-    '''
-
-    #print("diff_nums: ", diff_nums, "sum_nums: ", out_flash.shape[0] * out_flash.shape[1] * out_flash.shape[2] * out_flash.shape[3])
-
-    
-    #print("fp8 out softmax_lse: ",lse_flash)
-    
-
-    '''
     cal_diff(out_flash, out_torch, "out", use_fp8)
     cal_diff(lse_flash, lse_torch, "lse")
 
@@ -199,9 +198,9 @@ def main(torch_dtype):
 
     h_kv = 1
     d, dv = 576, 512
-    causal = False
+    causal = True
 
-    for b in [8,16,32,48,64]:
+    for b in [64]:
         for s in [4096]:
             for h_q in [64]:  # TP = 8, 4, 2, 1
                 for s_q in [2]:  # MTP = 1, 2

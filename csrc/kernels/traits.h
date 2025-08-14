@@ -95,47 +95,13 @@ struct Traits {
 
     using RegLayout = Layout<Shape <Shape<Shape<_2,_4>,_1>,_1,_1>,
                             Stride<Stride<Stride<_1,_2>,_0>,_0,_0>>;
-    
-    
-    // /* ---------- Shared memory plan ---------- */
-    // struct SharedMemoryPlan {
-    //     array_aligned<InputT, cosize_v<SmemLayoutQ>> smem_sQ;
-
-    //     array_aligned<OutputT, cosize_v<SmemLayoutO>> smem_sK0; // overlap output: output use smem_sK0 
-
-
-    //     array_aligned<InputT, cosize_v<SmemLayoutK>> smem_sK1; 
-
-    //     std::conditional_t<IsFp8,
-    //         array_aligned<InputT,
-    //            cosize_v<typename SmemTransposeFp8_64x64<PAGE_BLOCK_SIZE,
-    //                                                     HEAD_DIM_V>::SmemLayoutVt>>,
-    //                                                     char> smem_vt0;
-    //     std::conditional_t<IsFp8,
-    //         array_aligned<InputT,
-    //            cosize_v<typename SmemTransposeFp8_64x64<PAGE_BLOCK_SIZE,
-    //                                                     HEAD_DIM_V>::SmemLayoutVt>>,
-    //                                                     char> smem_vt1;
-
-    //     //array_aligned<InputT , cosize_v<SmemLayoutP0>> smem_sP0;
-    //     //array_aligned<InputT , cosize_v<SmemLayoutP0>> smem_sP1;
-    //     alignas(16) uint16_t smem_sP0[64 * 32];
-    //     alignas(16) uint16_t smem_sP1[64 * 32];
-    //     array_aligned<float  , BLOCK_SIZE_M>          smem_sM;
-    //     array_aligned<float  , 2*BLOCK_SIZE_M>        sL_reduction_wksp;
-    //     array_aligned<float  , BLOCK_SIZE_M>          smem_sScale0;
-    //     array_aligned<float  , BLOCK_SIZE_M>          smem_sScale1;
-    //     TMABarrier barriers_K0[HEAD_DIM_K/64];
-    //     TMABarrier barriers_K1[HEAD_DIM_K/64];
-    //     TMABarrier barrier_Q;
-    // };
 
     struct SharedMemoryPlan {
         alignas(16) InputT smem_sQ[BLOCK_SIZE_M * HEAD_DIM_K];
         alignas(16) InputT smem_sK0[PAGE_BLOCK_SIZE * HEAD_DIM_K * 2];
         alignas(16) InputT smem_sK1[PAGE_BLOCK_SIZE * HEAD_DIM_K];
-        alignas(16) InputT smem_vt0[PAGE_BLOCK_SIZE * HEAD_DIM_V];
         alignas(16) InputT smem_vt1[PAGE_BLOCK_SIZE * HEAD_DIM_V];
+        alignas(16) InputT smem_vt0[PAGE_BLOCK_SIZE * HEAD_DIM_V];
         alignas(16) uint16_t smem_sP0[64 * 32];
         alignas(16) uint16_t smem_sP1[64 * 32];
 
@@ -170,4 +136,8 @@ enum NamedBarriers : int {
     sP0Ready = 2,
     rO1sP0sV0RIssued = 3,
     sMInitialized = 4,
+    sV0LReady = 5,
+    sV0RReady = 6,
+    sV1LReady = 7,
+    sV1RReady = 8,
 };
