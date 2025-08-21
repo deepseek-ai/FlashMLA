@@ -13,6 +13,7 @@ struct Flash_fwd_mla_params {
     int num_blocks;     // Number of blocks in total
     int q_head_per_hk;  // The number of q_head(s) per KV head, = h_q / h_k
     bool is_causal;
+    int window_left;
     float scale_softmax, scale_softmax_log2;
     
     void *__restrict__ q_ptr;
@@ -55,4 +56,8 @@ struct Mla_metadata_params {
     int block_size_n;
     int fixed_overhead_num_blocks;
     int num_sm_parts;
+    // used for window
+    int window_left;
+    bool is_causal;
+    int s_q;
 };

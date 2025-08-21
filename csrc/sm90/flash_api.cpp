@@ -23,8 +23,11 @@
 std::vector<at::Tensor>
 get_mla_metadata(
     at::Tensor &seqlens_k,
-    const int num_heads_per_head_k,
-    const int num_heads_k
+    const int num_heads_per_head_k, // seq_len_q * (num_heads_q / num_heads_k)
+    const int num_heads_k,
+    const int window_left,
+    bool is_causal,
+    const int s_q
 ) {
     CHECK_DEVICE(seqlens_k);
     TORCH_CHECK(seqlens_k.is_contiguous());
@@ -53,6 +56,9 @@ get_mla_metadata(
     params.block_size_n = Config::PAGE_BLOCK_SIZE;
     params.fixed_overhead_num_blocks = Config::FIXED_OVERHEAD_NUM_BLOCKS;
     params.num_sm_parts = num_sm_parts;
+    params.window_left = window_left;
+    params.is_causal = is_causal;
+    params.s_q = s_q;
     run_get_mla_metadata_kernel(params, stream);
 
     return {tile_scheduler_metadata, num_splits};
@@ -67,6 +73,7 @@ mha_fwd_kvcache_mla(
     const at::Tensor &block_table,               // batch_size x max_num_blocks_per_seq
     const float softmax_scale,
     bool is_causal,
+    int window_left,
     const at::Tensor &tile_scheduler_metadata,   // num_sm_parts x TileSchedulerMetaDataSize
     const at::Tensor &num_splits                 // batch_size + 1
 ) {
@@ -120,6 +127,8 @@ mha_fwd_kvcache_mla(
     const int num_q_heads_per_hk = num_heads_q / num_heads_k;
     const int q_seq_per_hk = seqlen_q_ori * num_q_heads_per_hk;
     const int num_heads = num_heads_k;
+    // [b, qlen, h_k, h_q/h_k, d] -> [b, qlen, h_q/h_k, h_k, d]
+    //   -> make contiguous -> reshape to [b, h_q/h_k*qlen, h_k, d]
     q = q.view({batch_size, seqlen_q_ori, num_heads_k, num_q_heads_per_hk, head_size_k}).transpose(2, 3)
             .reshape({batch_size, q_seq_per_hk, num_heads, head_size_k});
 
@@ -148,6 +157,7 @@ mha_fwd_kvcache_mla(
     params.num_blocks = num_blocks;
     params.q_head_per_hk = num_q_heads_per_hk;
     params.is_causal = is_causal;
+    params.window_left = window_left;
     params.d = head_size_k;
     params.d_v = head_size_v;
     params.scale_softmax = softmax_scale;
@@ -158,12 +168,15 @@ mha_fwd_kvcache_mla(
     params.o_ptr = out.data_ptr();
     params.softmax_lse_ptr = softmax_lse.data_ptr();
     // All stride are in elements, not bytes.
+    // qshape: [b, h_q/h_k*qlen, h_k, d]
+    // kshape: [num_blocks, page_size, khead, dim]
     params.q_batch_stride = q.stride(0);
     params.k_batch_stride = kcache.stride(0);
     params.o_batch_stride = out.stride(0);
     params.q_row_stride = q.stride(-3);
     params.k_row_stride = kcache.stride(-3);
     params.o_row_stride = out.stride(-3);
+    // head_stride = dim
     params.q_head_stride = q.stride(-2);
     params.k_head_stride = kcache.stride(-2);
     params.o_head_stride = out.stride(-2);

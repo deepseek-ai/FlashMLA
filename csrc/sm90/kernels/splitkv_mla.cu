@@ -319,6 +319,7 @@ __forceinline__ __device__ void warpgroup_cooperative_pv_gemm_remoteP(
 
 template<
     typename T,
+    bool IS_BLK0_FIRST,
     bool DO_OOB_FILLING,
     typename Engine0, typename Layout0,
     typename Engine1, typename Layout1,
@@ -334,6 +335,7 @@ __forceinline__ __device__ void wg0_bunch_0(
     Tensor<Engine4, Layout4> &sM,	// (BLOCK_SIZE_M)
     float rL[2],
     int rRightBorderForQSeq[2],
+    int rLeftBorderForQSeq[2],
     float scale_softmax_log2,
     int start_token_idx,
     int idx_in_warpgroup
@@ -348,9 +350,15 @@ __forceinline__ __device__ void wg0_bunch_0(
         CUTLASS_PRAGMA_UNROLL
         for (int i = local_row_idx ? 2 : 0; i < size(rP0); i += 4) {
             if constexpr (DO_OOB_FILLING) {
+                // token_idx is col_idx. from wgmma-64N16-D.png
                 int token_idx = start_token_idx + (i/4)*8 + idx_in_warpgroup%4*2;
                 rP0(i) = token_idx < rRightBorderForQSeq[local_row_idx] ? rP0(i) : MAX_INIT_VAL;
                 rP0(i+1) = token_idx+1 < rRightBorderForQSeq[local_row_idx] ? rP0(i+1) : MAX_INIT_VAL;
+            }
+            if constexpr (IS_BLK0_FIRST) {
+                int token_idx = start_token_idx + (i/4)*8 + idx_in_warpgroup%4*2;
+                rP0(i) = token_idx >= rLeftBorderForQSeq[0] ? rP0(i) : MAX_INIT_VAL;
+                rP0(i+1) = token_idx+1 >= rLeftBorderForQSeq[1] ? rP0(i+1) : MAX_INIT_VAL;
             }
             cur_max = max(cur_max, max(rP0(i), rP0(i+1)));
         }
@@ -391,6 +399,7 @@ __forceinline__ __device__ void wg0_bunch_0(
 
 template<
     typename T,
+    bool IS_BLK0_FIRST,
     bool IS_BLK0_LAST,
     bool IS_BLK1_LAST,
     bool IS_BLK2_LAST,
@@ -408,6 +417,7 @@ __forceinline__ __device__ void wg1_bunch_0(
     Tensor<Engine3, Layout3> &sM,	// (BLOCK_SIZE_M)
     float rL[2],
     int rRightBorderForQSeq[2],
+    int rLeftBorderForQSeq[2],
     Tensor<Engine4, Layout4> const &sScale0,	// (BLOCK_SIZE_M)
     Tensor<Engine5, Layout5> &rP1,	// ((2, 2, 8), 1, 1)
     float scale_softmax_log2,
@@ -425,11 +435,17 @@ __forceinline__ __device__ void wg1_bunch_0(
             if constexpr (IS_BLK1_LAST || IS_BLK2_LAST) {
                 // Need to apply the mask when either this block is the last one, or
                 // the next block is the last one (because of the causal mask)
+                // token_idx is col_idx
                 int token_idx = start_token_idx + (i/4)*8 + idx_in_warpgroup%4*2;
                 rP1(i) = token_idx < rRightBorderForQSeq[local_row_idx] ? rP1(i) : MAX_INIT_VAL;
                 rP1(i+1) = token_idx+1 < rRightBorderForQSeq[local_row_idx] ? rP1(i+1) : MAX_INIT_VAL;
             } else if constexpr (IS_BLK0_LAST) {
                 rP1(i) = rP1(i+1) = MAX_INIT_VAL;
+            }
+            if constexpr (IS_BLK0_FIRST) {
+                int token_idx = start_token_idx + (i/4)*8 + idx_in_warpgroup%4*2;
+                rP1(i) = token_idx >= rLeftBorderForQSeq[0] ? rP1(i) : MAX_INIT_VAL;
+                rP1(i+1) = token_idx+1 >= rLeftBorderForQSeq[1] ? rP1(i+1) : MAX_INIT_VAL;
             }
             cur_max = max(cur_max, max(rP1(i), rP1(i+1)));
         }
@@ -695,8 +711,9 @@ __forceinline__ __device__ void launch_q_copy(
     TMABarrier* barrier_Q
 ) {
     if (threadIdx.x == 0) {
+        // mQ: [h_q/h_k*qlen, d, h_k, b]
         Tensor tma_gQ = tma_params.tma_Q.get_tma_tensor(tma_params.shape_Q)(_, _, k_head_idx, batch_idx);	// (seqlen_q, HEAD_DIM)
-        auto thr_tma = tma_params.tma_Q.get_slice(_0{});
+        auto thr_tma = tma_params.tma_Q.get_slice(/*cta_idx_in_cluster*/_0{});
         Tensor my_tma_gQ = flat_divide(tma_gQ, Shape<Int<T::BLOCK_SIZE_M>, Int<T::HEAD_DIM_K>>{})(_, _, m_block_idx, _0{});
         cute::copy(
             tma_params.tma_Q.with(reinterpret_cast<typename TMABarrier::ValueType &>(*barrier_Q), 0, cute::TMA::CacheHintSm90::EVICT_FIRST),
@@ -721,6 +738,7 @@ __forceinline__ __device__ auto get_half_V(
 
 template<
     typename T,
+    bool IS_BLK0_FIRST,
     bool IS_BLK0_LAST,	// "BLK0" means block_idx+0, "BLK1" means block_idx+1, ...
     bool IS_BLK1_LAST,
     typename TMAParams,
@@ -752,6 +770,7 @@ __forceinline__ __device__ void wg0_subroutine(
     Tensor<Engine11, Layout11> &rO0,
     float rL[2],
     int rRightBorderForQSeq[2],
+    int rLeftBorderForQSeq[2],
     TMABarrier barriers_K0[9],
     TMABarrier barriers_K1[9],
     bool &cur_phase_K0,
@@ -773,7 +792,10 @@ __forceinline__ __device__ void wg0_subroutine(
 
     Tensor rPb = make_tensor<T::InputT>(Shape<Shape<_2, _2, _2>, _1, _4>{});
     // Calc P0 = softmax(P0)
-    wg0_bunch_0<T, IS_BLK0_LAST||IS_BLK1_LAST>(rPb, rP0, rO0, sScale0, sM, rL, rRightBorderForQSeq, params.scale_softmax_log2, start_token_idx, idx_in_warpgroup);
+    wg0_bunch_0<T, IS_BLK0_FIRST, IS_BLK0_LAST||IS_BLK1_LAST>(
+        rPb, rP0, rO0, sScale0, sM, rL, rRightBorderForQSeq, rLeftBorderForQSeq,
+        params.scale_softmax_log2, start_token_idx, idx_in_warpgroup
+    );
     NamedBarrier::arrive(T::NUM_THREADS, NamedBarriers::sScale0Ready);
 
     // Issue rO0 += rPb @ sV0L
@@ -832,6 +854,7 @@ __forceinline__ __device__ void wg0_subroutine(
 
 template<
     typename T,
+    bool IS_BLK0_FIRST,
     bool IS_BLK0_LAST,
     bool IS_BLK1_LAST,
     bool IS_BLK2_LAST,
@@ -864,6 +887,7 @@ __forceinline__ __device__ void wg1_subroutine(
     Tensor<Engine11, Layout11> &rO1,
     float rL[2],
     int rRightBorderForQSeq[2],
+    int rLeftBorderForQSeq[2],
     TMABarrier barriers_K0[9],
     TMABarrier barriers_K1[9],
     bool &cur_phase_K1,
@@ -886,7 +910,10 @@ __forceinline__ __device__ void wg1_subroutine(
 
     // Wait for rP1 and warpgroup 0, run bunch 1, notify warpgroup 0
     NamedBarrier::arrive_and_wait(T::NUM_THREADS, NamedBarriers::sScale0Ready);
-    wg1_bunch_0<T, IS_BLK0_LAST, IS_BLK1_LAST, IS_BLK2_LAST>(rP1b, sScale1, rO1, sM, rL, rRightBorderForQSeq, sScale0, rP1, params.scale_softmax_log2, start_token_idx+T::PAGE_BLOCK_SIZE, idx_in_warpgroup);
+    wg1_bunch_0<T, IS_BLK0_FIRST, IS_BLK0_LAST, IS_BLK1_LAST, IS_BLK2_LAST>(
+        rP1b, sScale1, rO1, sM, rL, rRightBorderForQSeq, rLeftBorderForQSeq, sScale0, rP1,
+        params.scale_softmax_log2, start_token_idx+T::PAGE_BLOCK_SIZE, idx_in_warpgroup
+    );
     NamedBarrier::arrive(T::NUM_THREADS, NamedBarriers::sScale1Ready);
 
     // Save rPb to sP, and issue rO1 += rP1b @ sV1R
@@ -966,6 +993,9 @@ flash_fwd_splitkv_mla_kernel(__grid_constant__ const Flash_fwd_mla_params params
     // If is_no_split is True, then this request is exclusively assigned to this sm_part, so we shall write the result directly into params.o_ptr and params.softmax_lse_ptr. Otherwise, write to oaccum_ptr and softmax_lseaccum_ptr, with the corresponding split idx being (n_split_idx + num_splits_ptr[batch_idx])
     // For the complete schedule of the kernel, please read our deep-dive write-up (link can be found in the README.md file).
 
+    /* grid = (num_m_block, h_k, params.num_sm_parts) */ 
+    /* num_m_block = ceil_dev(q_seq_per_hk, BLOCK_M) */
+
     const int m_block_idx = blockIdx.x;
     const int k_head_idx = blockIdx.y;
     const int partition_idx = blockIdx.z;
@@ -1034,11 +1064,13 @@ flash_fwd_splitkv_mla_kernel(__grid_constant__ const Flash_fwd_mla_params params
         constexpr int kBlockN = T::PAGE_BLOCK_SIZE;
         const int n_split_idx = batch_idx == begin_idx ? begin_n_split_idx : 0;
         int seqlen_k = __ldg(params.seqlens_k_ptr + batch_idx);
-        const int start_block_idx = batch_idx == begin_idx ? begin_seqlen / kBlockN : 0;
+        int start_block_idx = batch_idx == begin_idx ? begin_seqlen / kBlockN : 0;
         int end_block_idx = batch_idx == end_idx ? cute::ceil_div(end_seqlen, kBlockN) : cute::ceil_div(seqlen_k, kBlockN);
-        const bool is_no_split = start_block_idx == 0 && end_block_idx == cute::ceil_div(seqlen_k, kBlockN);
+        const bool is_no_split = (params.num_splits_ptr[batch_idx+1] - params.num_splits_ptr[batch_idx]) == 1;
+        // const bool is_no_split = start_block_idx == 0 && end_block_idx == cute::ceil_div(seqlen_k, kBlockN);
         
         int rRightBorderForQSeq[2];
+        int rLeftBorderForQSeq[2] = {0};
         if (params.is_causal) {
             // The causal mask looks like:
             // XXXX
@@ -1057,16 +1089,64 @@ flash_fwd_splitkv_mla_kernel(__grid_constant__ const Flash_fwd_mla_params params
             // Besides, a token may have some extra masks other than the common mask. We use rRightBorderForQSeq to denote it, which means the right border of the k-sequence for the particular q token. In this way, (seqlen_k-common_mask_len) - rRightBorderForQSeq < 64 holds, which means that we only need to apply the causal mask to the last two KV blocks
             // NOTE This may lead to start_block_idx >= end_block_idx which needs some special handling
             int common_mask_len = get_mask_len(params, m_block_idx, T::BLOCK_SIZE_M-1);
-            end_block_idx = batch_idx == end_idx ? cute::ceil_div(min(end_seqlen, seqlen_k-common_mask_len), kBlockN) : cute::ceil_div(seqlen_k-common_mask_len, kBlockN);
+            int max_mask_len = get_mask_len(params, m_block_idx, 0);
+            int window_left = params.window_left;
+
+            end_block_idx = batch_idx == end_idx ? 
+                cute::ceil_div(min(end_seqlen, seqlen_k-common_mask_len), kBlockN) : 
+                cute::ceil_div(seqlen_k-common_mask_len, kBlockN)
+            ;
+            if (window_left >= 0) {
+                start_block_idx = batch_idx == begin_idx ?
+                    max(begin_seqlen, seqlen_k-max_mask_len-window_left) / kBlockN:
+                    max(seqlen_k-max_mask_len-window_left, 0) / kBlockN
+                ;
+            }
 
             CUTLASS_PRAGMA_UNROLL
             for (int local_row_idx = 0; local_row_idx < 2; ++local_row_idx) {
                 int row_idx = get_AorC_row_idx(local_row_idx, idx_in_warpgroup);
-                rRightBorderForQSeq[local_row_idx] = min(seqlen_k-get_mask_len(params, m_block_idx, row_idx), end_block_idx*T::PAGE_BLOCK_SIZE);
+                rRightBorderForQSeq[local_row_idx] = min(
+                    seqlen_k-get_mask_len(params, m_block_idx, row_idx),
+                    end_block_idx*T::PAGE_BLOCK_SIZE
+                );
+                if (window_left >= 0) {
+                    rLeftBorderForQSeq[local_row_idx] = max(
+                        seqlen_k-get_mask_len(params, m_block_idx, row_idx)-window_left,
+                        start_block_idx*T::PAGE_BLOCK_SIZE
+                    );
+                }
             }
         } else {
             rRightBorderForQSeq[0] = rRightBorderForQSeq[1] = seqlen_k;
+            int window_left = params.window_left; 
+            if (window_left >= 0) {
+                start_block_idx = batch_idx == begin_idx ?
+                    max(seqlen_k-window_left, begin_seqlen) / kBlockN:
+                    max(seqlen_k-window_left, 0) / kBlockN
+                ;
+                rLeftBorderForQSeq[0] = rLeftBorderForQSeq[1] = max(seqlen_k - window_left, 0);
+            }
         }
+        #ifdef MYDEBUG
+        if (
+            (partition_idx==18) && 
+            (threadIdx.x == 7 || threadIdx.x == 7+32)
+        ) {
+            int row_idx = get_AorC_row_idx(0, threadIdx.x);
+            int row_idx1 = get_AorC_row_idx(1, threadIdx.x);
+            printf(
+                "(%d,%d,%d): tid=%d, is_causal=%d, row_idx=%d,%d,"
+                "rightBorder=%d,%d, leftBorder=%d,%d,\n"
+                "    batch_idx=%d, seqlen_k=%d, start_block_idx=%d, end_block_idx=%d\n",
+                m_block_idx, k_head_idx, partition_idx,
+                threadIdx.x, params.is_causal, row_idx, row_idx1,
+                rRightBorderForQSeq[0], rRightBorderForQSeq[1],
+                rLeftBorderForQSeq[0], rLeftBorderForQSeq[1],
+                batch_idx, seqlen_k, start_block_idx, end_block_idx
+            );
+        }
+        #endif
 
         // Define global tensors
         using InputT = typename T::InputT;
@@ -1128,25 +1208,35 @@ flash_fwd_splitkv_mla_kernel(__grid_constant__ const Flash_fwd_mla_params params
             NamedBarrier::arrive_and_wait(128, NamedBarriers::sMInitialized);
             cute::warpgroup_wait<0>();
 
-            #define LAUNCH_WG0_SUBROUTINE(IS_BLK0_LAST, IS_BLK1_LAST) \
-                wg0_subroutine<T, IS_BLK0_LAST, IS_BLK1_LAST>( \
+            #define LAUNCH_WG0_SUBROUTINE(IS_BLK0_FIRST, IS_BLK0_LAST, IS_BLK1_LAST) \
+                wg0_subroutine<T, IS_BLK0_FIRST, IS_BLK0_LAST, IS_BLK1_LAST>( \
                     tma_gK, sQ, sK0, sK1, sP0, sP1, sM, sScale0, sScale1, \
-                    rQ8, rP0, rO, rL, rRightBorderForQSeq, \
+                    rQ8, rP0, rO, rL, rRightBorderForQSeq, rLeftBorderForQSeq, \
                     barriers_K0, barriers_K1, cur_phase_K0, \
                     tma_params, params, \
                     block_table_ptr, seqlen_k, block_idx, end_block_idx, idx_in_warpgroup \
                 );
 
             int block_idx = start_block_idx;
+            // handle first block
+            if (block_idx < end_block_idx-2) {
+                LAUNCH_WG0_SUBROUTINE(true, false, false);
+            } else if (block_idx == end_block_idx-2) {
+                LAUNCH_WG0_SUBROUTINE(true, false, true);
+            } else if (block_idx < end_block_idx) {
+                LAUNCH_WG0_SUBROUTINE(true, true, false);
+            }
+            block_idx += 2;
+
             #pragma unroll 1
             for (; block_idx < end_block_idx-2; block_idx += 2) {
-                LAUNCH_WG0_SUBROUTINE(false, false);
+                LAUNCH_WG0_SUBROUTINE(false, false, false);
             }
 
             if (block_idx+1 < end_block_idx) {
-                LAUNCH_WG0_SUBROUTINE(false, true);
+                LAUNCH_WG0_SUBROUTINE(false, false, true);
             } else if (block_idx < end_block_idx) {
-                LAUNCH_WG0_SUBROUTINE(true, false);
+                LAUNCH_WG0_SUBROUTINE(false, true, false);
             }
 
         } else {
@@ -1159,29 +1249,41 @@ flash_fwd_splitkv_mla_kernel(__grid_constant__ const Flash_fwd_mla_params params
                 cute::warpgroup_wait<0>();
             }
 
-            #define LAUNCH_WG1_SUBROUTINE(IS_BLK0_LAST, IS_BLK1_LAST, IS_BLK2_LAST) \
-                wg1_subroutine<T, IS_BLK0_LAST, IS_BLK1_LAST, IS_BLK2_LAST>( \
+            #define LAUNCH_WG1_SUBROUTINE(IS_BLK0_FIRST, IS_BLK0_LAST, IS_BLK1_LAST, IS_BLK2_LAST) \
+                wg1_subroutine<T, IS_BLK0_FIRST, IS_BLK0_LAST, IS_BLK1_LAST, IS_BLK2_LAST>( \
                     tma_gK, sQ, sK0, sK1, sP0, sP1, sM, sScale0, sScale1, \
-                    rQ8, rP1, rO, rL, rRightBorderForQSeq, \
+                    rQ8, rP1, rO, rL, rRightBorderForQSeq, rLeftBorderForQSeq, \
                     barriers_K0, barriers_K1, cur_phase_K1, \
                     tma_params, params, \
                     block_table_ptr, seqlen_k, block_idx, end_block_idx, idx_in_warpgroup \
                 );
 
             int block_idx = start_block_idx;
+            // handle first block
+            if (block_idx < end_block_idx-3) {
+                LAUNCH_WG1_SUBROUTINE(true, false, false, false);
+            } else if (block_idx < end_block_idx-2) {
+                LAUNCH_WG1_SUBROUTINE(true, false, false, true);
+            } else if (block_idx < end_block_idx-1) {
+                LAUNCH_WG1_SUBROUTINE(true, false, true, false);
+            } else if (block_idx < end_block_idx) {
+                LAUNCH_WG1_SUBROUTINE(true, true, false, false);
+            }
+            block_idx += 2;
+            // Although check whether the 3 blocks have ended, the step size is still 2.
             #pragma unroll 1
             for (; block_idx < end_block_idx-3; block_idx += 2) {
-                LAUNCH_WG1_SUBROUTINE(false, false, false);
+                LAUNCH_WG1_SUBROUTINE(false, false, false, false);
             }
 
             if (block_idx+2 < end_block_idx) {
-                LAUNCH_WG1_SUBROUTINE(false, false, true);
+                LAUNCH_WG1_SUBROUTINE(false, false, false, true);
                 block_idx += 2;
-                LAUNCH_WG1_SUBROUTINE(true, false, false);
+                LAUNCH_WG1_SUBROUTINE(false, true, false, false);
             } else if (block_idx+1 < end_block_idx) {
-                LAUNCH_WG1_SUBROUTINE(false, true, false);
+                LAUNCH_WG1_SUBROUTINE(false, false, true, false);
             } else if (block_idx < end_block_idx) {
-                LAUNCH_WG1_SUBROUTINE(true, false, false);
+                LAUNCH_WG1_SUBROUTINE(false, true, false, false);
             }
         }
 
@@ -1273,6 +1375,7 @@ flash_fwd_splitkv_mla_kernel(__grid_constant__ const Flash_fwd_mla_params params
 template<typename InputT>
 void run_flash_splitkv_mla_kernel(Flash_fwd_mla_params &params, cudaStream_t stream) {
     using T = Traits<InputT>;
+    // here q_*_stride is stride after reshape in `flash_api.cpp`
     auto shape_Q = make_shape(params.q_seq_per_hk, params.d, params.h_k, params.b);
     auto tma_Q = cute::make_tma_copy(
         SM90_TMA_LOAD{},
@@ -1335,9 +1438,18 @@ void run_flash_splitkv_mla_kernel(Flash_fwd_mla_params &params, cudaStream_t str
     cudaLaunchAttribute mla_kernel_attributes[1];
     mla_kernel_attributes[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
     mla_kernel_attributes[0].val.programmaticStreamSerializationAllowed = 1;
+    dim3 dimGrid(num_m_block, params.h_k, params.num_sm_parts);
+    dim3 dimBlock(T::NUM_THREADS, 1, 1);
+    #ifdef MYDEBUG
+    printf(
+        "launch kernel: flash_fwd_splitkv_mla_kernel grid(%d,%d,%d) thread(%d)\n",
+        dimGrid.x, dimGrid.y, dimGrid.z,
+        dimBlock.x
+    );
+    #endif
     cudaLaunchConfig_t mla_kernel_config = {
-        dim3(num_m_block, params.h_k, params.num_sm_parts),
-        dim3(T::NUM_THREADS, 1, 1),
+        dimGrid,
+        dimBlock,
         smem_size,
         stream,
         mla_kernel_attributes,
