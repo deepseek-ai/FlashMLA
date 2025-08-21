@@ -187,6 +187,15 @@ void run_flash_mla_combine_kernel(Flash_fwd_mla_params &params, cudaStream_t str
         cudaLaunchAttribute attribute[1];
         attribute[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
         attribute[0].val.programmaticStreamSerializationAllowed = 1;
+        dim3 dimGrid(params.b, cute::ceil_div(params.h_k*params.q_seq_per_hk, BLOCK_SIZE_M), 1);
+        dim3 dimBlock(NUM_THREADS, 1, 1);
+        #ifdef MYDEBUG
+        printf(
+            "launch kernel: flash_fwd_mla_combine_kernel grid(%d,%d,%d) thread(%d) numsplit=%d\n",
+            dimGrid.x, dimGrid.y, dimGrid.z,
+            dimBlock.x, NUM_SPLITS
+        );
+        #endif
         cudaLaunchConfig_t combine_kernel_config = {
             dim3(params.b, cute::ceil_div(params.h_k*params.q_seq_per_hk, BLOCK_SIZE_M), 1),
             dim3(NUM_THREADS, 1, 1),

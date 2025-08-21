@@ -3,7 +3,7 @@ from typing import Optional, Tuple
 import torch
 
 import flash_mla_sm90
-import flash_mla_sm100
+# import flash_mla_sm100
 
 
 
@@ -11,19 +11,29 @@ def get_mla_metadata(
     cache_seqlens: torch.Tensor,
     num_heads_per_head_k: int,
     num_heads_k: int,
+    window_left: int = -1,
+    causal: bool = False,
+    s_q: int = 1
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Arguments:
         cache_seqlens: (batch_size), dtype torch.int32.
         num_heads_per_head_k: Equals to seq_len_q * num_heads_q // num_heads_k.
         num_heads_k: num_heads_k.
+        window_left: -1 for no window
+        causal: bool. Whether to apply causal attention mask.
+        s_q: seq_len_q
+        
+        causal and s_q only take effect when window_left != -1.
 
     Returns:
         tile_scheduler_metadata: (num_sm_parts, TileSchedulerMetaDataSize), dtype torch.int32.
         num_splits: (batch_size + 1), dtype torch.int32.
     """
-    return flash_mla_sm90.get_mla_metadata(cache_seqlens, num_heads_per_head_k, num_heads_k)
-
+    return flash_mla_sm90.get_mla_metadata(
+        cache_seqlens, num_heads_per_head_k, num_heads_k,
+        window_left, causal, s_q
+    )
 
 def flash_mla_with_kvcache_sm90(
     q: torch.Tensor,
@@ -35,6 +45,7 @@ def flash_mla_with_kvcache_sm90(
     num_splits: torch.Tensor,
     softmax_scale: Optional[float] = None,
     causal: bool = False,
+    window_left: int = -1
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Arguments:
@@ -62,6 +73,7 @@ def flash_mla_with_kvcache_sm90(
         block_table,
         softmax_scale,
         causal,
+        window_left,
         tile_scheduler_metadata,
         num_splits,
     )
@@ -96,7 +108,7 @@ def _flash_attn_varlen_forward(
         lse = torch.empty(num_qo_heads, qo_total_len, device=q.device, dtype=torch.float32).T
 
     workspace_buffer = torch.empty(32 * 1024 * 1024, dtype=torch.uint8, device=q.device)
-    flash_mla_sm100.fwd(
+    flash_mla_sm90.fwd(
         workspace_buffer,
         q,
         k,
@@ -159,7 +171,7 @@ def _flash_attn_varlen_backward(
     if num_qo_heads != num_kv_heads:
         workspace_bytes += 2 * kv_total_len * num_qo_heads * (head_dim_qk + head_dim_vo)  # dKV_acc
     workspace_buffer = torch.empty(workspace_bytes, dtype=torch.uint8, device=q.device)
-    flash_mla_sm100.bwd(
+    flash_mla_sm90.bwd(
         workspace_buffer,
         do,
         q,
@@ -315,13 +327,14 @@ def flash_mla_with_kvcache(
     num_splits: Optional[torch.Tensor] = None,
     softmax_scale: Optional[float] = None,
     causal: bool = False,
+    window_left: int = -1
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     capability = torch.cuda.get_device_capability(q.device.index)
     if capability == (9, 0):
         return flash_mla_with_kvcache_sm90(
             q, k_cache, block_table, cache_seqlens, head_dim_v,
             tile_scheduler_metadata, num_splits,
-            softmax_scale, causal,
+            softmax_scale, causal, window_left
         )
     elif capability == (10, 0):
         raise ValueError(f"Unsupported device capability: {capability}")

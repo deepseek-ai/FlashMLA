@@ -8,3 +8,4 @@ dist/
 /.vscode
 compile_commands.json
 .cache
+*.log
