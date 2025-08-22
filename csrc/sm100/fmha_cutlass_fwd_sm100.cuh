@@ -143,8 +143,8 @@ struct FwdRunner {
 
     ProblemShapeType problem_size_for_launch;
 
-    get<0>(problem_size_for_launch) = VariableLength{max_seqlen_q};
-    get<1>(problem_size_for_launch) = VariableLength{max_seqlen_kv};
+    get<0>(problem_size_for_launch) = VariableLength{max_seqlen_q, nullptr, total_seqlen_q};
+    get<1>(problem_size_for_launch) = VariableLength{max_seqlen_kv, nullptr, total_seqlen_kv};
     get<2>(problem_size_for_launch) = get<2>(problem_size);
     get<3>(problem_size_for_launch) = get<3>(problem_size);
 
@@ -206,10 +206,6 @@ struct FwdRunner {
                      void *q_ptr, void *k_ptr, void *v_ptr, void *o_ptr, void *lse_ptr,
                      void *cumulative_length_q, void *cumulative_length_kv) {
     auto problem_shape_ = problem_shape;
-    if constexpr (kIsVarlen) {
-      get<0>(problem_shape_).cumulative_length = static_cast<int *>(cumulative_length_q);
-      get<1>(problem_shape_).cumulative_length = static_cast<int *>(cumulative_length_kv);
-    }
 
     typename Operation::Arguments arguments{
         problem_shape_,
@@ -230,6 +226,7 @@ struct FwdRunner {
 
     int total_seqlen_q = q.size(0);
     int total_seqlen_kv = k.size(0);
+
     ProblemShapeType problem_shape =
         initialize(options, max_seqlen_q, max_seqlen_kv, total_seqlen_q, total_seqlen_kv,
                         cumulative_seqlen_q.data_ptr(), cumulative_seqlen_kv.data_ptr());
@@ -322,7 +319,7 @@ void run_fmha_fwd(at::Tensor workspace, at::Tensor q, at::Tensor k, at::Tensor v
   auto options = get_options();
 
   if (options.h % cutlass::fmha::kernel::CausalIndividualTileScheduler::TileH == 0 &&
-      (!std::is_same_v<ActiveMask, NoMask>)) {
+      (std::is_same_v<ActiveMask, CausalMask<false>> || std::is_same_v<ActiveMask, CausalMask<true>>)) {
     FwdRunner<kIsMla, true, kIsVarlen, DTypeIn, DTypeOut, ActiveMask, KernelOptions...> runner;
     runner.run(options, hw_info, q, k, v, o, lse, scale_softmax, workspace, cumulative_seqlen_q,
                cumulative_seqlen_kv, max_seqlen_q, max_seqlen_kv);

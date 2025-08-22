@@ -82,18 +82,9 @@ def test_flash_attention(b, mean_sq, mean_sk, varlen, h, h_k, d, dv, causal, win
     grad_out = torch.randn(total_q, h, dv)
     softmax_scale = (d + 100) ** (-0.5)
 
-    offst_q = total_q
-    offst_kv = total_k
-
-    q1_with_buffer = torch.empty(total_q + total_q, h, d, device=device, dtype=dtype)
-    k1_with_buffer = torch.empty(offst_kv + total_k, h_k, d, device=device, dtype=dtype)
-    v1_with_buffer = torch.empty(offst_kv + total_k, h_k, dv, device=device, dtype=dtype)
-    q1_with_buffer[total_q:] = q
-    k1_with_buffer[offst_kv:] = k
-    v1_with_buffer[offst_kv:] = v
-    q1 = q1_with_buffer[offst_q:].requires_grad_()
-    k1 = k1_with_buffer[offst_kv:].requires_grad_()
-    v1 = v1_with_buffer[offst_kv:].requires_grad_()
+    q1 = q.clone().requires_grad_()
+    k1 = k.clone().requires_grad_()
+    v1 = v.clone().requires_grad_()
 
     q2 = q.clone().requires_grad_()
     k2 = k.clone().requires_grad_()

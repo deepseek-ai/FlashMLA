@@ -465,6 +465,8 @@ struct Sm100FmhaFwdKernelTmaWarpspecialized {
     else if (role == WarpRole::Correction) {
       cutlass::arch::warpgroup_reg_dealloc<NumRegsCorrection>();
 
+      bool has_valid = false;
+
       CUTLASS_PRAGMA_NO_UNROLL
       for (; tile_scheduler.is_valid(); ++tile_scheduler) {
         auto blk_coord = tile_scheduler.get_block_coord();
@@ -475,6 +477,8 @@ struct Sm100FmhaFwdKernelTmaWarpspecialized {
         if (get<0>(blk_coord) * get<0>(TileShape{}) >= get<0>(logical_problem_shape)) {
           continue;
         }
+
+        has_valid = true;
 
         if (get<1>(logical_problem_shape) == 0) {
           mainloop.correction_empty(
@@ -505,16 +509,17 @@ struct Sm100FmhaFwdKernelTmaWarpspecialized {
       if constexpr (NumWarpsEpilogue == 0) {
         static_assert(NumWarpsCorrection == 1);
 
-        uint32_t free_stage_ptr = shared_storage.tmem_base_ptr;
-        tmem_allocator.free(free_stage_ptr, TmemAllocator::Sm100TmemCapacityColumns);
+        if (has_valid) {
+          uint32_t free_stage_ptr = shared_storage.tmem_base_ptr;
+          tmem_allocator.free(free_stage_ptr, TmemAllocator::Sm100TmemCapacityColumns);
+        }
       }
 
     }
     else if (role == WarpRole::MMA) {
       warpgroup_reg_set<NumRegsOther>();
 
-      tmem_allocator.allocate(TmemAllocator::Sm100TmemCapacityColumns, &shared_storage.tmem_base_ptr);
-      __syncwarp();
+      bool allocated = false;
 
       CUTLASS_PRAGMA_NO_UNROLL
       for (; tile_scheduler.is_valid(); ++tile_scheduler) {
@@ -525,6 +530,12 @@ struct Sm100FmhaFwdKernelTmaWarpspecialized {
 
         if (get<0>(blk_coord) * get<0>(TileShape{}) >= get<0>(logical_problem_shape)) {
           continue;
+        }
+
+        if (!allocated) {
+          tmem_allocator.allocate(TmemAllocator::Sm100TmemCapacityColumns, &shared_storage.tmem_base_ptr);
+          __syncwarp();
+          allocated = true;
         }
 
         if (get<1>(logical_problem_shape) == 0) {
@@ -580,6 +591,8 @@ struct Sm100FmhaFwdKernelTmaWarpspecialized {
     else if (role == WarpRole::Epilogue) {
       warpgroup_reg_set<NumRegsOther>();
 
+      bool has_valid = false;
+
       CUTLASS_PRAGMA_NO_UNROLL
       for (; tile_scheduler.is_valid(); ++tile_scheduler) {
         auto blk_coord = tile_scheduler.get_block_coord();
@@ -590,6 +603,8 @@ struct Sm100FmhaFwdKernelTmaWarpspecialized {
         if (get<0>(blk_coord) * get<0>(TileShape{}) >= get<0>(logical_problem_shape)) {
           continue;
         }
+
+        has_valid = true;
 
         epilogue.store(
           blk_coord, logical_problem_shape,
@@ -602,8 +617,10 @@ struct Sm100FmhaFwdKernelTmaWarpspecialized {
 
       static_assert(NumWarpsEpilogue <= 1);
       if constexpr (NumWarpsEpilogue == 1) {
-        uint32_t free_stage_ptr = shared_storage.tmem_base_ptr;
-        tmem_allocator.free(free_stage_ptr, TmemAllocator::Sm100TmemCapacityColumns);
+        if(has_valid) {
+          uint32_t free_stage_ptr = shared_storage.tmem_base_ptr;
+          tmem_allocator.free(free_stage_ptr, TmemAllocator::Sm100TmemCapacityColumns);
+        }
       }
 
     }

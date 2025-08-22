@@ -18,8 +18,9 @@ void call_run_fmha_fwd([[maybe_unused]] Mask mask, [[maybe_unused]] Varlen is_va
   static constexpr bool IsVarlen = std::is_same_v<Varlen, true_type>;
   static constexpr bool IsMla = std::is_same_v<Mla, true_type>;
   static constexpr bool IsCausalMask = std::is_same_v<Mask, CausalMask<false>>;
-  using Option = std::conditional_t<IsCausalMask, Option<Tag::kIsPersistent, false_type>,
-                                    Option<Tag::kIsPersistent, true_type>>;
+  using Option =
+      std::conditional_t<IsCausalMask || (IsVarlen), Option<Tag::kIsPersistent, false_type>,
+                         Option<Tag::kIsPersistent, true_type>>;
 
   run_fmha_fwd<Element, ElementOut, IsVarlen, IsMla, Mask, Option>(
       workspace_buffer, q, k, v, cumulative_seqlen_q, cumulative_seqlen_kv, o, lse,

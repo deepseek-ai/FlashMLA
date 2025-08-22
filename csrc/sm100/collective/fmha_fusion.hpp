@@ -220,13 +220,13 @@ struct CausalMask : NoMask {
       BlkCoord const& blk_coord,
       TileShape const& tile_shape,
       ProblemSize const& problem_size) {
-    
+
     int trip_count = get_trip_count(blk_coord, tile_shape, problem_size);
     if constexpr (IsQBegin) {
       return std::min(trip_count, int(ceil_div(size<0>(tile_shape), size<1>(tile_shape))));
     } else {
-      const int offset_tile_q = get<1>(problem_size) % get<1>(tile_shape);
-      return std::min(trip_count, int(ceil_div(get<0>(tile_shape) + offset_tile_q, get<1>(tile_shape))));
+      const int corner_count = int((get<1>(problem_size) % get<1>(tile_shape) || get<0>(problem_size) % get<0>(tile_shape))) ;
+      return std::min(trip_count, int(ceil_div(get<0>(tile_shape), get<1>(tile_shape))) + corner_count);
     }
   }
 

@@ -102,32 +102,21 @@ struct Sm100MlaFwdLoadTmaWarpspecialized {
     auto dQ = args.dQ;
     auto dK = args.dK;
     auto dV = args.dV;
-    auto problem_shape_qk = replace<2>(problem_shape, get<2, 0>(problem_shape) + get<2, 1>(problem_shape));
 
+    using IntProblemShape = cute::tuple<int, int, int, cute::tuple<cute::tuple<int, int>, int>>;
+
+    IntProblemShape problem_shape_qk;
     if constexpr (is_variable_length_v<tuple_element_t<0, ProblemShape>>) {
       auto cumulative_length_q = get<0>(problem_shape).cumulative_length;
-      if (cumulative_length_q != nullptr) {
-          int max_length_q = get<0>(problem_shape).max_length;
-          // for variable sequence lenght, the batch is in units of row_stride
-          get<2,1>(dQ) = get<0>(dQ);
-          get<3,1>(problem_shape_qk) = std::max(get<3,1>(problem_shape_qk), max_length_q * (1 + get<3,1>(problem_shape)));
-          // offset ptr by the amount we add back in later
-          ptr_Q -= max_length_q * get<0>(dQ);
+      auto cumulative_length_k = get<1>(problem_shape).cumulative_length;
+      if (cumulative_length_q != nullptr && cumulative_length_k != nullptr ) {
+          get<0>(problem_shape_qk) = get<0>(problem_shape).total_length;
+          get<1>(problem_shape_qk) = get<1>(problem_shape).total_length;
+          get<2>(problem_shape_qk) = get<2, 0>(problem_shape) + get<2, 1>(problem_shape);
+          get<3>(problem_shape_qk) = get<3>(problem_shape);
       }
-    }
-
-    if constexpr (is_variable_length_v<tuple_element_t<1, ProblemShape>>) {
-      auto cumulative_length_kv = get<1>(problem_shape).cumulative_length;
-      if (cumulative_length_kv != nullptr) {
-          int max_length_kv = get<1>(problem_shape).max_length;
-          // for variable sequence lenght, the batch is in units of row_stride
-          get<2,1>(dK) = get<0>(dK);
-          get<2,1>(dV) = get<0>(dV);
-          get<3,1>(problem_shape_qk) = std::max(get<3,1>(problem_shape_qk), max_length_kv * (1 + get<3,1>(problem_shape)));
-          // offset ptr by the amount we add back in later
-          ptr_K -= max_length_kv * get<0>(dK);
-          ptr_V -= max_length_kv * get<0>(dV);
-      }
+    } else {
+      problem_shape_qk = replace<2>(problem_shape, get<2, 0>(problem_shape) + get<2, 1>(problem_shape));;
     }
 
     auto problem_shape_pv = replace<1>(select<0,2,1,3>(problem_shape_qk), get<2, 0>(problem_shape));
@@ -192,19 +181,16 @@ struct Sm100MlaFwdLoadTmaWarpspecialized {
     Tensor mQ_qdl_p = params.tma_load_q.get_tma_tensor(select<0,2,3>(problem_shape_qk));
 
     int q_offs_0 = 0;
-    int q_offs_2_1 = 0;
 
     if constexpr (is_variable_length_v<tuple_element_t<0, ParamsProblemShape>>) {
       auto cumulative_length_q = get<0>(params_problem_shape).cumulative_length;
       if (cumulative_length_q != nullptr) {
-        int max_length_q = get<0>(params_problem_shape).max_length;
-        q_offs_0 = max_length_q - get<0>(problem_shape);
-        q_offs_2_1 = cumulative_length_q[get<2,1>(blk_coord_q)] + get<0>(problem_shape);
+        q_offs_0 = cumulative_length_q[get<2,1>(blk_coord_q)];
         get<2,1>(blk_coord_q) = 0;
       }
     }
 
-    Tensor mQ_qdl = domain_offset(make_coord(q_offs_0, _0{}, make_coord(_0{}, q_offs_2_1)), mQ_qdl_p);
+    Tensor mQ_qdl = domain_offset(make_coord(q_offs_0, _0{}, make_coord(_0{}, _0{})), mQ_qdl_p);
 
     Tensor gQ_qdl = local_tile(mQ_qdl, TileShapeQK{}, make_coord(_, _, _), Step<_1, X, _1>{});
     Tensor tSgQ_qdl = mma_qk.partition_A(gQ_qdl);
@@ -219,19 +205,16 @@ struct Sm100MlaFwdLoadTmaWarpspecialized {
     Tensor mK_kdl_p = params.tma_load_k.get_tma_tensor(select<1,2,3>(problem_shape_qk));
 
     int kv_offs_0 = 0;
-    int kv_offs_2_1 = 0;
 
     if constexpr (is_variable_length_v<tuple_element_t<1, ParamsProblemShape>>) {
       auto cumulative_length = get<1>(params_problem_shape).cumulative_length;
       if (cumulative_length != nullptr) {
-        int max_length = get<1>(params_problem_shape).max_length;
-        kv_offs_0 = max_length - get<1>(problem_shape);
-        kv_offs_2_1 = cumulative_length[get<2,1>(blk_coord_kv)] + get<1>(problem_shape);
+        kv_offs_0 = cumulative_length[get<2,1>(blk_coord_kv)];
         get<2,1>(blk_coord_kv) = 0;
       }
     }
 
-    Tensor mK_kdl = domain_offset(make_coord(kv_offs_0, _0{}, make_coord(_0{}, kv_offs_2_1)), mK_kdl_p);
+    Tensor mK_kdl = domain_offset(make_coord(kv_offs_0, _0{}, make_coord(_0{}, _0{})), mK_kdl_p);
 
     Tensor gK_kdl = local_tile(mK_kdl, TileShapeQK{}, make_coord(_, _, _), Step<X, _1, _1>{});
     Tensor tSgK_kdl = mma_qk.partition_B(gK_kdl);
@@ -246,7 +229,7 @@ struct Sm100MlaFwdLoadTmaWarpspecialized {
     ThrMMA mma_pv = typename CollectiveMmaPV::TiledMma{}.get_slice(0);
     Tensor mV_dkl_p = params.tma_load_v.get_tma_tensor(select<2,1,3>(problem_shape_v));
 
-    Tensor mV_dkl = domain_offset(make_coord(_0{}, kv_offs_0, make_coord(_0{}, kv_offs_2_1)), mV_dkl_p);
+    Tensor mV_dkl = domain_offset(make_coord(_0{}, kv_offs_0, make_coord(_0{}, _0{})), mV_dkl_p);
 
     Tensor gV_dkl = local_tile(mV_dkl, TileShapePV{}, make_coord(_, _, _), Step<X, _1, _1>{});
     Tensor tOgV_dkl = mma_pv.partition_B(gV_dkl);
