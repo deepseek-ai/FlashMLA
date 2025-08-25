@@ -51,6 +51,7 @@ ext_modules.append(
             "csrc/sm90/kernels/get_mla_metadata.cu",
             "csrc/sm90/kernels/mla_combine.cu",
             "csrc/sm90/kernels/splitkv_mla.cu",
+            "csrc/sm90/kernels/splitkv_mla_fp8.cu",
         ],
         extra_compile_args={
             "cxx": cxx_args + get_features_args(),

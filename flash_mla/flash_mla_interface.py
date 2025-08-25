@@ -35,6 +35,8 @@ def flash_mla_with_kvcache_sm90(
     num_splits: torch.Tensor,
     softmax_scale: Optional[float] = None,
     causal: bool = False,
+    descale_q: Optional[torch.Tensor] = None,
+    descale_k: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Arguments:
@@ -64,6 +66,8 @@ def flash_mla_with_kvcache_sm90(
         causal,
         tile_scheduler_metadata,
         num_splits,
+        descale_q,
+        descale_k,
     )
     return out, softmax_lse
 
@@ -315,13 +319,15 @@ def flash_mla_with_kvcache(
     num_splits: Optional[torch.Tensor] = None,
     softmax_scale: Optional[float] = None,
     causal: bool = False,
+    descale_q: Optional[torch.Tensor] = None,
+    descale_k: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     capability = torch.cuda.get_device_capability(q.device.index)
     if capability == (9, 0):
         return flash_mla_with_kvcache_sm90(
             q, k_cache, block_table, cache_seqlens, head_dim_v,
             tile_scheduler_metadata, num_splits,
-            softmax_scale, causal,
+            softmax_scale, causal, descale_q, descale_k,
         )
     elif capability == (10, 0):
         raise ValueError(f"Unsupported device capability: {capability}")
