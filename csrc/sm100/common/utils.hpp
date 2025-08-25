@@ -48,12 +48,10 @@ struct DeviceAllocation {
 
   void reset(size_t size, size_t offset=0) {
     size_t num_element = sizeof(T) * (size + offset);
-    auto options = torch::TensorOptions()
-          .dtype(torch::kInt8)
-          .device(torch::kCUDA);
+    auto options = torch::TensorOptions().dtype(torch::kByte).device(torch::kCUDA);
 
     tensor = torch::empty(num_element, options);
-    ptr_ = tensor.data_ptr();
+    ptr_ = tensor.data_ptr<T>();
     size_ = size;
     offset_ = offset;
   }
@@ -69,14 +67,4 @@ struct DeviceAllocation {
   size_t size() const { return size_; }
 
   size_t get_storage_size() const { return (size_ + offset_) * sizeof(T); }
-
-  void copy_from_host(const T* ptr, size_t sz) {
-    auto ret = cudaMemcpy(ptr_, ptr, sz * sizeof(T), cudaMemcpyDefault);
-    assert(ret == cudaSuccess);
-  }
-
-  void copy_from_device(const T* ptr, size_t sz) {
-    auto ret = cudaMemcpy(ptr_, ptr, sz * sizeof(T), cudaMemcpyDefault);
-    assert(ret == cudaSuccess);
-  }
 };
