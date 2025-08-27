@@ -174,13 +174,10 @@ struct BwdRunner {
 
     Operation op;
 
-    size_t workspace_size = 0;
-    workspace_size = Operation::get_workspace_size(arguments);
-    DeviceAllocation<uint8_t> workspace(workspace_size);
-    uint8_t* workspace_ptr = workspace.get();
+    uint8_t* workspace_ptr = static_cast<uint8_t*>(workspace_buffer.data_ptr());
 
     CUTLASS_CHECK(op.can_implement(arguments));
-    CUTLASS_CHECK(op.initialize(arguments, workspace.get()));
+    CUTLASS_CHECK(op.initialize(arguments, workspace_ptr));
     CUTLASS_CHECK(op.run(at::cuda::getCurrentCUDAStream()));
   }
 

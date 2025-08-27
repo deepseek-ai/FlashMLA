@@ -154,7 +154,7 @@ def _flash_attn_varlen_backward(
     max_seqlen_qo_aligned = (max_seqlen_qo + 7) // 8 * 8
     bs = cu_seqlens_qo.shape[0] - 1
     workspace_bytes = 0
-    workspace_bytes += 4 * qo_total_len * num_qo_heads * head_dim_qk  # dQ_acc
+    workspace_bytes += 4 * bs * max_seqlen_qo_aligned * num_qo_heads * head_dim_qk  # dQ_acc
     workspace_bytes += 4 * max_seqlen_qo_aligned * bs * num_qo_heads * 2  # sum_OdO and scaled_lse
     if num_qo_heads != num_kv_heads:
         workspace_bytes += 2 * kv_total_len * num_qo_heads * (head_dim_qk + head_dim_vo)  # dKV_acc
