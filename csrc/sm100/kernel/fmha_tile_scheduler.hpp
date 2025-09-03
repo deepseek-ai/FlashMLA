@@ -123,7 +123,7 @@ struct PersistentTileScheduler {
 
     return Params {
       num_blocks,
-      { num_m_blocks}, { size<3,0>(problem_size) }, { size<3,1>(problem_size) },
+      { max(1, num_m_blocks)}, { size<3,0>(problem_size) }, { size<3,1>(problem_size) },
       hw_info
     };
   }

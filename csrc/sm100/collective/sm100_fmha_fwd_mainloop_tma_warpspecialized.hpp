@@ -1155,10 +1155,6 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
     float lse = -INFINITY;
     int thread_idx = threadIdx.x % (4 * NumThreadsPerWarp);
 
-#define DSHOW(x) print(#x ": "); print(x); print("\n")
-    if (threadIdx.x % 128 == 0 && block0()) {
-      DSHOW(sO);
-    }
 #if 1
 
     using ElementOut = typename CollectiveEpilogue::ElementOut;

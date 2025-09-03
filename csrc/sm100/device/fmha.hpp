@@ -208,6 +208,11 @@ public:
     dim3 const block = Kernel::get_block_shape();
     dim3 const grid = get_grid_shape(params);
 
+    // No need to launch the kernel
+    if(grid.x == 0 || grid.y == 0 || grid.z == 0) {
+      return Status::kSuccess; 
+    }
+
     // configure smem size and carveout
     int smem_size = Kernel::SharedStorageSize;
 

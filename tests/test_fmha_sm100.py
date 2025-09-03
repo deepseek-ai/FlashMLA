@@ -29,6 +29,9 @@ def get_attn_bias(s_q, s_k, causal, window):
 
 
 def assert_close(x: torch.Tensor, y: torch.Tensor, name: str) -> None:
+    close_tensor = torch.isclose(x.to(torch.float32), y.to(torch.float32), rtol=1e-5, atol=1e-5)
+    if close_tensor.all():
+        return
     x, y = x.double(), y.double()
     RMSE = ((x - y) * (x - y)).mean().sqrt().item()
     cos_diff = 1 - 2 * (x * y).sum().item() / max((x * x + y * y).sum().item(), 1e-12)

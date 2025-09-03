@@ -119,6 +119,9 @@ struct Sm100MlaFwdLoadTmaWarpspecialized {
       problem_shape_qk = replace<2>(problem_shape, get<2, 0>(problem_shape) + get<2, 1>(problem_shape));;
     }
 
+    get<0>(problem_shape_qk) = max(1, get<0>(problem_shape_qk));
+    get<1>(problem_shape_qk) = max(1, get<1>(problem_shape_qk));
+
     auto problem_shape_pv = replace<1>(select<0,2,1,3>(problem_shape_qk), get<2, 0>(problem_shape));
 
     auto params_qk = CollectiveMmaQK::to_underlying_arguments(
