@@ -5,7 +5,7 @@
 namespace cute {
 
 // Extensions to CuTe
-// CuTe 自带的 SM100_TMA_2SM_LOAD_1D 系列要求参与的 thread 数量为 2（using ThrID = Layout<_2>;），还会对数据进行切分，用起来太恶心了，所以我们自己改一版。另外，为了和其他使用 SM90 TMA 的部分统一，这里我们让它接受 TMA::CacheHintSm90 而不是 TMA::CacheHintSm100
+// CuTe's SM100_TMA_2SM_LOAD_1D requires two threads to perform this operation cooperatively (using ThrID = Layout<_2>;), which doesn't fit our use case.
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 /// TMA_LOAD : Initiates a TMA copy from global memory to shared memory
