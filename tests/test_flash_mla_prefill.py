@@ -86,6 +86,7 @@ def reference_torch(p: TestParam, t: Testcase, sm_scale: float) -> Tuple[torch.T
     max_logits = torch.max(attn_score, dim=-1)[0]   # [s_q, h_q]
     lse = log2sumexp2(attn_score, dim=-1)   # [s_q, h_q]
     attn_score = torch.exp2(attn_score - lse.unsqueeze(-1))   # [s_q, h_q, topk]
+    lse = lse / math.log2(math.e)
     result = attn_score @ kvs[:, :, :p.d_v]
     return (max_logits, lse, result)
 
