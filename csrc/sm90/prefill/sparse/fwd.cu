@@ -562,7 +562,7 @@ sparse_attn_fwd_kernel(__grid_constant__ const SparsePrefillParams params, __gri
                     int offs = (block_idx+buf_idx)*B_TOPK + local_row*NUM_GROUPS + group_idx;
                     int t = __ldg(gIndices + offs);
                     token_indices[buf_idx][local_row] = t*(int64_t)params.stride_kv_s_kv;   // We mult it with params.stride_kv_s_kv here since it's faster
-                    is_token_valid[buf_idx][local_row] = t >= 0 && t < params.s_kv;
+                    is_token_valid[buf_idx][local_row] = t >= 0;
                 }
             }
         };
