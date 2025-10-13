@@ -50,7 +50,7 @@ def generate_testcase(t: TestParam) -> Testcase:
                 cur_indices = torch.randperm(t.s_kv)[:t.topk]
                 cur_indices[near_mask] = torch.randint(max(0, t.s_kv - 20000), t.s_kv - 1, (near_mask.sum().item(),))
                 if len(cur_indices) < t.topk:
-                    cur_indices = torch.cat([cur_indices, torch.full((t.topk - len(cur_indices),), 2147480000)])
+                    cur_indices = torch.cat([cur_indices, torch.full((t.topk - len(cur_indices),), -1)])
                 cur_indices = cur_indices[torch.randperm(t.topk)]
                 indices[b, s, h] = cur_indices
     indices = indices.to(q.device)
