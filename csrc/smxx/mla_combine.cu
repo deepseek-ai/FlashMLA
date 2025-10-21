@@ -13,7 +13,7 @@ using namespace cute;
 template<typename ElementT, int HEAD_DIM_V, int BLOCK_SIZE_M, int MAX_SPLITS, int NUM_THREADS>
 __global__ void __launch_bounds__(NUM_THREADS)
 flash_fwd_mla_combine_kernel(__grid_constant__ const DecodingParams params) {
-    // grid_shape: [batch_size, num_q_heads*s_q / BLOCK_SIZE_M]
+    // grid_shape: [num_q_heads*s_q / BLOCK_SIZE_M, batch_size]
     // Each CTA gathers the activation of some heads from one batch, do scaling & accumulation, and save the result
     static_assert(NUM_THREADS/32 == BLOCK_SIZE_M); // The number of warps == block_size_m
     const int batch_idx = blockIdx.y;
