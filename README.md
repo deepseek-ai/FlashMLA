@@ -220,6 +220,31 @@ For AMD Instinct GPUs, visit the official website: [AMD Instinct](https://www.am
 
 The corresponding FlashMLA version can be found at: [AITER/MLA](https://github.com/ROCm/aiter/blob/main/aiter/mla.py)
 
+### PaddlePaddle Compatible API
+
+PaddlePaddle provides a PyTorch-compatible API layer that allows PyTorch ecosystem libraries to run seamlessly on Paddle. With this compatibility layer, you can use FlashMLA in PaddlePaddle projects with minimal code changes.
+
+**Installation:**
+
+```bash
+PADDLE_COMPATIBLE_API=1 pip install -v .
+```
+
+**Usage Example:**
+
+```python
+import paddle
+
+# Enable PyTorch compatibility mode
+paddle.compat.enable_torch_proxy()
+
+# Now you can use FlashMLA as if you were using PyTorch
+import flashmla
+
+# Use FlashMLA operations with PaddlePaddle tensors
+# The compatibility layer handles the framework differences automatically
+```
+
 ## Citation
 
 ```bibtex
