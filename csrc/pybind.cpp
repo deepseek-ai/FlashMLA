@@ -178,7 +178,9 @@ fwd_kvcache_mla(
     const at::Tensor &tile_scheduler_metadata,   // num_sm_parts x TileSchedulerMetaDataSize
     const at::Tensor &num_splits,                // batch_size + 1
     const bool &is_fp8,
-    const std::optional<at::Tensor> &indices     // None, or batch_size x seqlen_q x topk
+    const std::optional<at::Tensor> &indices,     // None, or batch_size x seqlen_q x topk
+    c10::optional<const at::Tensor> &descale_q,  // batch_size
+    c10::optional<const at::Tensor> &descale_k   // batch_size
 ) {
     bool is_sparse_attn = indices.has_value();
     int topk = is_sparse_attn ? indices->size(-1) : -1;
@@ -189,8 +191,9 @@ fwd_kvcache_mla(
     arch.assert_is_supported();
 
     // Check data types
-    auto q_dtype = q.dtype();
-    TORCH_CHECK(q_dtype == torch::kBFloat16 || q_dtype == torch::kHalf);
+    auto q_dtype = q.scalar_type();
+    TORCH_CHECK(q_dtype == torch::kBFloat16 || q_dtype == torch::kHalf||
+                q_dtype == torch::kFloat8_e4m3fn, "Unsupported dtype for query tensor");
     
     if (!is_fp8) {
         TORCH_CHECK(kcache.dtype() == q_dtype, "query and key must have the same dtype");
@@ -227,7 +230,7 @@ fwd_kvcache_mla(
     const int num_heads_q = sizes[2];
     const int head_size_k = sizes[3];
     TORCH_CHECK(head_size_k == 576, "Only head_size_k == 576 is supported");
-    TORCH_CHECK(head_size_v == 512, "Only head_size_v == 576 is supported");
+    TORCH_CHECK(head_size_v == 512, "Only head_size_v == 512 is supported");
 
     const int max_num_blocks_per_seq = block_table.size(1);
     const int num_blocks = kcache.size(0);
@@ -238,6 +241,19 @@ fwd_kvcache_mla(
     TORCH_CHECK(num_heads_q % num_heads_k == 0, "Number of heads in key/value must divide number of heads in query");
 
     if (seqlen_q_ori == 1) { is_causal = false; }
+    if (q_dtype == torch::kFloat8_e4m3fn) {
+        TORCH_CHECK(descale_q.has_value() && descale_k.has_value(), "descale is required when input dtype is fp8");
+        auto descale_q_value = descale_q.value();
+        auto descale_k_value = descale_k.value();
+        CHECK_DEVICE(descale_q_value);
+        CHECK_DEVICE(descale_k_value);
+        TORCH_CHECK(descale_q_value.stride(-1) == 1);
+        TORCH_CHECK(descale_k_value.stride(-1) == 1);
+        TORCH_CHECK(descale_q_value.dtype() == torch::kFloat);
+        TORCH_CHECK(descale_k_value.dtype() == torch::kFloat);
+        CHECK_SHAPE(descale_q_value, 1);
+        CHECK_SHAPE(descale_k_value, 1);
+    }
 
     const int num_q_heads_per_hk = num_heads_q / num_heads_k;
     const int q_seq_per_hk = seqlen_q_ori * num_q_heads_per_hk;
@@ -263,7 +279,8 @@ fwd_kvcache_mla(
     at::cuda::CUDAGuard device_guard{(char)q.get_device()};
 
     auto opts = q.options();
-    at::Tensor out = torch::empty({batch_size, q_seq_per_hk, num_heads, head_size_v}, opts);
+    auto out_type = (q_dtype == torch::kFloat8_e4m3fn) ? torch::kBFloat16 : q_dtype; // Kernel already supports half, but need change python api for output dtype
+    at::Tensor out = torch::empty({batch_size, q_seq_per_hk, num_heads, head_size_v}, opts.dtype(out_type));
     at::Tensor softmax_lse = torch::empty({batch_size, num_heads, q_seq_per_hk}, opts.dtype(at::kFloat));
     CHECK_CONTIGUOUS(softmax_lse);
 
@@ -282,6 +299,10 @@ fwd_kvcache_mla(
     params.d_v = head_size_v;
     params.scale_softmax = softmax_scale;
     params.scale_softmax_log2 = float(softmax_scale * M_LOG2E);
+    if (q_dtype == torch::kFloat8_e4m3fn) {
+        params.descale_q_ptr = reinterpret_cast<float*>(descale_q.value().data_ptr());
+        params.descale_k_ptr = reinterpret_cast<float*>(descale_k.value().data_ptr());
+    }
     params.topk = topk;
     // Set the pointers and strides.
     params.q_ptr = q.data_ptr();
@@ -346,6 +367,8 @@ fwd_kvcache_mla(
 #ifndef FLASH_MLA_DISABLE_FP16
                     sm90::run_flash_splitkv_mla_kernel<cutlass::half_t>(params, stream);
 #endif
+                } else if (q_dtype == torch::kFloat8_e4m3fn) {
+                    sm90::run_flash_splitkv_mla_kernel<cutlass::float_e4m3_t, cutlass::bfloat16_t>(params, stream);
                 } else {
                     TORCH_CHECK(false, "Unsupported dtype for dense MLA on SM90");
                 }
@@ -364,6 +387,8 @@ fwd_kvcache_mla(
 #ifndef FLASH_MLA_DISABLE_FP16
         run_flash_mla_combine_kernel<cutlass::half_t>(params, stream);
 #endif
+    } else if (q_dtype == torch::kFloat8_e4m3fn) { // Output default dtype is bfloat16_t, can support half.
+        run_flash_mla_combine_kernel<cutlass::bfloat16_t>(params, stream);
     } else {
         TORCH_CHECK(false, "Unsupported tensor dtype for query");
     }
