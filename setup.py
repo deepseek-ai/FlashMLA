@@ -68,6 +68,7 @@ ext_modules.append(
             "csrc/smxx/mla_combine.cu",
             "csrc/sm90/decode/dense/splitkv_mla.cu",
             "csrc/sm90/decode/sparse_fp8/splitkv_mla.cu",
+             "csrc/sm90/decode/dense/splitkv_mla_fp8.cu",
             "csrc/sm90/prefill/sparse/fwd.cu",
             "csrc/sm100/decode/sparse_fp8/splitkv_mla.cu",
             "csrc/sm100/prefill/dense/fmha_cutlass_fwd_sm100.cu",
