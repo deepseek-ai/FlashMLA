@@ -703,7 +703,7 @@ CUTLASS_DEVICE void wg0_subroutine(
     TMABarrier barriers_K1[9],
     bool &cur_phase_K0,
     const TMAParams &tma_params,
-    const Flash_fwd_mla_params &params,
+    const DecodingParams &params,
     int* block_table_ptr,
     int seqlen_k,
     int block_idx,
@@ -822,7 +822,7 @@ CUTLASS_DEVICE void wg1_subroutine(
     TMABarrier barriers_K1[9],
     bool &cur_phase_K1,
     const TMAParams &tma_params,
-    const Flash_fwd_mla_params &params,
+    const DecodingParams &params,
     int* block_table_ptr,
     int seqlen_k,
     int block_idx,
@@ -901,7 +901,7 @@ CUTLASS_DEVICE void wg1_subroutine(
 }
 
 // A helper function for determining the length of the causal mask for one q token
-CUTLASS_DEVICE int get_mask_len(const Flash_fwd_mla_params &params, int m_block_idx, int local_seq_q_idx) {
+CUTLASS_DEVICE int get_mask_len(const DecodingParams &params, int m_block_idx, int local_seq_q_idx) {
     int global_seq_q_idx = m_block_idx*Config::BLOCK_SIZE_M + local_seq_q_idx;
     if (global_seq_q_idx < params.q_seq_per_hk) {
         int s_q_idx = global_seq_q_idx / params.q_head_per_hk;
@@ -914,7 +914,7 @@ CUTLASS_DEVICE int get_mask_len(const Flash_fwd_mla_params &params, int m_block_
 
 template<typename T, typename TmaParams>
 __global__ void __launch_bounds__(T::NUM_THREADS, 1, 1)
-flash_fwd_splitkv_mla_kernel(__grid_constant__ const Flash_fwd_mla_params params, __grid_constant__ const TmaParams tma_params) {
+flash_fwd_splitkv_mla_kernel(__grid_constant__ const DecodingParams params, __grid_constant__ const TmaParams tma_params) {
     // grid shape: [
     // 	num_m_blocks (=ceil_div(seqlen_q_ori*(num_q_heads//num_kv_heads))),
     // 	num_kv_heads,
@@ -1252,7 +1252,7 @@ flash_fwd_splitkv_mla_kernel(__grid_constant__ const Flash_fwd_mla_params params
 
 
 template<typename InputT, typename OutputT = InputT>
-void run_flash_splitkv_mla_kernel(Flash_fwd_mla_params &params, cudaStream_t stream) {
+void run_flash_splitkv_mla_kernel(DecodingParams &params, cudaStream_t stream) {
     using TYPE = TraitsFP8<InputT, OutputT>;
     auto shape_Q = make_shape(params.q_seq_per_hk, params.d, params.h_k, params.b);
     using AtomQ = decltype(get_smem_layoutK<InputT , TYPE::HEAD_DIM_K>());
@@ -1333,7 +1333,7 @@ void run_flash_splitkv_mla_kernel(Flash_fwd_mla_params &params, cudaStream_t str
     CHECK_CUDA_KERNEL_LAUNCH();
 }
 
-template void run_flash_splitkv_mla_kernel<cutlass::float_e4m3_t, cutlass::bfloat16_t>(Flash_fwd_mla_params &params, cudaStream_t stream);
+template void run_flash_splitkv_mla_kernel<cutlass::float_e4m3_t, cutlass::bfloat16_t>(DecodingParams &params, cudaStream_t stream);
 #ifndef FLASH_MLA_DISABLE_FP16
-template void run_flash_splitkv_mla_kernel<cutlass::float_e4m3_t, cutlass::half_t>(Flash_fwd_mla_params &params, cudaStream_t stream);
+template void run_flash_splitkv_mla_kernel<cutlass::float_e4m3_t, cutlass::half_t>(DecodingParams &params, cudaStream_t stream);
 #endif
