@@ -8,6 +8,7 @@
 using namespace cute;
 using cutlass::arch::NamedBarrier;
 
+namespace sm90 {
 // Here we use MAX_INIT_VAL_SM to initialize sM, and MAX_INIT_VAL for masking
 // The reason is that, we need to calculate new_max = max(sM(row_idx), cur_max*scale_softmax_log2)
 // so we must guarantee that MAX_INIT_VAL*scale_softmax_log2 < MAX_INIT_VAL_SM
@@ -1337,3 +1338,4 @@ template void run_flash_splitkv_mla_kernel<cutlass::float_e4m3_t, cutlass::bfloa
 #ifndef FLASH_MLA_DISABLE_FP16
 template void run_flash_splitkv_mla_kernel<cutlass::float_e4m3_t, cutlass::half_t>(DecodingParams &params, cudaStream_t stream);
 #endif
+}
