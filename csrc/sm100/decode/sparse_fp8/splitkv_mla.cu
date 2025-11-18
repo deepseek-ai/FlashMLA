@@ -3,6 +3,8 @@
 #include <cutlass/barrier.h>
 #include <cutlass/arch/barrier.h>
 #include <cutlass/arch/reg_reconfig.h>
+#include <cutlass/cluster_launch.hpp>
+#include <cutlass/pipeline/sm100_pipeline.hpp>
 #include <cute/tensor.hpp>
 #include <cute/arch/tmem_allocator_sm100.hpp>
 
@@ -92,6 +94,8 @@ struct SharedMemoryPlan {
     } u;
     array_aligned<bf16, cosize_v<SmemLayoutS>> s;
     transac_bar_t bar_q;
+    // another cluster sync bar
+    transac_bar_t bar_remote[NUM_BUFS];
     transac_bar_t bar_k_ready[NUM_BUFS], bar_k_free[NUM_BUFS];
     transac_bar_t bar_qk_done[NUM_BUFS], bar_so_ready[NUM_BUFS];
     float rowwise_max_buf[128], rowwise_li_buf[128];
@@ -117,11 +121,16 @@ void store_128b(void* smem_ptr, const T &data) {
     *(__int128*)smem_ptr = *(__int128*)&data;
 }
 
+#define GET_TOKEN_INDEX(block_idx) \
+    __ldg(gIndices + (block_idx) * B_TOPK + idx_in_cluster * (B_TOPK / 2) + my_token_idx)
+
+// remember cluster2 need launch bounds 2
 template<typename TmaParams>
-__global__ void __launch_bounds__(NUM_THREADS, 1, 1)
+__global__ void __launch_bounds__(NUM_THREADS, 1, 2)
 flash_fwd_splitkv_mla_fp8_sparse_kernel(__grid_constant__ const DecodingParams params, __grid_constant__ const TmaParams tma_params) {
 #if IS_SM100
     const int head_block_idx = blockIdx.x;
+    const int idx_in_cluster = head_block_idx % 2;
     const int s_q_idx = blockIdx.y;
     const int partition_idx = blockIdx.z;
     const int warpgroup_idx = cutlass::canonical_warp_group_idx();
@@ -143,9 +152,11 @@ flash_fwd_splitkv_mla_fp8_sparse_kernel(__grid_constant__ const DecodingParams p
             plan.bar_q.init(1);
             for (int i = 0; i < NUM_BUFS; ++i) {
                 plan.bar_k_ready[i].init(128);
-                plan.bar_k_free[i].init(1);
+                // 2cluster need wait 2
+                plan.bar_k_free[i].init(2);
                 plan.bar_qk_done[i].init(1);
                 plan.bar_so_ready[i].init(128);
+                plan.bar_remote[i].init(1);
             }
             cutlass::arch::fence_barrier_init();
         }
@@ -154,6 +165,7 @@ flash_fwd_splitkv_mla_fp8_sparse_kernel(__grid_constant__ const DecodingParams p
         cute::TMEM::Allocator1Sm().release_allocation_lock();
     }
     __syncthreads();
+    cute::cluster_arrive();
 
     int bar_phase_k = 0;
 
@@ -177,85 +189,123 @@ flash_fwd_splitkv_mla_fp8_sparse_kernel(__grid_constant__ const DecodingParams p
         return {start_block_idx, end_block_idx, is_no_split};
     };
 
+    cluster_sync();
     if (warpgroup_idx == 0) {
         // Producer warpgroup
 
         #pragma unroll 1
+        int lane_idx = idx_in_warpgroup % 32;
+        int my_token_idx = warp_idx * 8 + lane_idx % 8;
+        const int GROUP_SIZE = 4;
+
+        CUTE_NO_UNROLL
         for (int batch_idx = begin_idx; batch_idx <= end_idx; ++batch_idx) {
             auto [start_block_idx, end_block_idx, is_no_split] = get_cur_req_info(batch_idx);
-            int* gIndices = params.indices_ptr + batch_idx*params.indices_batch_stride + s_q_idx*params.indices_row_stride; // (topk) : (1)
+            // (topk) : (1)
+            int* gIndices = 
+                params.indices_ptr + batch_idx * params.indices_batch_stride +
+                s_q_idx * params.indices_row_stride;
 
-            constexpr int GROUP_SIZE = 4, NUM_GROUPS = 128 / GROUP_SIZE;
-            constexpr int ROWS_PER_GROUP = B_TOPK / NUM_GROUPS;
-            int group_idx = idx_in_warpgroup / GROUP_SIZE;
-            int idx_in_group = idx_in_warpgroup % GROUP_SIZE;
+            int nxt_token_index = GET_TOKEN_INDEX(start_block_idx);
 
             NamedBarrier::arrive_and_wait(NUM_WORKING_THREADS, 1);
 
             CUTE_NO_UNROLL
             for (int block_idx = start_block_idx; block_idx < end_block_idx; block_idx++) {
-                int buf_idx = block_idx % NUM_BUFS;
+                int buf_idx = (block_idx) % NUM_BUFS;
 
-                // Wait for buffer to be available
-                plan.bar_k_free[buf_idx].wait(bar_phase_k>>buf_idx&1^1);
+                // Define shared and global tensors
+                bf16* sK_nope_base = plan.u.k[buf_idx].data() +
+                    (idx_in_cluster * (B_TOPK / 2) + my_token_idx) * 8 +
+                    ((lane_idx / 8) * 16) * B_TOPK;
+                bf16* sK_nope_peer_base = get_peer_addr(sK_nope_base);
 
-                // Load
-                Tensor sK = make_tensor(make_smem_ptr(plan.u.k[buf_idx].data()), SmemLayoutK{});
+                // Get another cluster barrier
+                transac_bar_t* peer_bar_k_remote_ready =
+                    get_peer_addr(&(plan.bar_remote[buf_idx]));
+                int token_index = nxt_token_index;
+                if (block_idx+1 != end_block_idx)
+                    nxt_token_index = GET_TOKEN_INDEX(block_idx + 1);
+                int block_index = token_index / 64;
+                // NOTE When token_index is -1, -1/PAGE_BLOCK_SIZE = 0
+                // and (-1+PAGE_BLOCK_SIZE)%PAGE_BLOCK_SIZE = 63, so there will be no illegal-memory-access error
+                int rel_idx_in_block = (token_index + 64) % 64;
+                fp8* gK_base =
+                    (fp8*)params.k_ptr + block_index * params.k_batch_stride +
+                    rel_idx_in_block * params.k_row_stride;
+                float4 scales =
+                    load_128b_from_gmem<float4, L1CacheHint::EVICT_LAST, L2PrefetchHint::B128>(
+                        (float*)(gK_base + D_V));
+
+                // Wait for the nope buffer to be available
+                plan.bar_k_free[buf_idx].wait((bar_phase_k >> buf_idx & 1) ^ 1);
+                bar_phase_k ^= 1 << buf_idx;
+
+                // Copy block #block_index
+                if (idx_in_warpgroup == 0) {
+                    plan.bar_remote[buf_idx].arrive_and_expect_tx(
+                        (B_TOPK / 2) * (D_V + 64) * sizeof(bf16));
+                }
+
+                // Collectively copy from global memory and dequant
+                // For more detail about the layout of K/V, please refer to comments in flash_mla_interface.py
+
+                fp8* gK_nope = gK_base + (lane_idx / 8) * 16;
+                if (token_index == -1) {
+                    scales = {0.0f, 0.0f, 0.0f, 0.0f};
+                }
+                CUTE_UNROLL
+                for (int dim_idx = 0; dim_idx < D_V / 64; dim_idx += 1) {
+                    fp8x16 cur_fp8x16 =
+                        load_128b_from_gmem<fp8x16, L1CacheHint::EVICT_LAST, L2PrefetchHint::B256>(
+                            gK_nope + dim_idx * 64);
+                    // We use EVICT_LAST here since gK_base may not be aligned to 32B
+                    float scale =
+                        dim_idx < 4 ? (dim_idx < 2 ? scales.x : scales.y) : (dim_idx < 6 ? scales.z : scales.w);
+                    auto dequant_and_save_bf16x8 = [&](const fp8x8 &data, int offset) {
+                        int smem_offset = (dim_idx*64 + offset) * B_TOPK;
+                        bf16x8 cur_bf16x8 = cvt_fp8x8_bf16x8(data, scale);
+                        *(__int128_t*)(sK_nope_base + smem_offset) = *(__int128_t*)&cur_bf16x8;
+                        st_async_128b(sK_nope_peer_base + smem_offset, cur_bf16x8, peer_bar_k_remote_ready);
+                    };
+                    if (token_index == -1)
+                        *(uint128_t*)(&cur_fp8x16) = uint128_t();
+                    dequant_and_save_bf16x8(cur_fp8x16.a0, 0);
+                    dequant_and_save_bf16x8(cur_fp8x16.a1, 8);
+                }
+
+                bf16* gK_rope = (bf16*)(gK_base + D_V + GROUP_SIZE * sizeof(float)) + (lane_idx / 8) * 8;
+                bf16* sK_rope_base = 
+                    plan.u.k[buf_idx].data() +
+                    (idx_in_cluster * (B_TOPK / 2) + my_token_idx) * 8 + ((lane_idx / 8) * 8) * B_TOPK;
+                bf16* sK_rope_peer_base = get_peer_addr(sK_rope_base);
 
                 CUTE_UNROLL
-                for (int local_row = 0; local_row < ROWS_PER_GROUP; ++local_row) {
-                    int smem_row = group_idx + local_row*NUM_GROUPS;
-                    int token_index = __ldg(gIndices + block_idx*B_TOPK + smem_row);
-                    bool is_token_invalid = token_index == -1;
-                    if (idx_in_group == 0)
-                        plan.is_token_valid[buf_idx][smem_row] = !is_token_invalid;
-                    if (is_token_invalid) {
-                        uint128_t zeros = uint128_t{};
-                        CUTE_UNROLL
-                        for (int local_col = 0; local_col < D_V / (GROUP_SIZE*16); ++local_col) {
-                            int col_base = local_col*(GROUP_SIZE*16) + idx_in_group*16;
-                            store_128b(&sK(smem_row, col_base  ), zeros);
-                            store_128b(&sK(smem_row, col_base+8), zeros);
-                        }
-                        CUTE_UNROLL
-                        for (int local_col = 0; local_col < (D_K-D_V) / (GROUP_SIZE*8); ++local_col) {
-                            int col_base = local_col*(GROUP_SIZE*8) + idx_in_group*8;
-                            store_128b(&sK(smem_row, D_V+col_base), zeros);
-                        }
-                    } else {
-                        int block_index = token_index/B_TOPK;
-                        int rel_idx_in_block = (token_index+B_TOPK) % B_TOPK;   // NOTE When token_index is -1, -1/B_TOPK = 0 and (-1+B_TOPK)%B_TOPK = 63, so there will be no illegal-memory-access error. However, masking is necessary to prevent NaN (TODO Skip some rows instead?) TODO Masking
-                        fp8* gK_base = (fp8*)params.k_ptr + block_index*params.k_batch_stride + rel_idx_in_block*params.k_row_stride;
-                        float4 scales = __ldg((float4*)(gK_base + D_V));
-
-                        CUTE_UNROLL
-                        for (int local_col = 0; local_col < D_V / (GROUP_SIZE*16); ++local_col) {
-                            int col_base = local_col*(GROUP_SIZE*16) + idx_in_group*16;
-                            fp8x16 cur_fp8s = ldg_128_fp8x16(gK_base + col_base);
-                            float cur_scale = local_col < (256/(GROUP_SIZE*16)) ?
-                                (local_col < (128/(GROUP_SIZE*16)) ? scales.x : scales.y) :
-                                (local_col < (384/(GROUP_SIZE*16)) ? scales.z : scales.w);
-                            store_128b(&sK(smem_row, col_base  ), cvt_fp8x8_bf16x8(cur_fp8s.a0, cur_scale));
-                            store_128b(&sK(smem_row, col_base+8), cvt_fp8x8_bf16x8(cur_fp8s.a1, cur_scale));
-                        }
-
-                        CUTE_UNROLL
-                        for (int local_col = 0; local_col < (D_K-D_V) / (GROUP_SIZE*8); ++local_col) {
-                            int col_base = local_col*(GROUP_SIZE*8) + idx_in_group*8;
-                            fp8x16 cur_k_rope_fp8s = ldg_128_fp8x16(gK_base + D_V + 4*sizeof(float) + col_base*sizeof(bf16));
-                            bf16x8 cur_k_rope = *reinterpret_cast<bf16x8*>(&cur_k_rope_fp8s);
-                            store_128b(&sK(smem_row, D_V+col_base), cur_k_rope);
-                        }
-                    }
+                for (int dim_idx = 0; dim_idx < 64 / 32; dim_idx += 1) {
+                    bf16x8 cur_bf16x8 =
+                        load_128b_from_gmem<bf16x8, L1CacheHint::EVICT_LAST, L2PrefetchHint::B128>(
+                            gK_rope + dim_idx * 32);
+                    if (token_index == -1)
+                        *(uint128_t*)(&cur_bf16x8) = uint128_t();
+                    int smem_offset = (D_V + dim_idx * 32) * B_TOPK;
+                    *(__int128_t*)(sK_rope_base + smem_offset) = *(__int128_t*)&cur_bf16x8;
+                    st_async_128b(sK_rope_peer_base + smem_offset, cur_bf16x8, peer_bar_k_remote_ready);
                 }
 
                 fence_view_async_shared();
 
-                // Signal
-                plan.bar_k_ready[buf_idx].arrive();
+                if (idx_in_warpgroup < 32) {
+                    // We put this after fence_view_async_shared() since this won't be read by async proxy
+                    int2 indices = __ldg((int2*)(gIndices + block_idx * B_TOPK + lane_idx * 2));
+                    *(char2*)(&plan.is_token_valid[buf_idx][lane_idx * 2]) =
+                        {indices.x != -1, indices.y != -1};
+                }
 
-                bar_phase_k ^= 1<<buf_idx;
+                // Signal the barrier
+                plan.bar_k_ready[buf_idx].arrive();
             }
+            // need cluster sync for each warpgroup
+            cute::cluster_sync();
         }
     } else if (warpgroup_idx == 1) {
         // Scale & Exp warpgroup
@@ -460,6 +510,8 @@ flash_fwd_splitkv_mla_fp8_sparse_kernel(__grid_constant__ const DecodingParams p
             }
 
             cute::tma_store_wait<0>();
+            // Need cluster for each warpgroup
+            cute::cluster_sync();
         }
 
         if (warp_idx == 4) {
@@ -507,9 +559,11 @@ flash_fwd_splitkv_mla_fp8_sparse_kernel(__grid_constant__ const DecodingParams p
                         
                         // Wait for K
                         plan.bar_k_ready[buf_idx].wait(bar_phase_k>>buf_idx&1);
+                        // Another cluster sync barrier
+                        plan.bar_remote[buf_idx].wait(bar_phase_k>>buf_idx&1);
                         tcgen05_after_thread_sync();
                         Tensor sK = make_tensor(make_smem_ptr(plan.u.k[buf_idx].data()), SmemLayoutK{});
-                        
+
                         // Issue P = Q @ K^T
                         utcmma_ss(tiled_mma_qk, sQ, sK, tP, true);
                         umma_arrive_noelect(plan.bar_qk_done[buf_idx]);
@@ -521,7 +575,9 @@ flash_fwd_splitkv_mla_fp8_sparse_kernel(__grid_constant__ const DecodingParams p
 
                         // Issue O += S @ V
                         utcmma_ss(tiled_mma_sv, sS, sV, tO, block_idx == start_block_idx);
-                        umma_arrive_noelect(plan.bar_k_free[buf_idx]);
+                        // umma_arrive_noelect(plan.bar_k_free[buf_idx]);
+                        // send double cluster
+                        umma_arrive_multicast_noelect(plan.bar_k_free[buf_idx], 1 | 2);
 
                         bar_phase_k ^= 1<<buf_idx;
                     }
@@ -530,8 +586,14 @@ flash_fwd_splitkv_mla_fp8_sparse_kernel(__grid_constant__ const DecodingParams p
 
                 // NOTE If we reach this point, we must have done the QK gemm (since we've waited for bar_so_ready)
                 // So we can launch the copy of the next Q block immediately
+                cute::cluster_sync();
             }
         }
+    }
+    if (begin_idx > end_idx) {
+        // Don't need a cluster_sync() when begin_idx <= end_idx,
+        // since the loop will execute at least once and the final statement is cluster_sync()
+        cute::cluster_sync();
     }
 
 #else
@@ -585,7 +647,19 @@ void run_flash_splitkv_mla_fp8_sparse_kernel(DecodingParams &params, cudaStream_
 
     const int num_m_blocks = cute::ceil_div(params.q_head_per_hk, B_H);
     // NOTE Don't use PDL because of potential compiler bugs!
-    mla_kernel<<<dim3(num_m_blocks, params.s_q, params.num_sm_parts), dim3(NUM_THREADS, 1, 1), smem_size, stream>>>(params, tma_params);
+
+    // remove origin kernel launch, use cutlass cluster launch
+    cutlass::ClusterLaunchParams launch_params = {
+        dim3(num_m_blocks, params.s_q, params.num_sm_parts),
+        dim3(NUM_THREADS, 1, 1),
+        dim3(2, 1, 1),
+        smem_size,
+        stream
+    };
+    cutlass::launch_kernel_on_cluster(
+        launch_params, (void*)mla_kernel, params, tma_params
+    );
+
     CHECK_CUDA_KERNEL_LAUNCH();
 }
     
