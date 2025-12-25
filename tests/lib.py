@@ -20,7 +20,7 @@ def check_is_allclose(name: str, ans: torch.Tensor, ref: torch.Tensor, abs_tol: 
         sim = 2 * (x * y).sum().item() / denominator
         return 1 - sim
     assert ans.shape == ref.shape, f"`{name}` Shape mismatch: {ans.shape} vs {ref.shape}"
-    
+
     ans = ans.clone().to(torch.float)
     ref = ref.clone().to(torch.float)
 
@@ -34,7 +34,7 @@ def check_is_allclose(name: str, ans: torch.Tensor, ref: torch.Tensor, abs_tol: 
             print(f"`{name}` Anomaly number `{val}` mismatch: {ans_mask.sum().item()} in ans but {ref_mask.sum().item()} in ref")
             return False
         return True
-    
+
     anomalies_check_passed = True
     anomalies_check_passed &= deal_with_anomalies(float("inf"))
     anomalies_check_passed &= deal_with_anomalies(float("-inf"))
