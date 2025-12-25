@@ -150,7 +150,7 @@ get_mla_decoding_metadata(
     int *tile_scheduler_metadata_ptr = tile_scheduler_metadata.data_ptr<int>();
     int *num_splits_ptr = num_splits.data_ptr<int>();
 
-    at::cuda::CUDAGuard device_guard{(char)seqlens_k.get_device()};
+    at::cuda::CUDAGuard device_guard{static_cast<c10::DeviceIndex>(seqlens_k.get_device())};
     auto stream = at::cuda::getCurrentCUDAStream().stream();
     GetDecodingMetadataParams params = {};
     params.seqlens_k_ptr = seqlens_k_ptr;
@@ -260,7 +260,7 @@ fwd_kvcache_mla(
     CHECK_SHAPE(num_splits, batch_size+1);
     if (is_sparse_attn) CHECK_SHAPE(indices.value(), batch_size, seqlen_q_ori, topk);
 
-    at::cuda::CUDAGuard device_guard{(char)q.get_device()};
+    at::cuda::CUDAGuard device_guard{static_cast<c10::DeviceIndex>(q.get_device())};
 
     auto opts = q.options();
     at::Tensor out = torch::empty({batch_size, q_seq_per_hk, num_heads, head_size_v}, opts);
@@ -419,7 +419,7 @@ std::vector<at::Tensor> sparse_prefill_fwd(
     TORCH_CHECK(kv.stride(-1) == 1);
     TORCH_CHECK(indices.stride(-1) == 1);
 
-    at::cuda::CUDAGuard device_guard{(char)q.get_device()};
+    at::cuda::CUDAGuard device_guard{static_cast<c10::DeviceIndex>(q.get_device())};
     auto opts = q.options();
     at::Tensor out = torch::empty({s_q, h_q, d_v}, opts);
     CHECK_CONTIGUOUS(out);
