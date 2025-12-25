@@ -25,24 +25,64 @@ def get_features_args():
 def get_arch_flags():
     # Check NVCC Version
     # NOTE The "CUDA_HOME" here is not necessarily from the `CUDA_HOME` environment variable. For more details, see `torch/utils/cpp_extension.py`
-    assert CUDA_HOME is not None, "PyTorch must be compiled with CUDA support"
-    nvcc_version = subprocess.check_output(
-        [os.path.join(CUDA_HOME, "bin", "nvcc"), '--version'], stderr=subprocess.STDOUT
-    ).decode('utf-8')
+    if CUDA_HOME is None:
+        raise RuntimeError(
+            "CUDA_HOME is not set. PyTorch must be compiled with CUDA support.\n"
+            "Please ensure CUDA is installed and CUDA_HOME is set correctly."
+        )
+
+    try:
+        nvcc_version = subprocess.check_output(
+            [os.path.join(CUDA_HOME, "bin", "nvcc"), '--version'], stderr=subprocess.STDOUT
+        ).decode('utf-8')
+    except (subprocess.CalledProcessError, FileNotFoundError) as e:
+        raise RuntimeError(
+            f"Failed to run nvcc from CUDA_HOME={CUDA_HOME}.\n"
+            f"Please ensure CUDA is installed correctly. Error: {e}"
+        )
+
     nvcc_version_number = nvcc_version.split('release ')[1].split(',')[0].strip()
     major, minor = map(int, nvcc_version_number.split('.'))
     print(f'Compiling using NVCC {major}.{minor}')
 
     DISABLE_SM100 = is_flag_set("FLASH_MLA_DISABLE_SM100")
     DISABLE_SM90 = is_flag_set("FLASH_MLA_DISABLE_SM90")
-    if major < 12 or (major == 12 and minor <= 8):
-        assert DISABLE_SM100, "sm100 compilation for Flash MLA requires NVCC 12.9 or higher. Please set FLASH_MLA_DISABLE_SM100=1 to disable sm100 compilation, or update your environment."
+
+    # SM100 (Blackwell) requires CUDA 12.9+
+    cuda_too_old_for_sm100 = major < 12 or (major == 12 and minor <= 8)
+    if cuda_too_old_for_sm100 and not DISABLE_SM100:
+        raise RuntimeError(
+            f"SM100 (Blackwell) compilation requires CUDA 12.9 or higher, but found CUDA {major}.{minor}.\n"
+            "\n"
+            "Options to fix this:\n"
+            "  1. Upgrade to CUDA 12.9+ to enable SM100 support\n"
+            "  2. Disable SM100 compilation by setting: FLASH_MLA_DISABLE_SM100=1\n"
+            "\n"
+            "Example: FLASH_MLA_DISABLE_SM100=1 pip install -v .\n"
+            "\n"
+            "Note: SM90 (Hopper) kernels will still be compiled and available."
+        )
 
     arch_flags = []
     if not DISABLE_SM100:
         arch_flags.extend(["-gencode", "arch=compute_100a,code=sm_100a"])
+        print("  - SM100 (Blackwell) support: enabled")
+    else:
+        print("  - SM100 (Blackwell) support: disabled")
+
     if not DISABLE_SM90:
         arch_flags.extend(["-gencode", "arch=compute_90a,code=sm_90a"])
+        print("  - SM90 (Hopper) support: enabled")
+    else:
+        print("  - SM90 (Hopper) support: disabled")
+
+    if not arch_flags:
+        raise RuntimeError(
+            "No GPU architectures enabled for compilation.\n"
+            "At least one of SM90 or SM100 must be enabled.\n"
+            "Check your FLASH_MLA_DISABLE_SM90 and FLASH_MLA_DISABLE_SM100 settings."
+        )
+
     return arch_flags
 
 def get_nvcc_thread_args():
