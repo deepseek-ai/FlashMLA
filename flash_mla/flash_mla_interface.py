@@ -1,16 +1,25 @@
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Union
+import warnings
 
 import torch
 
 import flash_mla.cuda as flash_mla_cuda
 
+
+# Sentinel value for detecting unset parameters
+_UNSET = object()
+
+
 def get_mla_metadata(
     cache_seqlens: torch.Tensor,
-    num_q_tokens_per_head_k: int,
-    num_heads_k: int,
+    num_q_tokens_per_head_k: Union[int, object] = _UNSET,
+    num_heads_k: Union[int, object] = _UNSET,
     num_heads_q: Optional[int] = None,
     is_fp8_kvcache: bool = False,
-    topk: Optional[int] = None
+    topk: Optional[int] = None,
+    *,  # Force remaining arguments to be keyword-only
+    # Deprecated parameter name for backwards compatibility (issue #108)
+    num_heads_per_head_k: Optional[int] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Arguments:
@@ -25,6 +34,26 @@ def get_mla_metadata(
         tile_scheduler_metadata: (num_sm_parts, TileSchedulerMetaDataSize), dtype torch.int32.
         num_splits: (batch_size + 1), dtype torch.int32.
     """
+    # Handle deprecated parameter name for backwards compatibility (issue #108)
+    if num_heads_per_head_k is not None:
+        warnings.warn(
+            "The parameter 'num_heads_per_head_k' is deprecated and will be removed in a future version. "
+            "Please use 'num_q_tokens_per_head_k' instead.",
+            DeprecationWarning,
+            stacklevel=2
+        )
+        if num_q_tokens_per_head_k is not _UNSET:
+            raise ValueError(
+                "Cannot specify both 'num_q_tokens_per_head_k' and 'num_heads_per_head_k'. "
+                "Please use only 'num_q_tokens_per_head_k'."
+            )
+        num_q_tokens_per_head_k = num_heads_per_head_k
+
+    if num_q_tokens_per_head_k is _UNSET:
+        raise TypeError("get_mla_metadata() missing required argument: 'num_q_tokens_per_head_k'")
+    if num_heads_k is _UNSET:
+        raise TypeError("get_mla_metadata() missing required argument: 'num_heads_k'")
+
     return flash_mla_cuda.get_mla_decoding_metadata(cache_seqlens, num_q_tokens_per_head_k, num_heads_k, num_heads_q, is_fp8_kvcache, topk)
 
 
