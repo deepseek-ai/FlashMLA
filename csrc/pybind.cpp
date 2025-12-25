@@ -107,10 +107,10 @@ DecodingAttnImplMeta get_attn_impl_meta(
         } else {
             if (is_fp8_kvcache) {
                 // FP8 MLA
-                TORCH_CHECK(false, "FP8 Dence MLA is not supported on SM100");
+                TORCH_CHECK(false, "FP8 Dense MLA is not supported on SM100");
             } else {
                 // Normal BF16 MLA
-                TORCH_CHECK(false, "BF16 Dence MLA is not supported on SM100");
+                TORCH_CHECK(false, "BF16 Dense MLA is not supported on SM100");
             }
         }
     } else {
