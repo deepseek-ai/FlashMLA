@@ -161,7 +161,7 @@ focused_kv = kv[indices]    # For the i-th sequence (s_q), the corresponding KV 
 
 P = (Q @ focused_kv.transpose(-1, -2)) * sm_scale * math.log2(math.e)    # [s_q, h_q, topk]
 max_logits = P.max(dim=-1) # [s_q, h_q]
-lse = log2sumexp2(P, dim=-1, base=2)   # [s_q, h_q]，"log2sumexp2" means that the exponentiation and logarithm are base-2
+lse = log2sumexp2(P, dim=-1, base=2)   # [s_q, h_q], "log2sumexp2" means that the exponentiation and logarithm are base-2
 S = exp2(P - lse)      # [s_q, h_q, topk]
 out = S @ focused_kv  # [s_q, h_q, d_qk]
 
