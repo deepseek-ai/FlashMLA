@@ -351,7 +351,7 @@ sparse_attn_fwd_kernel(__grid_constant__ const SparsePrefillParams params, __gri
                 float2 d = float2_fma(p[i], scale, neg_new_max);
                 d.x = exp2f(d.x);
                 d.y = exp2f(d.y);
-                li += d.x + d.y;    // NOTE Theorically we can have use FFMA2 here but actually this is faster...
+                li += d.x + d.y;    // NOTE Theoretically we can use FFMA2 here but actually this is faster...
                 s[i] = __float22bfloat162_rn(d);
             }
 
