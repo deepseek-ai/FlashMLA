@@ -1,5 +1,4 @@
 import math
-import time
 from typing import Tuple
 import random
 import dataclasses
