@@ -68,6 +68,6 @@ def check_is_allclose(name: str, ans: torch.Tensor, ref: torch.Tensor, abs_tol: 
         return False
     else:
         if abs(cos_diff) > cos_diff_tol:
-            print(f"`{name}` mismatch: Cosine diff too large: {cos_diff} vs {cos_diff_tol})")
+            print(f"`{name}` mismatch: Cosine diff too large: {cos_diff} vs {cos_diff_tol}")
             return False
         return True
