@@ -252,7 +252,7 @@ fwd_kvcache_mla(
         int bytes_per_token = 512 + 64*2 + (512/128)*4;
         CHECK_SHAPE(kcache, num_blocks, page_block_size, num_heads_k, bytes_per_token);
         TORCH_CHECK(num_heads_k == 1, "Currently the number of k heads must be 1 when is_fp8_kvcache is True");
-        TORCH_CHECK(kcache.stride(1) == bytes_per_token, "The whole block must be contiguous when is_fp8_cache is True");
+        TORCH_CHECK(kcache.stride(1) == bytes_per_token, "The whole block must be contiguous when is_fp8_kvcache is True");
     }
     CHECK_SHAPE(seqlens_k, batch_size);
     CHECK_SHAPE(block_table, batch_size, max_num_blocks_per_seq);
@@ -334,7 +334,7 @@ fwd_kvcache_mla(
                 TORCH_CHECK(q_dtype == torch::kBFloat16, "Sparse FP8 MLA only supports BFloat16 on SM90");
                 sm90::run_flash_splitkv_mla_fp8_sparse_kernel(params, stream);
             } else {
-                TORCH_CHECK(false, "Only FP8 kvcahe is supported for sparse MLA on SM90");
+                TORCH_CHECK(false, "Only FP8 KV cache is supported for sparse MLA on SM90");
             }
         } else {
             if (is_fp8) {
