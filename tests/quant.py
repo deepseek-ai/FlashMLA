@@ -7,7 +7,7 @@ def quantize_k_cache(
 ) -> torch.Tensor:
     """
     Quantize the k-cache
-    Return a tensor with shape (num_blocks, block_size, h_k, dv + 4(dv/tile_size) + t(d-dv)) of dtype uint8_t, where t = input_k_cache.element_size()
+    Return a tensor with shape (num_blocks, block_size, h_k, dv + 4(dv/tile_size) + t(d-dv)) of dtype float8_e4m3fn, where t = input_k_cache.element_size()
     For more detail about the layout of K/V, please refer to comments in flash_mla_interface.py or README.md
     """
     assert dv % tile_size == 0
