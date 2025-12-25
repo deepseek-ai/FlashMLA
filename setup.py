@@ -104,7 +104,8 @@ ext_modules.append(
 try:
     cmd = ['git', 'rev-parse', '--short', 'HEAD']
     rev = '+' + subprocess.check_output(cmd).decode('ascii').rstrip()
-except Exception as _:
+except (subprocess.CalledProcessError, FileNotFoundError, OSError):
+    # Fallback to timestamp if git is not available or not in a git repo
     now = datetime.now()
     date_time_str = now.strftime("%Y-%m-%d-%H-%M-%S")
     rev = '+' + date_time_str
