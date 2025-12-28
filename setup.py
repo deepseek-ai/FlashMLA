@@ -97,6 +97,8 @@ ext_modules.append(
             Path(this_dir) / "csrc" / "sm90",
             Path(this_dir) / "csrc" / "cutlass" / "include",
             Path(this_dir) / "csrc" / "cutlass" / "tools" / "util" / "include",
+            # CUDA 13+ moved cuda/std headers to CCCL - add CUDA include path explicitly
+            Path(CUDA_HOME) / "include",
         ],
     )
 )
