@@ -34,7 +34,7 @@
 
 #include "cutlass/cutlass.h"
 #include "cute/layout.hpp"
-#include "utils.h"  // for IS_SM100
+#include <kerutils/kerutils.cuh> // for  KERUTILS_ENABLE_SM100A
 
 namespace cutlass::fmha::kernel {
 
@@ -139,7 +139,7 @@ struct FmhaKernelBwdConvert {
   }
 
   CUTLASS_DEVICE void operator()(const Params &params, char* smem) {
-#if IS_SM100
+#if defined(KERUTILS_ENABLE_SM100A)
     if (params.ptr_src_dQ != nullptr) {
       copy(params, params.ptr_src_dQ, params.stride_src_dQ, params.ptr_dest_dQ, params.stride_dest_dQ, get<0>(params.problem_shape), get<2>(params.problem_shape));
     }

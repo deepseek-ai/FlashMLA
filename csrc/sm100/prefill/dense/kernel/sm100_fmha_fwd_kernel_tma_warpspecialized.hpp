@@ -37,7 +37,7 @@
 #include "cutlass/pipeline/pipeline.hpp"
 #include "cute/arch/tmem_allocator_sm100.hpp"
 
-#include "utils.h"  // for IS_SM100
+#include <kerutils/kerutils.cuh> // for  KERUTILS_ENABLE_SM100A
 #include "../kernel/fmha_options.hpp"
 #include "../kernel/fmha_tile_scheduler.hpp"
 #include "../kernel/fmha_causal_tile_scheduler.hpp"
@@ -252,7 +252,7 @@ struct Sm100FmhaFwdKernelTmaWarpspecialized {
   }
 
   CUTLASS_DEVICE void operator()(const Params &params, char* smem) {
-#if IS_SM100
+#if defined(KERUTILS_ENABLE_SM100A)
 
     TileScheduler tile_scheduler{params.tile_scheduler};
 
