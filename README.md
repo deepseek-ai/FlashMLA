@@ -2,7 +2,7 @@
 
 ## Introduction
 
-FlashMLA is DeepSeek's library of optimized attention kernels, powering the [DeepSeek-V3](https://github.com/deepseek-ai/DeepSeek-V3) and [DeepSeek-V3.2](https://github.com/deepseek-ai/DeepSeek-V3.2-Exp) models. This repository contains the following implementations:
+FlashMLA is DeepSeek's library of optimized attention kernels, powering the [DeepSeek-V3](https://github.com/deepseek-ai/DeepSeek-V3) and [DeepSeek-V3.2-Exp](https://github.com/deepseek-ai/DeepSeek-V3.2-Exp) models. This repository contains the following implementations:
 
 **Sparse Attention Kernels**
 
@@ -18,8 +18,8 @@ FlashMLA is DeepSeek's library of optimized attention kernels, powering the [Dee
 
 ## News
 
-- **2025.09.29 Release of Sparse Attention Kernels**: With the launch of [DeepSeek-V3.2](https://github.com/deepseek-ai/DeepSeek-V3.2-Exp), we are releasing the corresponding token-level sparse attention kernels. These kernels power the model's DeepSeek Sparse Attention (DSA) and achieve up to 640 TFlops during prefilling and 410 TFlops during decoding.
-- **2025.08.01 Kernels for MHA on Blackwell**: Thanks to [NVIDIA's PR](https://github.com/deepseek-ai/FlashMLA/pull/76) for MHA forward / backward kernels on Blackwell!
+- **2025.09.29 Release of Sparse Attention Kernels**: With the launch of [DeepSeek-V3.2](https://github.com/deepseek-ai/DeepSeek-V3.2-Exp), we are releasing the corresponding token-level sparse attention kernels. These kernels power the model's DeepSeek Sparse Attention (DSA) and achieve up to 640 TFlops during prefilling and 410 TFlops during decoding. We also release a deep-dive blog for our new FP8 sparse decoding kernel. Check it out [here](docs/20250929-hopper-fp8-sparse-deep-dive.md).
+- **2025.08.01 Kernels for MHA on SM100**: Thanks to [NVIDIA's PR](https://github.com/deepseek-ai/FlashMLA/pull/76) for MHA forward / backward kernels on SM100!
 - **2025.04.22 Deep-Dive Blog**: We'd love to share the technical details behind the new FlashMLA kernel! Check out our deep-dive write-up [here](docs/20250422-new-kernel-deep-dive.md).
 - **2025.04.22 Performance Update**: We're excited to announce the new release of Flash MLA, which delivers 5% ~ 15% performance improvement for compute-bound workloads, achieving up to 660 TFlops on NVIDIA H800 SXM5 GPUs. The interface of the new version is fully compatible with the old one. Simply upgrade to the new version for an immediate performance boost! 🚀🚀🚀
 
@@ -28,12 +28,11 @@ FlashMLA is DeepSeek's library of optimized attention kernels, powering the [Dee
 #### Test & benchmark MLA decoding (Sparse & Dense):
 
 ```bash
-python tests/test_flash_mla_decoding.py
+python tests/test_flash_mla_dense_decoding.py
+python tests/test_flash_mla_sparse_decoding.py
 ```
 
-The dense MLA decoding kernel can achieve up to 3000 GB/s in memory-bound configuration and 660 TFLOPS in computation-bound configuration on H800 SXM5, using CUDA 12.8. For token-level sparse MLA decoding kernel (which uses an FP8 KV cache while performing the matrix multiplication in bfloat16), it can achieve 410 TFLOPS in compute-bound configuration on H800 SXM5, CUDA 12.8.
-
-For Blackwell GPUs, the token-level sparse MLA decoding kernel can achieve up to 350 TFlops (on B200) which is not really optimized yet.
+The dense MLA decoding kernel achieves up to 3000 GB/s in memory-bound configuration and 660 TFLOPS in computation-bound configuration on H800 SXM5 with CUDA 12.8. The token-level sparse MLA decoding kernel (which uses an FP8 KV cache while performing the matrix multiplication in bfloat16) achieves 410 TFLOPS in compute-bound configuration on H800 SXM5 with CUDA 12.8, and achieves up to 350 TFlops on B200 (which is not really optimized yet).
 
 #### Test & benchmark MHA prefill (Dense):
 
@@ -46,25 +45,25 @@ It achieves up to 1460 TFlops in forward and 1000 TFlops in backward computation
 #### Test & benchmark MLA prefill (Sparse):
 
 ```bash
-python tests/test_flash_mla_prefill.py
+python tests/test_flash_mla_sparse_prefill.py
 ```
 
-It achieves up to 640 TFlops in forward computation on H800 SXM5, CUDA 12.8, and achieves up to 1450 TFlops on B200, CUDA 12.9.
+It achieves up to 640 TFlops in forward computation on H800 SXM5 with CUDA 12.8, and achieves up to 1450 TFlops on B200, CUDA 12.9.
 
 ## Requirements
 
-- Hopper / Blackwell GPUs (See the support matrix below)
-- CUDA 12.8 and above (CUDA 12.9+ is required for Blackwell kernels)
+- SM90 / SM100 (See the support matrix below)
+- CUDA 12.8 and above (CUDA 12.9+ is required for SM100 kernels)
 - PyTorch 2.0 and above
 
 Support matrix:
 
 | Kernel | GPU Architecture | MLA Mode [2] | KVCache Format |
 | :---: | :---: | :---: | :---: |
-| Dense Decoding | Hopper | MQA | BF16 |
-| Sparse Decoding | Hopper & Blackwell | MQA | FP8 [1] |
-| Dense Prefill | Blackwell | MHA |  |
-| Sparse Prefill | Hopper & Blackwell | MQA |  |
+| Dense Decoding | SM90 | MQA | BF16 |
+| Sparse Decoding | SM90 & SM100 | MQA | FP8 [1] |
+| Dense Prefill | SM100 | MHA |  |
+| Sparse Prefill | SM90 & SM100 | MQA |  |
 
 [1]: For more details on using FP8 KV cache, see documents below.
 

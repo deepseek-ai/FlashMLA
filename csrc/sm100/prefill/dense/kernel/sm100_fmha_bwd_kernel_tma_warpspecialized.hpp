@@ -41,7 +41,7 @@
 #include "cutlass/arch/memory_sm80.h"
 #include "cutlass/gemm/collective/collective_builder.hpp"
 
-#include "utils.h"  // for IS_SM100
+#include <kerutils/kerutils.cuh> // for  KERUTILS_ENABLE_SM100A
 #include "../collective/fmha_common.hpp"
 
 #include <cmath>
@@ -949,8 +949,7 @@ struct Sm100FmhaBwdKernelTmaWarpSpecialized {
       TensorC const& coord,
       TensorShape const& tensor_shape) {
 
-    //TODO Performance of FlashMLA on hopper is dropped with latest cutlass, so here revert the to the old version.
-    // Tensor preds = cute::lazy::transform(coord, [&](auto const& c) { return elem_less(c, tensor_shape); });
+    Tensor preds = cute::lazy::transform(coord, [&](auto const& c) { return elem_less(c, tensor_shape); });
 
     auto copy_op = make_cotiled_copy(
         Copy_Atom<UniversalCopy<uint128_t>, Element>{},
@@ -960,23 +959,11 @@ struct Sm100FmhaBwdKernelTmaWarpSpecialized {
     auto thr_copy = copy_op.get_slice(_0{});
 
     Tensor quantized_regs = quantize(regs);
-    auto tCg = thr_copy.partition_D(gmem);
-    auto tCr = thr_copy.partition_S(quantize(regs));
-    auto tCc = thr_copy.partition_D(coord);
+    Tensor tCr = thr_copy.partition_S(quantized_regs);
+    Tensor tCg = thr_copy.partition_D(gmem);
+    Tensor tPc = thr_copy.partition_D(preds);
 
-
-    constexpr int R = decltype(tCr.layout())::rank;
-    auto tCg_v = group_modes<1, R>(tCg);
-    auto tCr_v = group_modes<1, R>(tCr);
-    auto tCc_v = group_modes<1, R>(tCc);
-    auto tCp_v = make_tensor<bool>(shape<1>(tCc_v));
-
-    for (int i = 0; i < size(tCp_v); ++i) {
-      tCp_v(i) = elem_less(tCc_v(_0{},i), tensor_shape);
-    }
-
-    copy_if(copy_op, tCp_v, tCr_v, tCg_v);
-
+    copy_if(copy_op, tPc, tCr, tCg);
   }
 
 
@@ -1500,7 +1487,7 @@ struct Sm100FmhaBwdKernelTmaWarpSpecialized {
 
 
   CUTLASS_DEVICE void operator()(Params const& params, char* smem) {
-#if IS_SM100
+#if defined(KERUTILS_ENABLE_SM100A)
     int warp_idx = cutlass::canonical_warp_idx_sync();
     auto role = warp_idx_to_role(warp_idx);
     uint32_t lane_predicate = cute::elect_one_sync();
