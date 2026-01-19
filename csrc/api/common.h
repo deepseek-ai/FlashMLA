@@ -6,6 +6,7 @@
 #include <kerutils/supplemental/torch_tensors.h>
 
 #include <cutlass/bfloat16.h>
+#include <span>
 
 static constexpr float LOG_2_E = 1.44269504f;
 
