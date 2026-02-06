@@ -13,6 +13,7 @@
 #include "kernel/sm100_fmha_fwd_kernel_tma_warpspecialized.hpp"
 
 #include <torch/library.h>
+#include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAStream.h>
 
 using namespace cute;
@@ -288,8 +289,11 @@ void run_fmha_fwd(at::Tensor workspace, at::Tensor q, at::Tensor k, at::Tensor v
                   at::Tensor cumulative_seqlen_q, at::Tensor cumulative_seqlen_kv, at::Tensor o,
                   at::Tensor lse, float scale_softmax, int max_seqlen_q, int max_seqlen_kv) {
 
+  const at::cuda::CUDAGuard device_guard{(char)q.get_device()};
+  const int device_id = q.get_device();
+
   cutlass::KernelHardwareInfo hw_info;
-  hw_info.device_id = 0;
+  hw_info.device_id = device_id;
   hw_info.sm_count =
       cutlass::KernelHardwareInfo::query_device_multiprocessor_count(hw_info.device_id);
 
