@@ -46,14 +46,6 @@ do { \
 } while (0)
 #endif
 
-#ifndef TRAP_ONLY_DEVICE_ASSERT
-#define TRAP_ONLY_DEVICE_ASSERT(cond) \
-do { \
-    if (not (cond)) \
-        asm("trap;"); \
-} while (0)
-#endif
-
 
 struct RingBufferState {
     uint32_t cur_block_idx = 0u;

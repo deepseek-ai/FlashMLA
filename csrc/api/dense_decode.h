@@ -58,7 +58,7 @@ dense_attn_decode_interface(
     const int num_heads_q = sizes[2];
     const int head_size_k = sizes[3];
     TORCH_CHECK(head_size_k == 576 || head_size_k == 512, "Only head_size_k == 576 or 512 is supported");
-    TORCH_CHECK(head_size_v == 512, "Only head_size_v == 576 is supported");
+    TORCH_CHECK(head_size_v == 512, "Only head_size_v == 512 is supported");
     
     const int max_num_blocks_per_seq = block_table.size(1);
     const int num_blocks = kcache.size(0);
