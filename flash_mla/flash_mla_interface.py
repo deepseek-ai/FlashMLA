@@ -181,6 +181,7 @@ def flash_mla_sparse_fwd(
     d_v: int = 512,
     attn_sink: Optional[torch.Tensor] = None,
     topk_length: Optional[torch.Tensor] = None,
+    indexer_topk: int = 0,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Sparse attention prefill kernel
@@ -197,16 +198,19 @@ def flash_mla_sparse_fwd(
             This argument has no effect on lse and max_logits.
         topk_length: optional, [s_q], int32. If provided, the i-th q token will only attend to k tokens specified by indices[i, :, :topk_length[i]], ignoring later k/v tokens (even if provided in indices).
             In extremely rare cases (topk_length provided, there is a valid topk index between topk_length[i] ~ s_kv, and that topk index points to a k token containing NaN), operator output will contain NaN, so please avoid this situation.
+        indexer_topk: int, 0 or 512. When > 0, the kernel computes lse_indexer over
+            the first indexer_topk entries of indices (the indexer/compress portion).
 
     Returns:
-        (output, max_logits, lse)
+        (output, max_logits, lse, lse_indexer)
         Please refer to tests/ref.py for the precise definitions of these parameters.
         - output: [s_q, h_q, d_v], bfloat16
         - max_logits:  [s_q, h_q], float
         - lse: [s_q, h_q], float, log-sum-exp of attention scores
+        - lse_indexer: [s_q, h_q], float, LSE over the indexer portion only
     """
     results = flash_mla_cuda.sparse_prefill_fwd(
-        q, kv, indices, sm_scale, d_v, attn_sink, topk_length
+        q, kv, indices, sm_scale, d_v, attn_sink, topk_length, indexer_topk
     )
     return results
 

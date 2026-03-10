@@ -1,5 +1,7 @@
 #pragma once
 
+#include <limits>
+
 #include "common.h"
 
 #include "params.h"
@@ -41,7 +43,11 @@ protected:
     void run_(const SparseAttnFwdParams &params, const std::vector<FeatureT> &required_features) override {
         DISPATCH_HEAD_DIM(params.d_qk, HEAD_DIM_QK, [&]() {
             DISPATCH_BOOLEAN_FLAG(params.topk_length != nullptr, HAVE_TOPK_LENGTH, [&]() {
-                sm90::fwd::run_fwd_phase1_kernel<HEAD_DIM_QK, HAVE_TOPK_LENGTH>(params);
+                if (params.indexer_topk == 512) {
+                    sm90::fwd::run_fwd_phase1_kernel<HEAD_DIM_QK, HAVE_TOPK_LENGTH, 128, 512>(params);
+                } else {
+                    sm90::fwd::run_fwd_phase1_kernel<HEAD_DIM_QK, HAVE_TOPK_LENGTH>(params);
+                }
             });
         });
     }
@@ -60,7 +66,11 @@ class Fwd_Sm100_Head64_Impl : public FwdImplBase {
 protected:
     void run_(const SparseAttnFwdParams &params, const std::vector<FeatureT> &required_features) override {
         DISPATCH_HEAD_DIM(params.d_qk, HEAD_DIM_QK, [&]() {
-            sm100::fwd::head64::run_fwd_phase1_kernel<HEAD_DIM_QK>(params);
+            if (params.indexer_topk == 512) {
+                sm100::fwd::head64::run_fwd_phase1_kernel<HEAD_DIM_QK, 128, 512>(params);
+            } else {
+                sm100::fwd::head64::run_fwd_phase1_kernel<HEAD_DIM_QK>(params);
+            }
         });
     }
 };
@@ -105,7 +115,8 @@ static std::vector<at::Tensor> sparse_attn_prefill_interface(
     float sm_scale,
     int d_v,
     const std::optional<at::Tensor> &attn_sink,
-    const std::optional<at::Tensor> &topk_length
+    const std::optional<at::Tensor> &topk_length,
+    int64_t indexer_topk = 0
 ) {
     using bf16 = cutlass::bfloat16_t;
     
@@ -130,6 +141,7 @@ static std::vector<at::Tensor> sparse_attn_prefill_interface(
 
     TORCH_CHECK(d_qk == 576 || d_qk == 512, "Invalid d_qk: ", d_qk);
     TORCH_CHECK(d_v == 512, "Invalid d_v", d_v);
+    TORCH_CHECK(indexer_topk == 0 || indexer_topk == 512, "indexer_topk must be 0 or 512, got ", indexer_topk);
     
     KU_CHECK_DEVICE(q);
     KU_CHECK_DEVICE(kv);
@@ -162,9 +174,11 @@ static std::vector<at::Tensor> sparse_attn_prefill_interface(
     at::Tensor out = torch::empty({s_q, h_q, d_v}, opts);
     at::Tensor lse = torch::empty({s_q, h_q}, opts.dtype(torch::kFloat));
     at::Tensor max_logits = torch::empty({s_q, h_q}, opts.dtype(torch::kFloat));
+    at::Tensor lse_indexer = torch::full({s_q, h_q}, std::numeric_limits<float>::infinity(), opts.dtype(torch::kFloat));
     KU_CHECK_CONTIGUOUS(out);
     KU_CHECK_CONTIGUOUS(lse);
     KU_CHECK_CONTIGUOUS(max_logits);
+    KU_CHECK_CONTIGUOUS(lse_indexer);
 
     SparseAttnFwdParams params = {
         s_q, s_kv, h_q, h_kv, d_qk, d_v, topk,
@@ -183,9 +197,11 @@ static std::vector<at::Tensor> sparse_attn_prefill_interface(
         (bf16*)out.data_ptr(),
         (float*)max_logits.data_ptr(),
         (float*)lse.data_ptr(),
+        (float*)lse_indexer.data_ptr(),
 
         arch.num_sms,
-        at::cuda::getCurrentCUDAStream().stream()
+        at::cuda::getCurrentCUDAStream().stream(),
+        (int)indexer_topk
     };
 
     std::vector<FwdFeatures> required_features;
@@ -239,5 +255,5 @@ static std::vector<at::Tensor> sparse_attn_prefill_interface(
         TORCH_CHECK(false, "Unsupported architecture");
     }
 
-    return {out, max_logits, lse};
+    return {out, max_logits, lse, lse_indexer};
 }
