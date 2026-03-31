@@ -90,7 +90,7 @@ struct FmhaKernelBwdConvert {
   }
 
   static dim3 get_grid_shape(Params const& params) {
-    dim3 grid(size<4,0>(params.problem_shape), size<4,1>(params.problem_shape), ceil_div(std::max(size<0>(params.problem_shape), size<1>(params.problem_shape)), kBlockSeq));
+    dim3 grid(ceil_div(std::max(size<0>(params.problem_shape), size<1>(params.problem_shape)), kBlockSeq), size<4,0>(params.problem_shape), size<4,1>(params.problem_shape));
     return grid;
   }
 
@@ -105,18 +105,18 @@ struct FmhaKernelBwdConvert {
 
   template<class StrideSrc, class StrideDest, class Count>
   CUTLASS_DEVICE void copy(Params const& params, const ElementAcc* ptr_src, StrideSrc const& stride_src, Element* ptr_dest, StrideDest const& stride_dest, Count const& count, int d_dim) {
-    auto ptr_src_bh = ptr_src + get<2,0>(stride_src) * blockIdx.x + get<2,1>(stride_src) * blockIdx.y;
-    auto ptr_dest_bh = ptr_dest + get<2,0>(stride_dest) * blockIdx.x + get<2,1>(stride_dest) * blockIdx.y;
+    auto ptr_src_bh = ptr_src + get<2,0>(stride_src) * blockIdx.y + get<2,1>(stride_src) * blockIdx.z;
+    auto ptr_dest_bh = ptr_dest + get<2,0>(stride_dest) * blockIdx.y + get<2,1>(stride_dest) * blockIdx.z;
 
     int seqlen = count;
     if constexpr (is_variable_length_v<decltype(count)>) {
-      int offset = count.cumulative_length[blockIdx.y];
+      int offset = count.cumulative_length[blockIdx.z];
       ptr_dest_bh += offset * get<0>(stride_dest);
-      seqlen = count.cumulative_length[blockIdx.y + 1] - offset;
+      seqlen = count.cumulative_length[blockIdx.z + 1] - offset;
     }
 
     for (int idx_s_t = threadIdx.y; idx_s_t < kBlockSeq; idx_s_t += kNumThreadsSeq) {
-      int idx_s = idx_s_t + kBlockSeq * blockIdx.z;
+      int idx_s = idx_s_t + kBlockSeq * blockIdx.x;
       if (idx_s >= seqlen) continue;
       auto ptr_src_bhs = ptr_src_bh + idx_s * get<0>(stride_src);
       auto ptr_dest_bhs = ptr_dest_bh + idx_s * get<0>(stride_dest);
