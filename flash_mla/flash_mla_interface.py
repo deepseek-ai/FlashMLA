@@ -72,7 +72,7 @@ def flash_mla_with_kvcache(
     Arguments:
         q: (batch_size, seq_len_q, num_heads_q, head_dim).
         k_cache: (num_blocks, page_block_size, num_heads_k, head_dim).
-                Different modes (including fp8/bf16, and sparsity) has different KV cache layouts. See comments below for details.
+                Different modes (including fp8/bf16, and sparsity) have different KV cache layouts. See comments below for details.
                 The KV cache must be contiguously valid for sparse attention on sm100. Here "contiguously valid" means that every byte, from the very beginning of the KV cache, till the last byte in the KV cache, is valid memory address to visit (i.e. won't IMA). In other words, the KV cache could be a slice of a larger array, but cannot be a list of disjoint memory blocks.
         block_table: (batch_size, max_num_blocks_per_seq), torch.int32. Can be None when sparse attention is used.
         cache_seqlens: (batch_size), torch.int32. Can be None when sparse attention is used.
@@ -85,7 +85,7 @@ def flash_mla_with_kvcache(
         indices: (batch_size, seq_len_q, topk). KV indices when sparse attention is enabled.
                     Pay attention that indices_in_kvcache[i][j][k] = (the index of the page block where token t resides) * block_size + (the offset of token t among the page block),
                     where t is the k-th token of the j-th q-sequence in the i-th batch.
-        attn_sink: Optional[torch.Tensor], (num_heads_q, ), torch.float32. If presented, the final output will be scaled by exp(lse) / (exp(lse) + exp(attn_sink)). Have no affect on the returned softmax_lse. +inf will cause the result to become 0.
+        attn_sink: Optional[torch.Tensor], (num_heads_q, ), torch.float32. If presented, the final output will be scaled by exp(lse) / (exp(lse) + exp(attn_sink)). Has no effect on the returned softmax_lse. +inf will cause the result to become 0.
         extra_k_cache and extra_indices_in_kvcache: If provided, will attend to these extra tokens in addition to those in k_cache and indices_in_kvcache. Their format requirements are the same as k_cache and indices_in_kvcache respectively.
         topk_length/extra_topk_length: (batch_size, ), torch.int32. If provided, only the leftmost topk_length indices will be processed. Useful when the actual topk for different queries are different so that we can save some computation, compared to masking.
     
