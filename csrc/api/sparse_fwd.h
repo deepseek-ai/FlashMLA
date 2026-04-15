@@ -43,7 +43,9 @@ protected:
     void run_(const SparseAttnFwdParams &params, const std::vector<FeatureT> &required_features) override {
         DISPATCH_HEAD_DIM(params.d_qk, HEAD_DIM_QK, [&]() {
             DISPATCH_BOOLEAN_FLAG(params.topk_length != nullptr, HAVE_TOPK_LENGTH, [&]() {
-                if (params.indexer_topk == 512) {
+                if (params.indexer_topk == 2048) {
+                    sm90::fwd::run_fwd_phase1_kernel<HEAD_DIM_QK, HAVE_TOPK_LENGTH, 128, 2048>(params);
+                } else if (params.indexer_topk == 512) {
                     sm90::fwd::run_fwd_phase1_kernel<HEAD_DIM_QK, HAVE_TOPK_LENGTH, 128, 512>(params);
                 } else {
                     sm90::fwd::run_fwd_phase1_kernel<HEAD_DIM_QK, HAVE_TOPK_LENGTH>(params);
@@ -66,7 +68,9 @@ class Fwd_Sm100_Head64_Impl : public FwdImplBase {
 protected:
     void run_(const SparseAttnFwdParams &params, const std::vector<FeatureT> &required_features) override {
         DISPATCH_HEAD_DIM(params.d_qk, HEAD_DIM_QK, [&]() {
-            if (params.indexer_topk == 512) {
+            if (params.indexer_topk == 2048) {
+                sm100::fwd::head64::run_fwd_phase1_kernel<HEAD_DIM_QK, 128, 2048>(params);
+            } else if (params.indexer_topk == 512) {
                 sm100::fwd::head64::run_fwd_phase1_kernel<HEAD_DIM_QK, 128, 512>(params);
             } else {
                 sm100::fwd::head64::run_fwd_phase1_kernel<HEAD_DIM_QK>(params);
@@ -141,7 +145,7 @@ static std::vector<at::Tensor> sparse_attn_prefill_interface(
 
     TORCH_CHECK(d_qk == 576 || d_qk == 512, "Invalid d_qk: ", d_qk);
     TORCH_CHECK(d_v == 512, "Invalid d_v", d_v);
-    TORCH_CHECK(indexer_topk == 0 || indexer_topk == 512, "indexer_topk must be 0 or 512, got ", indexer_topk);
+    TORCH_CHECK(indexer_topk == 0 || indexer_topk == 512 || indexer_topk == 2048, "indexer_topk must be 0, 512, or 2048, got ", indexer_topk);
     
     KU_CHECK_DEVICE(q);
     KU_CHECK_DEVICE(kv);

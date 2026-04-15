@@ -198,7 +198,7 @@ def flash_mla_sparse_fwd(
             This argument has no effect on lse and max_logits.
         topk_length: optional, [s_q], int32. If provided, the i-th q token will only attend to k tokens specified by indices[i, :, :topk_length[i]], ignoring later k/v tokens (even if provided in indices).
             In extremely rare cases (topk_length provided, there is a valid topk index between topk_length[i] ~ s_kv, and that topk index points to a k token containing NaN), operator output will contain NaN, so please avoid this situation.
-        indexer_topk: int, 0 or 512. When > 0, the kernel computes lse_indexer over
+        indexer_topk: int, 0/512/2048. When > 0, the kernel computes lse_indexer over
             the first indexer_topk entries of indices (the indexer/compress portion).
 
     Returns:
