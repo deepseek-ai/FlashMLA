@@ -1,0 +1,949 @@
+#include "splitkv_mla.h"
+
+#include <cutlass/cluster_launch.hpp>
+#include <cutlass/barrier.h>
+#include <cutlass/arch/barrier.h>
+#include <cutlass/arch/reg_reconfig.h>
+#include <cute/tensor.hpp>
+#include <cute/arch/tmem_allocator_sm100.hpp>
+
+#include <kerutils/device/sm100/gemm.cuh>
+#include <kerutils/device/sm100/intrinsics.cuh>
+
+#include "defines.h"
+#include "utils.h"
+#include "deps/utils.h"         // provides IS_SM100 / IS_SM90 macros
+#include "deps/helpers.h"       // utcmma_ss / utcmma_ts / launch_tma_copy
+#include "deps/intrinsics.h"    // DSMEM st_async_128b / get_peer_addr / tma_gather4<bool> / umma_arrive_noelect
+#include "dequant.h"
+
+namespace nv_smallbatch::sm100 {
+
+using cutlass::arch::fence_view_async_shared;
+using cutlass::arch::NamedBarrier;
+using namespace cute;
+using namespace kerutils;   // tcgen05_*, tmem_ld/st_32dp32bNx, float2_add/mul/fma, umma_arrive_noelect, etc.
+
+CUTE_DEVICE int32x8_t ldg_256_indices(void* src_ptr) {
+    int32x8_t val;
+    asm volatile("ld.global.nc.L1::evict_normal.L2::evict_normal.L2::256B.v8.s32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];"
+        : "=r"(val.a0), "=r"(val.a1), "=r"(val.a2), "=r"(val.a3),
+          "=r"(val.a4), "=r"(val.a5), "=r"(val.a6), "=r"(val.a7)
+        : "l"(src_ptr)
+    );
+    return val;
+}
+
+constexpr int B_H = 64;
+constexpr int B_TOPK = 64;
+constexpr int D_Q = 576;
+constexpr int D_K = 576;
+constexpr int D_V = 512;
+constexpr int NUM_BUFS = 2;
+constexpr int NUM_INDEX_BUFS = 2;
+constexpr int NUM_THREADS = 128*3;
+constexpr float MAX_INIT_VAL = -1e30f;  // To avoid (-inf) - (-inf) = NaN
+
+constexpr int D_sQ = 256, NUM_sQ_TILES = D_sQ / 64;
+constexpr int D_tQ = D_Q - D_sQ, NUM_tQ_TILES = D_tQ / 64;
+static_assert(D_sQ%64 == 0 && D_tQ%64 == 0 && D_sQ + D_tQ == D_Q);
+
+template<
+    typename Shape_Q, typename TMA_Q,
+    typename Shape_O, typename TMA_O
+>
+struct TmaParams {
+    Shape_Q shape_Q; TMA_Q tma_Q;
+    Shape_O shape_O; TMA_O tma_O;
+    CUtensorMap tensor_map_kv_nope;
+    CUtensorMap tensor_map_kv_rope;
+};
+
+namespace tmem_addr {
+    constexpr int o = 0;    // o: [0, 256]
+    constexpr int p = 256;  // p: [256, 320]
+    constexpr int q = 320;  // q: [320, 416]
+};
+
+using SmemLayoutQ = decltype(coalesce(tile_to_shape(
+    UMMA::Layout_K_SW128_Atom<bf16>{},
+    Shape<Int<B_H>, Int<D_K>>{},
+    Step<_1, _2>{}
+), Shape<_1, _1>{}));
+
+using SmemLayoutQ_SMEM = decltype(coalesce(tile_to_shape(
+    UMMA::Layout_K_SW128_Atom<bf16>{},
+    Shape<Int<B_H>, Int<D_sQ>>{},
+    Step<_1, _2>{}
+), Shape<_1, _1>{}));
+
+using SmemLayoutOBuf = decltype(tile_to_shape(
+    UMMA::Layout_K_INTER_Atom<bf16>{},  // TODO This may lead to TMA double traffic
+    Shape<Int<B_H>, Int<D_V>>{}
+));
+
+using SmemLayoutOAccumBuf = Layout<
+    Shape<Int<B_H>, Int<D_V>>,
+    Stride<Int<520>, _1>	// We use stride = 520 here to avoid bank conflict
+>;
+
+using SmemLayoutS = decltype(tile_to_shape(
+    UMMA::Layout_K_INTER_Atom<bf16>{},
+    Shape<Int<B_H>, Int<B_TOPK>>{},
+    Step<_1, _2>{}
+));
+
+template<int NUM_TILES>
+using SmemLayoutKTiles = decltype(coalesce(tile_to_shape(
+    UMMA::Layout_K_SW128_Atom<bf16>{},
+    Shape<Int<B_H>, Int<64*NUM_TILES>>{},
+    Step<_1, _2>{}
+), Shape<_1, _1>{}));
+
+template<int NUM_TILES>
+using SmemLayoutKNopeTiles = cute::Layout<
+    cute::Shape<cute::Int<B_H>, cute::Int<64 * NUM_TILES>>,
+    cute::Stride<cute::Int<64 * NUM_TILES>, cute::_1>
+>;
+
+template<int NUM_TILES>
+using SmemLayoutKTilesTransposed = decltype(composition(
+    SmemLayoutKTiles<NUM_TILES>{},
+    Layout<
+        Shape<Int<64*NUM_TILES>, Int<B_TOPK>>,
+        Stride<Int<B_TOPK>, _1>
+    >{}
+));
+
+using SmemLayoutK = SmemLayoutKTiles<9>;
+using SmemLayoutKS = SmemLayoutKTiles<NUM_sQ_TILES>;
+using SmemLayoutKT = SmemLayoutKTiles<NUM_tQ_TILES>;
+using SmemLayoutV = SmemLayoutKTilesTransposed<8>;
+using SmemLayoutFP8KNope = SmemLayoutKNopeTiles<4>;
+
+struct SharedMemoryPlan {
+    array_aligned<fp8, cosize_v<SmemLayoutFP8KNope>> k_nope_fp8[NUM_BUFS];
+    array_aligned<bf16, cosize_v<SmemLayoutQ_SMEM>> q;
+    union {
+        array_aligned<bf16, cosize_v<SmemLayoutOBuf>> o_buf;
+        array_aligned<float, cosize_v<SmemLayoutOAccumBuf>> o_accum_buf;
+        array_aligned<bf16, cosize_v<SmemLayoutK>> k[NUM_BUFS];
+    } u;
+    array_aligned<bf16, cosize_v<SmemLayoutS>> s[NUM_BUFS];
+    transac_bar_t bar_q, bar_q_prologue;
+    transac_bar_t bar_dequant_ready[NUM_BUFS], bar_k_remote_ready[NUM_BUFS];
+    transac_bar_t bar_k_rope_ready[NUM_BUFS];
+    transac_bar_t bar_k_ready[NUM_BUFS], bar_k_free[NUM_BUFS];
+    transac_bar_t bar_qk_done[NUM_BUFS], bar_so_ready[NUM_BUFS];
+    transac_bar_t bar_k_valid_ready[NUM_BUFS], bar_k_valid_free[NUM_BUFS];
+    transac_bar_t bar_index_ready[NUM_INDEX_BUFS], bar_index_free[NUM_INDEX_BUFS];
+    float rowwise_max_buf[128], rowwise_li_buf[128];
+    char is_k_valid[NUM_BUFS][B_TOPK/8];
+    float2 scales_buf[NUM_INDEX_BUFS][B_TOPK];
+    array_aligned<uint32_t, 1> tmem_start_addr;
+};
+
+// ---------------------------------------------------------------------------
+// NUMERIC NOTE VS main's head64x2:
+//
+// This kernel issues two separate QK MMAs (first via TiledMMA_QK with SMEM-A,
+// then via TiledMMA_QK_T with TMEM-A for the tail Q half) and both MMAs
+// accumulate into the same TMEM P tile via hardware C += A*B ordering.
+//
+// main's head64 uses a single WS_TS dual-gemm MMA that produces two partial
+// halves in the TMEM P tile, then reads P back and does an explicit FP32
+// software add of the two halves in the exp warpgroup. See main head64
+// config.h:196 and kernel.cuh:166.
+//
+// These reduction graphs can differ in the last FP32 bits, but after matching
+// main's KV-cache addressing, scale loads, and softmax arithmetic, the observed
+// output drift stays below the original sparse decode cos_diff tolerance.
+// Larger LSE/cosine deltas are more likely a KV layout bug than this ordering
+// difference.
+// ---------------------------------------------------------------------------
+using TiledMMA_QK = decltype(make_tiled_mma(
+    SM100_MMA_F16BF16_WS_SS_NOELECT<bf16, bf16, float, B_H, B_TOPK, UMMA::Major::K, UMMA::Major::K>{},
+    Layout<Shape<_1, _1, _1>>{}
+));
+
+using TiledMMA_SV = decltype(make_tiled_mma(
+    SM100_MMA_F16BF16_WS_SS_NOELECT<bf16, bf16, float, B_H, 256, UMMA::Major::K, UMMA::Major::MN>{},
+    Layout<Shape<_1, _1, _1>>{},
+    Tile<Int<B_H>, Int<D_V>>{}
+));
+
+using TiledMMA_QK_T = decltype(make_tiled_mma(
+    SM100_MMA_F16BF16_WS_TS_NOELECT<bf16, bf16, float, B_H, B_TOPK, UMMA::Major::K, UMMA::Major::K>{},
+    Layout<Shape<_1, _1, _1>>{}
+));
+
+template<typename T>
+CUTE_DEVICE
+void store_128b(void* smem_ptr, const T &data) {
+    static_assert(sizeof(T) == 16);
+    *(__int128*)smem_ptr = *(__int128*)&data;
+}
+
+template<typename TmaParams>
+__global__ void __launch_bounds__(NUM_THREADS, 1, 2)
+flash_fwd_splitkv_mla_fp8_sparse_kernel(__grid_constant__ const DecodingParamsCompat params, __grid_constant__ const TmaParams tma_params) {
+#if IS_SM100
+    const int head_block_idx = blockIdx.x;
+    const int s_q_idx = blockIdx.y;
+    const int partition_idx = blockIdx.z;
+    const int idx_in_cluster = head_block_idx % 2;
+    const int warpgroup_idx = cutlass::canonical_warp_group_idx();
+    const int idx_in_warpgroup = threadIdx.x % 128;
+    const int warp_idx = cutlass::canonical_warp_idx_sync();
+
+    // Define shared tensors
+    extern __shared__ char wksp_buf[];
+    SharedMemoryPlan &plan = *reinterpret_cast<SharedMemoryPlan*>(wksp_buf);
+    Tensor sQ = make_tensor(make_smem_ptr(plan.q.data()), SmemLayoutQ{});
+
+    if (warp_idx == 0 && elect_one_sync()) {
+        cute::prefetch_tma_descriptor(tma_params.tma_Q.get_tma_descriptor());
+        cute::prefetch_tma_descriptor(tma_params.tma_O.get_tma_descriptor());
+        cute::prefetch_tma_descriptor(&tma_params.tensor_map_kv_nope);
+        cute::prefetch_tma_descriptor(&tma_params.tensor_map_kv_rope);
+    }
+
+    if (warp_idx == 0) {
+        if (elect_one_sync()) {
+            plan.bar_q.init(1);
+            plan.bar_q_prologue.init(1);
+            CUTE_UNROLL
+            for (int i = 0; i < NUM_BUFS; ++i) {
+                plan.bar_k_ready[i].init(128);
+                plan.bar_k_remote_ready[i].init(1);
+                plan.bar_k_rope_ready[i].init(2);
+                plan.bar_k_free[i].init(2);
+                plan.bar_qk_done[i].init(1);
+                plan.bar_dequant_ready[i].init(2);
+                plan.bar_so_ready[i].init(128);
+                plan.bar_k_valid_ready[i].init(8);
+                plan.bar_k_valid_free[i].init(128);
+            }
+            CUTE_UNROLL
+            for (int i = 0; i < NUM_INDEX_BUFS; ++i) {
+                plan.bar_index_ready[i].init(32);
+                plan.bar_index_free[i].init(128);
+            }
+            cutlass::arch::fence_barrier_init();
+        }
+        cute::TMEM::Allocator1Sm().allocate(512, plan.tmem_start_addr.data());
+        TRAP_ONLY_DEVICE_ASSERT(plan.tmem_start_addr.data()[0] == 0);
+        cute::TMEM::Allocator1Sm().release_allocation_lock();
+    }
+    cute::cluster_sync();
+
+    int bar_phase_k = 0;
+    int bar_phase_q = 0;
+
+    const DecodingSchedMeta sched_meta = params.tile_scheduler_metadata_ptr[partition_idx];
+    int begin_idx = sched_meta.begin_req_idx;
+    int sched_begin_block_idx = sched_meta.begin_block_idx;
+    int end_idx = sched_meta.end_req_idx;
+    int sched_end_block_idx = sched_meta.end_block_idx;
+    if (begin_idx >= params.b) {
+        if (warp_idx == 0) {
+            cute::TMEM::Allocator1Sm().free(0, 512);
+        }
+        return;
+    }
+
+    auto get_cur_req_info = [&](int batch_idx) -> std::tuple<int, int, bool> {
+        int start_block_idx = batch_idx == begin_idx ? sched_begin_block_idx : 0;
+        int end_block_idx = batch_idx == end_idx ? sched_end_block_idx : params.topk / B_TOPK;
+        bool is_no_split = start_block_idx == 0 && end_block_idx == params.topk / B_TOPK;
+        return {start_block_idx, end_block_idx, is_no_split};
+    };
+
+    if (warpgroup_idx == 0) {
+        // Producer warpgroup
+        cutlass::arch::warpgroup_reg_dealloc<144>();
+        #pragma unroll 1
+        for (int batch_idx = begin_idx; batch_idx <= end_idx; ++batch_idx) {
+            auto [start_block_idx, end_block_idx, is_no_split] = get_cur_req_info(batch_idx);
+            int* gIndices = params.indices_ptr + batch_idx*params.indices_batch_stride + s_q_idx*params.indices_row_stride; // (topk) : (1)
+
+            constexpr int GROUP_SIZE = 4, NUM_GROUPS = 128 / GROUP_SIZE;
+            constexpr int ROWS_PER_GROUP = B_TOPK / NUM_GROUPS;
+            int group_idx = idx_in_warpgroup / GROUP_SIZE;
+            int idx_in_group = idx_in_warpgroup % GROUP_SIZE;
+
+            plan.bar_q_prologue.wait(bar_phase_q);
+            bar_phase_q ^= 1;
+            CUTE_NO_UNROLL
+            for (int block_idx = start_block_idx; block_idx < end_block_idx; block_idx++) {
+                int buf_idx = (block_idx - start_block_idx + 1) % NUM_BUFS;
+
+                // Wait for buffer to be available
+                plan.bar_dequant_ready[buf_idx].wait(bar_phase_k>>buf_idx&1);
+                plan.bar_k_free[buf_idx].wait(bar_phase_k>>buf_idx&1^1);
+                plan.bar_index_ready[buf_idx].wait(bar_phase_k>>buf_idx&1);
+                // Load
+                Tensor sK = make_tensor(make_smem_ptr(plan.u.k[buf_idx].data()), SmemLayoutK{});
+                Tensor sK_fp8 = make_tensor(make_smem_ptr(plan.k_nope_fp8[buf_idx].data()), SmemLayoutFP8KNope{});
+
+                // fp8x8 buf_bf8x8s[16];
+                bf16x8 buf_bf16x8s[16];
+                CUTE_UNROLL
+                for (int local_row = 0; local_row < ROWS_PER_GROUP; ++local_row) {
+                    int smem_row = group_idx + local_row*NUM_GROUPS;
+                    int token_index = __ldg(gIndices + block_idx*B_TOPK + smem_row);
+                    bool is_token_invalid = token_index == -1;
+                    if (is_token_invalid) {
+                        uint128_t zeros = uint128_t{};
+                        CUTE_UNROLL
+                        for (int local_col = 0; local_col < D_V / 2 / (GROUP_SIZE*16); ++local_col) {
+                            int col_base = local_col*(GROUP_SIZE*16) + idx_in_group*16;
+                            int offset = idx_in_cluster * 4 * 64;
+                            store_128b(&sK(smem_row, col_base + offset    ), zeros);
+                            store_128b(&sK(smem_row, col_base + offset + 8), zeros);
+                            st_async_128b(get_peer_addr(&sK(smem_row, col_base + offset)), zeros, get_peer_addr(&plan.bar_k_remote_ready[buf_idx]));
+                            st_async_128b(get_peer_addr(&sK(smem_row, col_base + offset + 8)), zeros, get_peer_addr(&plan.bar_k_remote_ready[buf_idx]));
+                        }
+                        CUTE_UNROLL
+                        for (int local_col = 0; local_col < (D_K-D_V) / (GROUP_SIZE*8); ++local_col) {
+                            int col_base = local_col*(GROUP_SIZE*8) + idx_in_group*8;
+                            store_128b(&sK(smem_row, D_V+col_base), zeros);
+                        }
+                    } else {
+                        float2 my_scales = plan.scales_buf[buf_idx][smem_row];
+                        int num_cols = D_V / 2 / (GROUP_SIZE*16);
+                        CUTE_UNROLL
+                        for (int local_col = 0; local_col < num_cols; ++local_col) {
+                            int col_base = local_col*(GROUP_SIZE*16) + idx_in_group*8;
+                            int local_offset = 8 * GROUP_SIZE;
+                            int offset = idx_in_cluster * 4 * 64;
+
+                            fp8x8 fp8x8_0 = *reinterpret_cast<fp8x8*>(&sK_fp8(smem_row, col_base));
+                            fp8x8 fp8x8_1 = *reinterpret_cast<fp8x8*>(&sK_fp8(smem_row, col_base + local_offset));
+
+                            float cur_scale = (local_col < num_cols/2) ? my_scales.x : my_scales.y;
+
+                            buf_bf16x8s[local_row * num_cols * 2 + local_col * 2] = cvt_fp8x8_bf16x8(fp8x8_0, cur_scale);
+                            store_128b(&sK(smem_row, col_base + offset), buf_bf16x8s[local_row * num_cols * 2 + local_col * 2]);
+                            buf_bf16x8s[local_row * num_cols * 2 + local_col * 2 + 1] = cvt_fp8x8_bf16x8(fp8x8_1, cur_scale);
+                            store_128b(&sK(smem_row, col_base + offset + local_offset), buf_bf16x8s[local_row * num_cols * 2 + local_col * 2 + 1]);
+
+                            st_async_128b(get_peer_addr(&sK(smem_row, col_base + offset)), buf_bf16x8s[local_row * num_cols * 2 + local_col * 2], get_peer_addr(&plan.bar_k_remote_ready[buf_idx]));
+                            st_async_128b(get_peer_addr(&sK(smem_row, col_base + offset + local_offset)), buf_bf16x8s[local_row * num_cols * 2 + local_col * 2 + 1], get_peer_addr(&plan.bar_k_remote_ready[buf_idx]));
+                        }
+                    }
+                }
+                fence_view_async_shared();
+                // Signal
+                plan.bar_k_ready[buf_idx].arrive();
+                plan.bar_index_free[buf_idx].arrive();
+
+                bar_phase_k ^= 1<<buf_idx;
+            }
+            cute::cluster_sync();
+        }
+    } else if (warpgroup_idx == 1) {
+        // Scale & Exp warpgroup
+        cutlass::arch::warpgroup_reg_alloc<240>();
+
+        int begin_n_split_idx = sched_meta.begin_split_idx;
+
+        #pragma unroll 1
+        for (int batch_idx = begin_idx; batch_idx <= end_idx; ++batch_idx) {
+            auto [start_block_idx, end_block_idx, is_no_split] = get_cur_req_info(batch_idx);
+
+            constexpr int GROUP_SIZE = 4, NUM_GROUPS = 128 / GROUP_SIZE;
+            constexpr int ROWS_PER_GROUP = B_TOPK / NUM_GROUPS;
+            int group_idx = idx_in_warpgroup / GROUP_SIZE;
+
+            bar_phase_q ^= 1;
+
+            float li = 0.0f;
+            float mi = MAX_INIT_VAL;
+
+            CUTE_NO_UNROLL
+            for (int block_idx = start_block_idx; block_idx < end_block_idx; block_idx++) {
+                int buf_idx = (block_idx - start_block_idx + 1) % NUM_BUFS;
+                // Wait for P
+                plan.bar_qk_done[buf_idx].wait(bar_phase_k>>buf_idx&1);
+                tcgen05_after_thread_sync();
+
+                // Load P from TMEM
+                float p[B_TOPK/2];
+                float2* p_float2 = reinterpret_cast<float2*>(p);
+                tmem_ld_32dp32bNx<B_TOPK/2>(tmem_addr::p + buf_idx * 32, p);
+                cutlass::arch::fence_view_async_tmem_load();
+                tcgen05_before_thread_sync();  // match main head64 (kernel.cuh:176)
+
+                plan.bar_k_valid_ready[buf_idx].wait(bar_phase_k>>buf_idx&1);
+                // Get rowwise max
+                uint32_t is_k_valid = *(uint32_t*)(plan.is_k_valid[buf_idx] + (idx_in_warpgroup>=64?B_TOPK/8/2:0));
+                float cur_max = -INFINITY;
+                CUTE_UNROLL
+                for (int i = 0; i < B_TOPK/2; ++i) {
+                    if (!(is_k_valid >> i & 1)) p[i] = -INFINITY;
+                    cur_max = max(cur_max, p[i]);
+                }
+                cur_max *= params.scale_softmax_log2;
+                plan.bar_k_valid_free[buf_idx].arrive();
+                
+                NamedBarrier::arrive_and_wait(128, 0);  // TODO Name these barriers
+                plan.rowwise_max_buf[idx_in_warpgroup] = cur_max;
+                NamedBarrier::arrive_and_wait(128, 0);
+                cur_max = max(cur_max, plan.rowwise_max_buf[idx_in_warpgroup ^ 64]);
+                bool should_scale_o = __any_sync(0xffffffff, cur_max - mi > 6.0f);
+
+                float new_max, scale_for_old;
+                if (!should_scale_o) {
+                    // Don't scale O
+                    scale_for_old = 1.0f;
+                    new_max = mi;
+                } else {
+                    new_max = max(mi, cur_max);  // typo fix from 76a4218
+                    scale_for_old = exp2f(mi - new_max);
+                }
+
+                float2 scale_for_old_float2 = {scale_for_old, scale_for_old};
+
+                // Get S
+                float2 scale_softmax_log2_float2 = {params.scale_softmax_log2, params.scale_softmax_log2};
+                float2 neg_new_max_float2 = {-new_max, -new_max};
+                bf16 s[B_TOPK/2];
+                float2 cur_sum = {0.0f, 0.0f};
+                CUTE_UNROLL
+                for (int i = 0; i < (B_TOPK/2)/2; ++i) {
+                    float2 t = float2_fma(p_float2[i], scale_softmax_log2_float2, neg_new_max_float2);
+                    t.x = exp2f(t.x);
+                    t.y = exp2f(t.y);
+                    *(__nv_bfloat162*)&s[i*2] = __float22bfloat162_rn(t);
+                    cur_sum = float2_add(cur_sum, t);
+                }
+
+                // Save S
+                // NOTE We don't need a barrier here, since the current QK^T has finished implies that the previous SV has finished
+                bf16* sS_base = plan.s[buf_idx].data() + (idx_in_warpgroup/64)*(B_H*B_TOPK/2) + (idx_in_warpgroup%64) * 8;
+                CUTE_UNROLL
+                for (int i = 0; i < (B_TOPK/2)/8; i += 1) {
+                    store_128b(sS_base + i*8*B_H, *((bf16x8*)s + i));
+                }
+                fence_view_async_shared();
+
+                // Rescale O
+                if (should_scale_o && block_idx != start_block_idx) {
+                    constexpr int B_SCALE_O = 16;
+                    float2 o[B_SCALE_O/2];
+                    CUTE_UNROLL
+                    for (int b = 0; b < (D_V/2)/B_SCALE_O; ++b) {
+                        tmem_ld_32dp32bNx<B_SCALE_O>(tmem_addr::o + b*B_SCALE_O, o);
+                        cutlass::arch::fence_view_async_tmem_load();
+                        CUTE_UNROLL
+                        for (int i = 0; i < B_SCALE_O/2; ++i)
+                            o[i] = float2_mul(o[i], scale_for_old_float2);
+                        tmem_st_32dp32bNx<B_SCALE_O>(tmem_addr::o + b*B_SCALE_O, o);
+                        cutlass::arch::fence_view_async_tmem_store();
+                    }
+                    tcgen05_before_thread_sync();  // match main head64 (kernel.cuh:290)
+                }
+                plan.bar_so_ready[buf_idx].arrive();
+
+                // Update mi and li
+                mi = new_max;
+                li = fma(li, scale_for_old, cur_sum.x + cur_sum.y);  // match main's fused update
+
+                bar_phase_k ^= 1<<buf_idx;
+            }
+
+            // Epilogue
+            // Deal with no valid token cases
+            if (mi == MAX_INIT_VAL) {
+                mi = -INFINITY;
+                li = 0.0f;
+            }
+
+            // Reduce li
+            plan.rowwise_li_buf[idx_in_warpgroup] = li;
+            NamedBarrier::arrive_and_wait(128, 0);
+            li += plan.rowwise_li_buf[idx_in_warpgroup ^ 64];
+
+            // Save li
+            int num_valid_heads = min(B_H, params.q_head_per_hk - head_block_idx*B_H);
+            int start_seq_idx = s_q_idx*params.q_head_per_hk + head_block_idx*B_H;
+            int n_split_idx = batch_idx == begin_idx ? begin_n_split_idx : 0;
+            int split_idx = is_no_split ? 0 : (__ldg(params.num_splits_ptr+batch_idx) + n_split_idx);
+            if (idx_in_warpgroup < num_valid_heads) {
+                if (is_no_split) {
+                    float* gSoftmaxLse = (float*)params.softmax_lse_ptr + batch_idx*params.q_seq_per_hk + start_seq_idx + idx_in_warpgroup;
+                    *gSoftmaxLse = li == 0.0f ? INFINITY : logf(li) + mi / (float)M_LOG2E; // NOTE Follows Flash MLA's approach, which returns +inf when there are no valid indices
+                } else {
+                    float* gSoftmaxLseAccum = (float*)params.softmax_lseaccum_ptr + split_idx*params.q_seq_per_hk + start_seq_idx + idx_in_warpgroup;
+                    *gSoftmaxLseAccum = li == 0.0f ? -INFINITY : log2f(li) + mi;
+                }
+            }
+
+            // Wait for the last SV gemm
+            plan.bar_k_free[(end_block_idx-start_block_idx)%NUM_BUFS].wait(bar_phase_k>>((end_block_idx-start_block_idx)%NUM_BUFS)&1^1);
+            tcgen05_after_thread_sync();
+
+            if (batch_idx == end_idx) {
+                cudaTriggerProgrammaticLaunchCompletion();
+            }
+
+            // Save O
+            float o_scale = li == 0.0f ? 0.0f : __fdividef(1.0f, li);  // match main's __fdividef
+            float2 o_scale_float2 = {o_scale, o_scale};
+            if (is_no_split) {
+                constexpr int B_EPI = 16;
+                float2 o[B_EPI/2];
+                __nv_bfloat162 o_bf16[B_EPI/2];
+                Tensor sO = make_tensor(make_smem_ptr(plan.u.o_buf.data()), SmemLayoutOBuf{});
+                bf16* sO_base = plan.u.o_buf.data() + ((idx_in_warpgroup/64)*128)*B_H + (idx_in_warpgroup%64)*8;
+                CUTE_UNROLL
+                for (int i = 0; i < (D_V/2) / B_EPI; ++i) {
+                    // Load
+                    tmem_ld_32dp32bNx<B_EPI>(tmem_addr::o + i*B_EPI, o);
+                    cutlass::arch::fence_view_async_tmem_load();
+                    // Scale & Convert
+                    CUTE_UNROLL
+                    for (int j = 0; j < B_EPI/2; ++j) {
+                        o[j] = float2_mul(o[j], o_scale_float2);
+                        o_bf16[j] = __float22bfloat162_rn(o[j]);
+                    }
+                    // Store
+                    int col_base = (i*B_EPI>=D_V/4 ? D_V/2 : 0) + (i*B_EPI%(D_V/4));
+                    CUTE_UNROLL
+                    for (int j = 0; j < B_EPI / 8; ++j)
+                        store_128b(sO_base + (col_base+j*8)*B_H, *reinterpret_cast<bf16x8*>(&o_bf16[j*4]));
+                }
+                fence_view_async_shared();
+                NamedBarrier::arrive_and_wait(128, 0);
+                if (warp_idx == 4 && elect_one_sync()) {
+                    Tensor tma_gO = tma_params.tma_O.get_tma_tensor(tma_params.shape_O)(_, _, s_q_idx, batch_idx);
+                    auto thr_tma = tma_params.tma_O.get_slice(_0{});
+                    Tensor my_tma_gO = flat_divide(tma_gO, Shape<Int<B_H>, Int<D_V>>{})(_, _, head_block_idx, _0{});
+                    cute::copy(
+                        tma_params.tma_O,
+                        thr_tma.partition_S(sO),
+                        thr_tma.partition_D(my_tma_gO)
+                    );
+                    cute::tma_store_arrive();
+                }
+            } else {
+                constexpr int B_EPI = 16;
+                float2 o[B_EPI/2];
+                Tensor sO = make_tensor(make_smem_ptr(plan.u.o_accum_buf.data()), SmemLayoutOAccumBuf{});
+                CUTE_UNROLL
+                for (int i = 0; i < (D_V/2) / B_EPI; ++i) {
+                    // Load
+                    tmem_ld_32dp32bNx<B_EPI>(tmem_addr::o + i*B_EPI, o);
+                    cutlass::arch::fence_view_async_tmem_load();
+                    // Scale & Convert
+                    CUTE_UNROLL
+                    for (int j = 0; j < B_EPI/2; ++j)
+                        o[j] = float2_mul(o[j], o_scale_float2);
+                    // Store
+                    int col_base = (idx_in_warpgroup/64)*128 + (i*B_EPI >= D_V/4 ? D_V/2 : 0) + (i*B_EPI%(D_V/4));
+                    CUTE_UNROLL
+                    for (int j = 0; j < B_EPI / 4; ++j)
+                        store_128b(&sO(idx_in_warpgroup%64, col_base + j*4), *reinterpret_cast<float4*>(&o[j*2]));
+                }
+                fence_view_async_shared();
+                NamedBarrier::arrive_and_wait(128, 0);
+                if (elect_one_sync()) {
+                    CUTE_UNROLL
+                    for (int local_row = 0; local_row < B_H/4; ++local_row) {
+                        int smem_row = local_row*4 + (warp_idx-4);
+                        if (smem_row < num_valid_heads) {
+                            SM90_BULK_COPY_S2G::copy(
+                                &sO(smem_row, _0{}),
+                                (float*)params.oaccum_ptr + (split_idx*params.q_seq_per_hk + start_seq_idx + smem_row)*D_V,
+                                D_V*sizeof(float)
+                            );
+                        }
+                    }
+                    cute::tma_store_arrive();
+                }
+            }
+
+            cute::tma_store_wait<0>();
+            cute::cluster_sync();
+        }
+
+        if (warp_idx == 4) {
+            cute::TMEM::Allocator1Sm().free(0, 512);
+        }
+    } else if (warpgroup_idx == 2) {
+        
+        if (warp_idx == 8) {
+            cutlass::arch::warpgroup_reg_dealloc<120>();
+            // UTCMMA warp
+
+            bool bar_phase_q = 0;
+            TiledMMA tiled_mma_qk = TiledMMA_QK{};
+            TiledMMA tiled_mma_sv = TiledMMA_SV{};
+            TiledMMA tiled_mma_qk_t = TiledMMA_QK_T{};
+            Tensor tP = partition_fragment_C(tiled_mma_qk, Shape<Int<B_H>, Int<B_TOPK>>{});
+            Tensor tO = partition_fragment_C(tiled_mma_sv, Shape<Int<B_H>, Int<D_V>>{});
+            Tensor tQr = tiled_mma_qk_t.get_slice(_0{}).make_fragment_A(
+                partition_shape_A(tiled_mma_qk_t, Shape<Int<B_H>, Int<D_tQ>>{})
+            );
+            tO.data().get() = tmem_addr::o;
+            tP.data().get() = tmem_addr::p;
+            tQr.data().get() = tmem_addr::q;
+            Tensor sS = make_tensor(make_smem_ptr(plan.s[0].data()), SmemLayoutS{});
+            
+            #pragma unroll 1
+            for (int batch_idx = begin_idx; batch_idx <= end_idx; ++batch_idx) {
+                auto [start_block_idx, end_block_idx, is_no_split] = get_cur_req_info(batch_idx);
+                if (elect_one_sync()) {
+                    // Copy Q
+                    UMMA::SmemDescriptor sQ_desc = UMMA::make_umma_desc<UMMA::Major::K>(
+                        make_tensor(
+                            make_smem_ptr(plan.q.data() + B_H*D_sQ),
+                            tile_to_shape(
+                                UMMA::Layout_K_SW128_Atom<bf16>{},
+                                Shape<Int<B_H>, Int<64>>{}
+                            )
+                        )
+                    );
+                    Tensor gQ = flat_divide(
+                        tma_params.tma_Q.get_tma_tensor(tma_params.shape_Q)(_, _, s_q_idx, batch_idx),
+                        Tile<Int<B_H>, Int<D_K>>{}
+                    )(_, _, head_block_idx, _0{});
+                    launch_tma_copy(tma_params.tma_Q, gQ, sQ, plan.bar_q, TMA::CacheHintSm90::EVICT_FIRST);
+                    plan.bar_q.arrive_and_expect_tx(B_H*D_K*sizeof(bf16));
+                    plan.bar_q.wait(bar_phase_q);
+                    tcgen05_after_thread_sync();
+                    CUTE_UNROLL
+                    for (int tile_idx = 0; tile_idx < NUM_tQ_TILES; ++tile_idx) {
+                        // A tile is 64 rows * 64 cols (128B)
+                        CUTE_UNROLL
+                        for (int subtile_idx = 0; subtile_idx < 8; ++subtile_idx) {
+                            // A subtile is 64 rows * 8 cols (128b)
+                            SM100_UTCCP_2x64dp128bitlw0213_1cta::copy(
+                                sQ_desc + tile_idx*(B_H*128/16) + subtile_idx*(16/16),   // Remember that 4 LSBs are not included
+                                tmem_addr::q + tile_idx*32 + subtile_idx*4
+                            );
+                        }
+                    }                    
+                    umma_arrive_noelect(plan.bar_q_prologue);
+                    
+                    bar_phase_q ^= 1;
+                    CUTE_NO_UNROLL
+                    for (int block_idx = start_block_idx; block_idx < end_block_idx; block_idx++) {
+                        int buf_idx = (block_idx - start_block_idx + 1) % NUM_BUFS;
+                        tP.data().get() = tmem_addr::p + buf_idx * 32;
+                        // Wait for K
+                        plan.bar_k_ready[buf_idx].wait(bar_phase_k>>buf_idx&1);
+                        plan.bar_k_rope_ready[buf_idx].wait(bar_phase_k>>buf_idx&1);
+                        tcgen05_after_thread_sync();                        
+                        
+                        Tensor sQl = make_tensor(make_smem_ptr(plan.q.data()), SmemLayoutQ_SMEM{});
+                        Tensor sK = make_tensor(make_smem_ptr(plan.u.k[buf_idx].data()), SmemLayoutK{});
+                        Tensor sKl = make_tensor(make_smem_ptr(plan.u.k[buf_idx].data()), SmemLayoutKS{});
+                        Tensor sKr = make_tensor(make_smem_ptr(plan.u.k[buf_idx].data() + B_TOPK*D_sQ), SmemLayoutKT{});
+                    
+                        // plan.bar_p_free[buf_idx].wait(bar_phase_k>>buf_idx&1^1);
+                        // Issue P = Q @ K^T
+                        if (idx_in_cluster == 0) {
+                            utcmma_ss(tiled_mma_qk, sQl, sKl, tP, true);
+                            plan.bar_k_remote_ready[buf_idx].arrive_and_expect_tx(B_TOPK*256*sizeof(bf16));
+                            plan.bar_k_remote_ready[buf_idx].wait(bar_phase_k>>buf_idx&1);
+                            tcgen05_after_thread_sync();  
+                            utcmma_ts(tiled_mma_qk_t, tQr, sKr, tP, false);
+                        } else {
+                            utcmma_ts(tiled_mma_qk_t, tQr, sKr, tP, true);
+                            plan.bar_k_remote_ready[buf_idx].arrive_and_expect_tx(B_TOPK*256*sizeof(bf16));
+                            plan.bar_k_remote_ready[buf_idx].wait(bar_phase_k>>buf_idx&1);
+                            tcgen05_after_thread_sync();  
+                            utcmma_ss(tiled_mma_qk, sQl, sKl, tP, false);
+                        }
+                        umma_arrive_noelect(plan.bar_qk_done[buf_idx]);
+                    
+                        Tensor sS = make_tensor(make_smem_ptr(plan.s[buf_idx].data()), SmemLayoutS{});
+                        // Wait for S
+                        plan.bar_so_ready[buf_idx].wait(bar_phase_k>>buf_idx&1);
+                        tcgen05_after_thread_sync();
+                        Tensor sV = make_tensor(make_smem_ptr(plan.u.k[buf_idx].data()), SmemLayoutV{});
+
+                        utcmma_ss(tiled_mma_sv, sS, sV, tO, block_idx == start_block_idx);
+                        umma_arrive_noelect(plan.bar_k_free[buf_idx]);
+                        plan.bar_k_free[buf_idx].arrive(idx_in_cluster ^ 1);
+
+                        bar_phase_k ^= 1<<buf_idx;
+                    }
+                }
+                __syncwarp();
+                cute::cluster_sync();
+                // NOTE If we reach this point, we must have done the QK gemm (since we've waited for bar_so_ready)
+                // So we can launch the copy of the next Q block immediately
+            }
+        } else if (warp_idx < 11) {
+            cutlass::arch::warpgroup_reg_dealloc<120>();
+            // Producer warp for K RoPE
+            int warp_idx = cutlass::canonical_warp_idx_sync() - 9;
+            constexpr int NUM_WARPS = 2, NUM_LOCAL_ROWS_PER_WARP = B_TOPK/4/NUM_WARPS;
+            #pragma unroll 1
+            for (int batch_idx = begin_idx; batch_idx <= end_idx; ++batch_idx) {
+                auto [start_block_idx, end_block_idx, is_no_split] = get_cur_req_info(batch_idx);
+                int* gIndices = params.indices_ptr + batch_idx*params.indices_batch_stride + s_q_idx*params.indices_row_stride;
+                bar_phase_q ^= 1;
+                if (elect_one_sync()) {
+                    CUTE_NO_UNROLL
+                    for (int block_idx = start_block_idx; block_idx < end_block_idx; block_idx++) {
+                        int buf_idx = (block_idx - start_block_idx + 1) % NUM_BUFS;
+                        bf16* sK_base = plan.u.k[buf_idx].data() + warp_idx*32*64;
+                        fp8* sK_nope_base = plan.k_nope_fp8[buf_idx].data() + warp_idx*32*256;
+                        int4 indices[NUM_LOCAL_ROWS_PER_WARP];
+                        int skip_mask[NUM_LOCAL_ROWS_PER_WARP];
+                        int valid_gather4_cnt = NUM_LOCAL_ROWS_PER_WARP;
+
+                        CUTE_UNROLL
+                        for (int local_row = 0; local_row < NUM_LOCAL_ROWS_PER_WARP; ++local_row) {
+                            indices[local_row] = __ldg((int4*)(gIndices + block_idx*B_TOPK) + NUM_LOCAL_ROWS_PER_WARP*warp_idx + local_row);
+                            skip_mask[local_row] = 0;
+                            if (indices[local_row].x == -1) {
+                                skip_mask[local_row] |= 1;
+                                // valid_gather4_cnt -= 1;
+                                indices[local_row].x = 0;
+                            } 
+                            if (indices[local_row].y == -1) {
+                                skip_mask[local_row] |= 2;
+                                // valid_gather4_cnt -= 1;
+                                indices[local_row].y = 1;
+                            }
+                            if (indices[local_row].z == -1) {
+                                skip_mask[local_row] |= 4;
+                                // valid_gather4_cnt -= 1;
+                                indices[local_row].z = 2;
+                            }
+                            if (indices[local_row].w == -1) {
+                                skip_mask[local_row] |= 8;
+                                // valid_gather4_cnt -= 1;
+                                indices[local_row].w = 3;
+                            }
+                            if (skip_mask[local_row] == 15) {
+                                valid_gather4_cnt -= 1;
+                            }
+                            // Remap raw token indices to TMA y-coords that account for
+                            // main's KV block padding (block_size+1 internal stride).
+                            // Placeholders 0/1/2/3 are within block 0 and map to themselves.
+                            {
+                                const int step = params.tma_coords_step_per_block;
+                                const int pbs  = params.page_block_size;
+                                indices[local_row].x = (indices[local_row].x / pbs) * step + (indices[local_row].x % pbs);
+                                indices[local_row].y = (indices[local_row].y / pbs) * step + (indices[local_row].y % pbs);
+                                indices[local_row].z = (indices[local_row].z / pbs) * step + (indices[local_row].z % pbs);
+                                indices[local_row].w = (indices[local_row].w / pbs) * step + (indices[local_row].w % pbs);
+                            }
+                        }
+                        plan.bar_k_ready[buf_idx].wait(bar_phase_k>>buf_idx&1^1);
+                        auto load_part_k_rope = [&](transac_bar_t* bar) {
+                            CUTE_UNROLL
+                            for (int local_row = 0; local_row < NUM_LOCAL_ROWS_PER_WARP; ++local_row) {
+                                if (skip_mask[local_row] != 15) {
+                                    tma_gather4<false>(
+                                        &(tma_params.tensor_map_kv_rope),
+                                        bar,
+                                        sK_base + local_row*4*64 + 8*B_TOPK*64,
+                                        0,
+                                        indices[local_row],
+                                        TMA::CacheHintSm90::EVICT_LAST
+                                    );
+                                }
+                            }
+                        };
+
+                        auto load_part_k_nope = [&](transac_bar_t* bar) {
+                            CUTE_UNROLL
+                            for (int local_row = 0; local_row < NUM_LOCAL_ROWS_PER_WARP; ++local_row) {
+                                if (skip_mask[local_row] != 15) {
+                                    tma_gather4<false>(
+                                        &(tma_params.tensor_map_kv_nope),
+                                        bar,
+                                        sK_nope_base + local_row*4*256,
+                                        idx_in_cluster*256,
+                                        indices[local_row],
+                                        TMA::CacheHintSm90::EVICT_LAST
+                                    );
+                                }
+                            }
+                        };
+
+                        load_part_k_nope(plan.bar_dequant_ready + buf_idx);
+                        plan.bar_dequant_ready[buf_idx].arrive_and_expect_tx(256 * 4 * valid_gather4_cnt * sizeof(fp8));
+                        plan.bar_qk_done[buf_idx].wait(bar_phase_k>>buf_idx&1^1);
+                        load_part_k_rope(plan.bar_k_rope_ready + buf_idx);
+                        plan.bar_k_rope_ready[buf_idx].arrive_and_expect_tx(64 * 4 * valid_gather4_cnt * sizeof(bf16));
+                        
+                        bar_phase_k ^= 1<<buf_idx;
+                    }
+                    
+                }
+                cute::cluster_sync();
+            } 
+        } else {
+            cutlass::arch::warpgroup_reg_dealloc<120>();
+            // Index Preprocessing Warp
+            static_assert(B_TOPK == 64);
+            int lane_idx = threadIdx.x % 32;
+            #pragma unroll 1
+            for (int batch_idx = begin_idx; batch_idx <= end_idx; ++batch_idx) {
+                auto [start_block_idx, end_block_idx, is_no_split] = get_cur_req_info(batch_idx);
+                int* gIndices = params.indices_ptr + batch_idx*params.indices_batch_stride + s_q_idx*params.indices_row_stride;
+                CUTE_NO_UNROLL
+                for (int block_idx = start_block_idx; block_idx < end_block_idx; block_idx++) {
+                    int buf_idx = (block_idx - start_block_idx + 1) % NUM_BUFS;
+
+                    // Scale prefetch FIRST (all 32 threads, unblocks WG0 quickly)
+                    plan.bar_index_free[buf_idx].wait(bar_phase_k>>buf_idx&1^1);
+                    int idx0 = __ldg(gIndices + block_idx*B_TOPK + lane_idx*2);
+                    int idx1 = __ldg(gIndices + block_idx*B_TOPK + lane_idx*2 + 1);
+                    auto load_scale = [&](int token_index) -> float2 {
+                        if (token_index == -1) return float2{0.0f, 0.0f};
+                        // Use params.page_block_size, NOT B_TOPK: they coincidentally equal 64
+                        // in common tests but differ when block_size != 64 (e.g. 61, 69).
+                        int block_index = (unsigned int)token_index / params.page_block_size;
+                        int rel_idx_in_block = (unsigned int)token_index % params.page_block_size;
+                        fp8* gK_base = (fp8*)params.k_ptr + block_index*params.k_batch_stride + rel_idx_in_block*params.k_row_stride;
+                        float4 full_scale = __ldg((float4*)(gK_base + D_V));
+                        return idx_in_cluster == 0 ? float2{full_scale.x, full_scale.y} : float2{full_scale.z, full_scale.w};
+                    };
+                    plan.scales_buf[buf_idx][lane_idx*2]     = load_scale(idx0);
+                    plan.scales_buf[buf_idx][lane_idx*2 + 1] = load_scale(idx1);
+                    fence_view_async_shared();
+                    plan.bar_index_ready[buf_idx].arrive();
+
+                    // Valid mask AFTER scales (lanes 0-7 only, doesn't block WG0)
+                    if (lane_idx < 8) {
+                        int32x8_t indices = ldg_256_indices(gIndices + block_idx*B_TOPK + lane_idx*8);
+                        auto is_valid = [&](int index) -> char { return index != -1; };
+                        char is_ks_valid_mask =
+                            is_valid(indices.a7) << 7 | is_valid(indices.a6) << 6 |
+                            is_valid(indices.a5) << 5 | is_valid(indices.a4) << 4 |
+                            is_valid(indices.a3) << 3 | is_valid(indices.a2) << 2 |
+                            is_valid(indices.a1) << 1 | is_valid(indices.a0) << 0;
+                        plan.bar_k_valid_free[buf_idx].wait(bar_phase_k>>buf_idx&1^1);
+                        plan.is_k_valid[buf_idx][lane_idx] = is_ks_valid_mask;
+                        plan.bar_k_valid_ready[buf_idx].arrive();
+                    }
+
+                    bar_phase_k ^= 1<<buf_idx;
+                }
+                cute::cluster_sync();
+            }
+        }
+    } 
+
+#else
+    if (cute::thread0()) {
+        CUTE_INVALID_CONTROL_PATH("This kernel only supports sm100 ~ sm119");
+    }
+#endif
+}
+
+void run_flash_splitkv_mla_fp8_sparse_kernel(const DecodingParamsCompat &params) {
+    FLASH_ASSERT(params.h_k == 1);
+    FLASH_ASSERT(params.topk % B_TOPK == 0);
+
+    auto shape_Q = make_shape(params.q_head_per_hk, params.d, params.s_q, params.b);
+    auto tma_Q = cute::make_tma_copy(
+        SM90_TMA_LOAD{},
+        make_tensor(
+            make_gmem_ptr((bf16*)params.q_ptr),
+            make_layout(
+                shape_Q,
+                make_stride(params.q_row_stride, _1{}, params.q_seq_stride, params.q_batch_stride)
+            )
+        ),
+        SmemLayoutQ{}
+    );
+
+    auto shape_O = make_shape(params.q_head_per_hk, params.d_v, params.s_q, params.b);
+    auto tma_O = cute::make_tma_copy(
+        SM90_TMA_STORE{},
+        make_tensor(
+            make_gmem_ptr((bf16*)params.o_ptr),
+            make_layout(
+                shape_O,
+                make_stride(params.o_row_stride, _1{}, params.o_seq_stride, params.o_batch_stride)
+            )
+        ),
+        SmemLayoutOBuf{}
+    );
+
+    CUtensorMap tensor_map_kv_nope;
+    {
+        uint64_t size[2] = {D_V, (unsigned long)params.num_blocks * (unsigned long)params.tma_coords_step_per_block};
+        uint64_t stride[1] = {params.k_row_stride*sizeof(fp8)};
+        uint32_t box_size[2] = {256, 1};
+        uint32_t elem_stride[2] = {1, 1};
+        CUresult res = CUTLASS_CUDA_DRIVER_WRAPPER_CALL(cuTensorMapEncodeTiled)(
+            &tensor_map_kv_nope,
+            CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_UINT8,
+            2,
+            params.k_ptr,
+            size,
+            stride,
+            box_size,
+            elem_stride,
+            CUtensorMapInterleave::CU_TENSOR_MAP_INTERLEAVE_NONE,
+            CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_NONE,
+            CUtensorMapL2promotion::CU_TENSOR_MAP_L2_PROMOTION_L2_256B,
+            CUtensorMapFloatOOBfill::CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE
+        );
+        FLASH_ASSERT(res == CUresult::CUDA_SUCCESS);
+    }
+
+    CUtensorMap tensor_map_kv_rope;
+    {
+        uint64_t size[2] = {D_K - D_V, (unsigned long)params.num_blocks * (unsigned long)params.tma_coords_step_per_block};
+        uint64_t stride[1] = {params.k_row_stride*sizeof(fp8)};
+        uint32_t box_size[2] = {64, 1};
+        uint32_t elem_stride[2] = {1, 1};
+        CUresult res = CUTLASS_CUDA_DRIVER_WRAPPER_CALL(cuTensorMapEncodeTiled)(
+            &tensor_map_kv_rope,
+            CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,
+            2,
+            (fp8*)params.k_ptr + (D_V + 4*4),
+            size,
+            stride,
+            box_size,
+            elem_stride,
+            CUtensorMapInterleave::CU_TENSOR_MAP_INTERLEAVE_NONE,
+            CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_128B,
+            CUtensorMapL2promotion::CU_TENSOR_MAP_L2_PROMOTION_L2_256B,
+            CUtensorMapFloatOOBfill::CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE
+        );
+        FLASH_ASSERT(res == CUresult::CUDA_SUCCESS);
+    }
+    TmaParams<
+        decltype(shape_Q), decltype(tma_Q),
+        decltype(shape_O), decltype(tma_O)
+    > tma_params = {
+        shape_Q, tma_Q,
+        shape_O, tma_O,
+        tensor_map_kv_nope,
+        tensor_map_kv_rope
+    };
+    auto mla_kernel = &flash_fwd_splitkv_mla_fp8_sparse_kernel<decltype(tma_params)>;
+
+    constexpr size_t smem_size = sizeof(SharedMemoryPlan);
+    CHECK_CUDA(cudaFuncSetAttribute(mla_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+
+    const int num_m_blocks = cute::ceil_div(params.q_head_per_hk, B_H * 2) * 2;
+
+    cutlass::ClusterLaunchParams launch_params = {
+        dim3(num_m_blocks, params.s_q, params.num_sm_parts),
+        dim3(NUM_THREADS, 1, 1),
+        dim3(2, 1, 1),
+        smem_size,
+        params.stream
+    };
+    // NOTE Don't use PDL because of potential compiler bugs!
+    cutlass::launch_kernel_on_cluster(
+        launch_params, (void*)mla_kernel, params, tma_params
+    );
+    CHECK_CUDA_KERNEL_LAUNCH();
+}
+    
+}  // namespace nv_smallbatch::sm100

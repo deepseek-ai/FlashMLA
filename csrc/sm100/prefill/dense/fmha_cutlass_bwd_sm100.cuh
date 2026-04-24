@@ -49,6 +49,9 @@
 #include "collective/fmha_fusion.hpp"
 #include "device/fmha_device_bwd.hpp"
 
+#include <c10/cuda/CUDAGuard.h>
+#include <c10/cuda/CUDAStream.h>
+
 using namespace cute;
 using namespace cutlass::fmha::kernel;
 using namespace cutlass::fmha::collective;
@@ -95,8 +98,11 @@ struct BwdRunner {
                   at::Tensor cumulative_seqlen_q, at::Tensor cumulative_seqlen_kv,
                   at::Tensor dq, at::Tensor dk, at::Tensor dv,
                   float softmax_scale, int max_seqlen_q, int max_seqlen_kv) {
+    const at::cuda::CUDAGuard device_guard{(char)q.get_device()};
+    const int device_id = q.get_device();
+
     cutlass::KernelHardwareInfo hw_info;
-    hw_info.device_id = 0;
+    hw_info.device_id =device_id;
     hw_info.sm_count = cutlass::KernelHardwareInfo::query_device_multiprocessor_count(hw_info.device_id);
     ProblemShape problem_shape;
     cute::tuple<int, int, int, int, cute::tuple<int, int>> tensor_shape;

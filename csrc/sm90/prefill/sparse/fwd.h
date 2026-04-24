@@ -4,6 +4,6 @@
 
 namespace sm90 {
 
-void run_fwd_kernel(const SparsePrefillParams& params);
+void run_fwd_kernel(const SparseAttnFwdParams& params);
 
 }

@@ -28,7 +28,8 @@ FlashMLA is DeepSeek's library of optimized attention kernels, powering the [Dee
 #### Test & benchmark MLA decoding (Sparse & Dense):
 
 ```bash
-python tests/test_flash_mla_decoding.py
+python tests/test_flash_mla_dense_decoding.py
+python tests/test_flash_mla_sparse_decoding.py
 ```
 
 The dense MLA decoding kernel achieves up to 3000 GB/s in memory-bound configuration and 660 TFLOPS in computation-bound configuration on H800 SXM5 with CUDA 12.8. The token-level sparse MLA decoding kernel (which uses an FP8 KV cache while performing the matrix multiplication in bfloat16) achieves 410 TFLOPS in compute-bound configuration on H800 SXM5 with CUDA 12.8, and achieves up to 350 TFlops on B200 (which is not really optimized yet).
@@ -44,7 +45,7 @@ It achieves up to 1460 TFlops in forward and 1000 TFlops in backward computation
 #### Test & benchmark MLA prefill (Sparse):
 
 ```bash
-python tests/test_flash_mla_prefill.py
+python tests/test_flash_mla_sparse_prefill.py
 ```
 
 It achieves up to 640 TFlops in forward computation on H800 SXM5 with CUDA 12.8, and achieves up to 1450 TFlops on B200, CUDA 12.9.

@@ -34,7 +34,7 @@
 
 #include "cutlass/cutlass.h"
 #include "cute/layout.hpp"
-#include "utils.h"  // for IS_SM100
+#include <kerutils/kerutils.cuh> // for  KERUTILS_ENABLE_SM100A
 
 namespace cutlass::fmha::kernel {
 
@@ -105,7 +105,7 @@ struct FmhaKernelBwdSumOdO {
   }
 
   CUTLASS_DEVICE void operator()(const Params &params, char* smem) {
-#if IS_SM100
+#if defined(KERUTILS_ENABLE_SM100A)
     auto ptr_O_bh = params.ptr_O + blockIdx.y * get<2,0>(params.stride_O) + blockIdx.z * get<2,1>(params.stride_O);
     auto ptr_dO_bh = params.ptr_dO + blockIdx.y * get<2,0>(params.stride_dO) + blockIdx.z * get<2,1>(params.stride_dO);
     auto ptr_sum_OdO_bh = params.ptr_sum_OdO + blockIdx.y * get<1,0>(params.stride_sum_OdO) + blockIdx.z * get<1,1>(params.stride_sum_OdO);

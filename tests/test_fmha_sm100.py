@@ -5,7 +5,7 @@ from torch.utils.checkpoint import checkpoint
 import triton
 
 from flash_mla import flash_attn_varlen_func
-from lib import check_is_allclose
+from kernelkit import check_is_allclose
 
 def get_window_size(causal, window):
     if window > 0:
@@ -116,14 +116,14 @@ def test_flash_attention(b, mean_sq, mean_sk, varlen, h, h_k, d, dv, causal, win
     out_flash, lse_flash = flash_attn()
     if has_bwd:
         out_flash.backward(grad_out, retain_graph=True)
-        dq1 = q1.grad.clone()
+        _dq1 = q1.grad.clone()
         dk1 = k1.grad.clone()
         dv1 = v1.grad.clone()
 
     if check_correctness:
         out_torch, lse_torch = torch_attn()
-        assert check_is_allclose("out", out_flash, out_torch, abs_tol=1e-3, rel_tol=8.01 / 128, cos_diff_tol=7e-6)
-        assert check_is_allclose("lse", lse_flash, lse_torch, abs_tol=1e-6, rel_tol=2.01 / 65536)
+        assert check_is_allclose("out", out_flash.float(), out_torch, abs_tol=1e-3, rel_tol=8.01 / 128, cos_diff_tol=7e-6)
+        assert check_is_allclose("lse", lse_flash.float(), lse_torch, abs_tol=1e-6, rel_tol=2.01 / 65536)
 
         if has_bwd:
             out_torch.backward(grad_out, retain_graph=True)

@@ -1,5 +1,14 @@
 #pragma once
 
+#include <cooperative_groups.h>
+#include <cute/tensor.hpp>
+
+#include "config.h"
+
+using namespace cute;
+
+namespace sm90::decode::sparse_fp8 {
+
 // In the layout of fragment A and fragment C during WGMMA, data each thread holds resides in two particular rows. This function converts the local_row_idx (0~1) to the actual row_idx
 // You may refer to this link for the detailed layout: https://docs.nvidia.com/cuda/parallel-thread-execution/#wgmma-64n16-a
 __forceinline__ __device__ int get_AorC_row_idx(int local_row_idx, int idx_in_warpgroup) {
@@ -78,9 +87,23 @@ static void st_async_128b(void* dst_ptr, const T& data, const transac_bar_t* mba
     );
 }
 
-static constexpr int PEER_ADDR_MASK = 16777216; // peer_addr = my_addr ^ PEER_ADDR_MASK. 不确定是不是在所有显卡上都是这个数字
+CUTE_DEVICE
+static void cp_async_bulk_shared_cta_shared_cluster(void* dst_ptr, void* src_ptr, int size, transac_bar_t* mbar_ptr) {
+    uint32_t dst_addr = cute::cast_smem_ptr_to_uint(dst_ptr);
+    uint32_t src_addr = cute::cast_smem_ptr_to_uint(src_ptr);
+    uint32_t mbar_addr = cute::cast_smem_ptr_to_uint(mbar_ptr);
+    asm volatile (
+        "cp.async.bulk.shared::cluster.shared::cta.mbarrier::complete_tx::bytes [%0], [%1], %2, [%3]; \n"
+        :
+        : "r"(dst_addr), "r"(src_addr), "r"(size), "r"(mbar_addr)
+    );
+}
+
+static constexpr int PEER_ADDR_MASK = 16777216; // peer_addr = my_addr ^ PEER_ADDR_MASK.
 template<typename T>
 CUTE_DEVICE
-T* get_peer_addr(const T* p) {
+T* get_peer_addr(T* p) {
     return (T*)((int64_t)(p) ^ PEER_ADDR_MASK);
+}
+
 }
