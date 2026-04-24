@@ -605,7 +605,7 @@ sparse_attn_fwd_kernel(__grid_constant__ const SparseAttnFwdParams params, __gri
 #endif
 }
 
-template<int D_QK, int WIN, int INDEXER_TOPK>
+template<int D_QK, int INDEXER_TOPK>
 void run_fwd_phase1_kernel(const SparseAttnFwdParams& params) {
     KU_ASSERT(params.h_kv == 1);
     KU_ASSERT(params.topk % B_TOPK == 0);   // To save some boundry checkings
@@ -613,7 +613,6 @@ void run_fwd_phase1_kernel(const SparseAttnFwdParams& params) {
     KU_ASSERT(params.d_qk == D_QK);
     static_assert(D_QK == 576 || D_QK == 512);
     static_assert(INDEXER_TOPK % B_TOPK == 0, "INDEXER_TOPK must be a multiple of B_TOPK");
-    static_assert(WIN % B_TOPK == 0, "WIN (local) must be a multiple of B_TOPK");
 
     auto shape_Q_nope = make_shape(params.h_q, D_V, params.s_q);
     auto tma_Q_nope = cute::make_tma_copy(

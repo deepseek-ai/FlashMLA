@@ -42,9 +42,9 @@ protected:
         DISPATCH_HEAD_DIM(params.d_qk, HEAD_DIM_QK, [&]() {
             DISPATCH_BOOLEAN_FLAG(params.topk_length != nullptr, HAVE_TOPK_LENGTH, [&]() {
                 if (params.indexer_topk == 2048) {
-                    sm90::fwd::run_fwd_phase1_kernel<HEAD_DIM_QK, HAVE_TOPK_LENGTH, 128, 2048>(params);
+                    sm90::fwd::run_fwd_phase1_kernel<HEAD_DIM_QK, HAVE_TOPK_LENGTH, 2048>(params);
                 } else if (params.indexer_topk == 512) {
-                    sm90::fwd::run_fwd_phase1_kernel<HEAD_DIM_QK, HAVE_TOPK_LENGTH, 128, 512>(params);
+                    sm90::fwd::run_fwd_phase1_kernel<HEAD_DIM_QK, HAVE_TOPK_LENGTH, 512>(params);
                 } else {
                     sm90::fwd::run_fwd_phase1_kernel<HEAD_DIM_QK, HAVE_TOPK_LENGTH>(params);
                 }
@@ -67,9 +67,9 @@ protected:
     void run_(const SparseAttnFwdParams &params, const std::vector<FeatureT> &required_features) override {
         DISPATCH_HEAD_DIM(params.d_qk, HEAD_DIM_QK, [&]() {
             if (params.indexer_topk == 2048) {
-                sm100::fwd::head64::run_fwd_phase1_kernel<HEAD_DIM_QK, 128, 2048>(params);
+                sm100::fwd::head64::run_fwd_phase1_kernel<HEAD_DIM_QK, 2048>(params);
             } else if (params.indexer_topk == 512) {
-                sm100::fwd::head64::run_fwd_phase1_kernel<HEAD_DIM_QK, 128, 512>(params);
+                sm100::fwd::head64::run_fwd_phase1_kernel<HEAD_DIM_QK, 512>(params);
             } else {
                 sm100::fwd::head64::run_fwd_phase1_kernel<HEAD_DIM_QK>(params);
             }

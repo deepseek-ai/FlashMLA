@@ -39,9 +39,9 @@ void tma_bulk_reduce_add(void const* src_ptr, void* dst_ptr, int32_t store_bytes
                      : "memory");
 }
 
-template<int D_QK, bool HAVE_TOPK_LENGTH, int WIN, int INDEXER_TOPK>
+template<int D_QK, bool HAVE_TOPK_LENGTH, int INDEXER_TOPK>
 template<typename TMAParams>
-__device__ void KernelTemplate<D_QK, HAVE_TOPK_LENGTH, WIN, INDEXER_TOPK>::devfunc(const SparseAttnFwdParams &params, const TMAParams &tma_params) {
+__device__ void KernelTemplate<D_QK, HAVE_TOPK_LENGTH, INDEXER_TOPK>::devfunc(const SparseAttnFwdParams &params, const TMAParams &tma_params) {
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 900)) || (defined(__CLION_IDE__) || defined(__VSCODE_IDE__))
     const int q_h_idx = blockIdx.x % (params.h_q/B_H);
     const int s_q_idx = blockIdx.x / (params.h_q/B_H);
@@ -631,10 +631,9 @@ sparse_attn_fwd_kernel(__grid_constant__ const SparseAttnFwdParams params, __gri
     Kernel::devfunc(params, tma_params);
 }
 
-template<int D_QK, bool HAVE_TOPK_LENGTH, int WIN, int INDEXER_TOPK>
-void KernelTemplate<D_QK, HAVE_TOPK_LENGTH, WIN, INDEXER_TOPK>::run(const SparseAttnFwdParams &params) {
+template<int D_QK, bool HAVE_TOPK_LENGTH, int INDEXER_TOPK>
+void KernelTemplate<D_QK, HAVE_TOPK_LENGTH, INDEXER_TOPK>::run(const SparseAttnFwdParams &params) {
     static_assert(INDEXER_TOPK % (2*B_TOPK) == 0, "INDEXER_TOPK must be a multiple of 2*B_TOPK (SM90 processes 2 blocks per iteration)");
-    static_assert(WIN % (2*B_TOPK) == 0, "WIN must be a multiple of 2*B_TOPK (SM90 processes 2 blocks per iteration)");
     KU_ASSERT(params.h_kv == 1);
     KU_ASSERT(params.topk % (2*B_TOPK) == 0);   // To save some boundry checkings
     KU_ASSERT(params.topk > 0);
@@ -682,7 +681,7 @@ void KernelTemplate<D_QK, HAVE_TOPK_LENGTH, WIN, INDEXER_TOPK>::run(const Sparse
         shape_Q, tma_Q,
         tensor_map_O
     };
-    auto kernel = &sparse_attn_fwd_kernel<KernelTemplate<D_QK, HAVE_TOPK_LENGTH, WIN, INDEXER_TOPK>, decltype(tma_params)>;
+    auto kernel = &sparse_attn_fwd_kernel<KernelTemplate<D_QK, HAVE_TOPK_LENGTH, INDEXER_TOPK>, decltype(tma_params)>;
 
     constexpr size_t smem_size = sizeof(SharedMemoryPlan);
     KU_CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
@@ -700,9 +699,9 @@ void KernelTemplate<D_QK, HAVE_TOPK_LENGTH, WIN, INDEXER_TOPK>::run(const Sparse
     KU_CHECK_KERNEL_LAUNCH();
 }
 
-template<int D_QK, bool HAVE_TOPK_LENGTH, int WIN, int INDEXER_TOPK>
+template<int D_QK, bool HAVE_TOPK_LENGTH, int INDEXER_TOPK>
 void run_fwd_phase1_kernel(const SparseAttnFwdParams& params) {
-    KernelTemplate<D_QK, HAVE_TOPK_LENGTH, WIN, INDEXER_TOPK>::run(params);
+    KernelTemplate<D_QK, HAVE_TOPK_LENGTH, INDEXER_TOPK>::run(params);
 }
 
 }
