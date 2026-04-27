@@ -162,9 +162,11 @@ struct SparseAttnFwdParams {
     cutlass::bfloat16_t* __restrict__ out;   // [s_q, h_q, d_v]
     float* __restrict__ max_logits; // [s_q, h_q]
     float* __restrict__ lse; // [s_q, h_q]
+    float* __restrict__ lse_indexer; // [s_q, h_q], may be nullptr. LSE over the indexer portion only (first INDEXER_TOPK entries).
 
     int num_sm;
     cudaStream_t stream;
+    int indexer_topk;
 };
 
 // We have some kernels that implement both prefill and decode modes in a single kernel (with different template instantiations). The following enum helps to distinguish the modes.

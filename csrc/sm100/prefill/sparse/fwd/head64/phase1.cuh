@@ -56,7 +56,7 @@ KV5                 scale(O) w.r.t P3
 
 using FwdMode = SparseAttnFwdMode;
 
-template<bool HAVE_ROPE, typename TmaParams>
+template<bool HAVE_ROPE, int INDEXER_TOPK = 0, typename TmaParams>
 __global__ void __launch_bounds__(NUM_THREADS, 1, 1)
 sparse_attn_fwd_kernel(__grid_constant__ const SparseAttnFwdParams params, __grid_constant__ const TmaParams tma_params) {
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000 && __CUDA_ARCH__ < 1200)) || (defined(__CLION_IDE__) || defined(__VSCODE_IDE__))
@@ -163,6 +163,9 @@ sparse_attn_fwd_kernel(__grid_constant__ const SparseAttnFwdParams params, __gri
         float li = 0.0f;
         float real_mi = -CUDART_INF_F;
 
+        float mi_indexer = MAX_INIT_VAL;
+        float li_indexer = 0.0f;
+
         bf16* sS_base = plan.s_q_rope.s + lane_idx*8 + (warp_idx&1)*(B_H/2)*8 + (warp_idx/2)*B_H*(B_TOPK/2);
         static constexpr int NUM_ELEMS_PER_THREAD = B_TOPK / 2;
 
@@ -241,6 +244,14 @@ sparse_attn_fwd_kernel(__grid_constant__ const SparseAttnFwdParams params, __gri
             
             fence_view_async_shared();
             plan.bar_so_ready.arrive();
+
+            if constexpr (INDEXER_TOPK > 0) {
+                constexpr int INDEXER_N_BLOCKS = INDEXER_TOPK / B_TOPK;
+                if (k == INDEXER_N_BLOCKS - 1) {
+                    mi_indexer = mi;
+                    li_indexer = li;
+                }
+            }
         }
 
         // Epilogue
@@ -264,6 +275,20 @@ sparse_attn_fwd_kernel(__grid_constant__ const SparseAttnFwdParams params, __gri
             cur_lse = cur_lse == -CUDART_INF_F ? +CUDART_INF_F : cur_lse;
             params.max_logits[global_index] = real_mi*CUDART_LN2_F;
             params.lse[global_index] = cur_lse;
+        }
+
+        // Store lse_indexer (LSE over the indexer portion only)
+        if constexpr (INDEXER_TOPK > 0) {
+            plan.rowwise_li_buf[idx_in_warpgroup] = li_indexer;
+            NamedBarrier::arrive_and_wait(128, NamedBarriers::wg0_sync);
+            li_indexer += plan.rowwise_li_buf[idx_in_warpgroup^64];
+
+            if (idx_in_warpgroup < 64 && params.lse_indexer != nullptr) {
+                int global_index = s_q_idx*params.h_q + idx_in_warpgroup;
+                float cur_lse_indexer = fmaf(mi_indexer, CUDART_LN2_F, logf(li_indexer));
+                cur_lse_indexer = cur_lse_indexer == -CUDART_INF_F ? +CUDART_INF_F : cur_lse_indexer;
+                params.lse_indexer[global_index] = cur_lse_indexer;
+            }
         }
 
         // Wait for the last GEMM
@@ -580,13 +605,14 @@ sparse_attn_fwd_kernel(__grid_constant__ const SparseAttnFwdParams params, __gri
 #endif
 }
 
-template<int D_QK>
+template<int D_QK, int INDEXER_TOPK>
 void run_fwd_phase1_kernel(const SparseAttnFwdParams& params) {
     KU_ASSERT(params.h_kv == 1);
     KU_ASSERT(params.topk % B_TOPK == 0);   // To save some boundry checkings
     KU_ASSERT(params.h_q == B_H);  // To save some calculation
     KU_ASSERT(params.d_qk == D_QK);
     static_assert(D_QK == 576 || D_QK == 512);
+    static_assert(INDEXER_TOPK % B_TOPK == 0, "INDEXER_TOPK must be a multiple of B_TOPK");
 
     auto shape_Q_nope = make_shape(params.h_q, D_V, params.s_q);
     auto tma_Q_nope = cute::make_tma_copy(
@@ -661,7 +687,7 @@ void run_fwd_phase1_kernel(const SparseAttnFwdParams& params) {
         shape_O, tma_O,
         tensor_map_kv_nope
     };
-    auto kernel = &sparse_attn_fwd_kernel<D_QK == 576, decltype(tma_params)>;
+    auto kernel = &sparse_attn_fwd_kernel<D_QK == 576, INDEXER_TOPK, decltype(tma_params)>;
 
     constexpr size_t smem_size = sizeof(SharedMemoryPlan);
     KU_CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));

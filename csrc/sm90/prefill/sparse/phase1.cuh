@@ -39,9 +39,9 @@ void tma_bulk_reduce_add(void const* src_ptr, void* dst_ptr, int32_t store_bytes
                      : "memory");
 }
 
-template<int D_QK, bool HAVE_TOPK_LENGTH>
+template<int D_QK, bool HAVE_TOPK_LENGTH, int INDEXER_TOPK>
 template<typename TMAParams>
-__device__ void KernelTemplate<D_QK, HAVE_TOPK_LENGTH>::devfunc(const SparseAttnFwdParams &params, const TMAParams &tma_params) {
+__device__ void KernelTemplate<D_QK, HAVE_TOPK_LENGTH, INDEXER_TOPK>::devfunc(const SparseAttnFwdParams &params, const TMAParams &tma_params) {
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 900)) || (defined(__CLION_IDE__) || defined(__VSCODE_IDE__))
     const int q_h_idx = blockIdx.x % (params.h_q/B_H);
     const int s_q_idx = blockIdx.x / (params.h_q/B_H);
@@ -95,6 +95,9 @@ __device__ void KernelTemplate<D_QK, HAVE_TOPK_LENGTH>::devfunc(const SparseAttn
 
         float rM[2] = {MAX_INIT_VAL, MAX_INIT_VAL}; // Meaning: the `max_logits` used for O / rL calculation
         float rL[2] = {0.0f, 0.0f};
+
+        float rM_indexer[2] = {MAX_INIT_VAL, MAX_INIT_VAL};
+        float rL_indexer[2] = {0.0f, 0.0f};
         Tensor rO = partition_fragment_C(TiledMMA_PV_LocalP{}, Shape<Int<B_H>, Int<D_V/2>>{});
         Tensor rP = partition_fragment_C(TiledMMA_QK{}, Shape<Int<B_H>, Int<B_TOPK>>{});
         Tensor rS = make_tensor<bf16>(partition_shape_A(TiledMMA_PV_LocalP{}, Shape<Int<B_H>, Int<B_TOPK>>{}));
@@ -354,6 +357,14 @@ __device__ void KernelTemplate<D_QK, HAVE_TOPK_LENGTH>::devfunc(const SparseAttn
 
                 cur_bar_wait_phase ^= 1;
 
+                if constexpr (INDEXER_TOPK > 0) {
+                    constexpr int INDEXER_N_BLOCKS = INDEXER_TOPK / B_TOPK;
+                    if (block_idx + 2 == INDEXER_N_BLOCKS) {
+                        rM_indexer[0] = rM[0]; rM_indexer[1] = rM[1];
+                        rL_indexer[0] = rL[0]; rL_indexer[1] = rL[1];
+                    }
+                }
+
                 if (block_idx+2 < num_topk_blocks) {
                     // Launch the next QK^T GEMM
                     pipelined_wait_and_qkt_gemm_l();
@@ -373,6 +384,21 @@ __device__ void KernelTemplate<D_QK, HAVE_TOPK_LENGTH>::devfunc(const SparseAttn
             }
 
             reduce_L();
+
+            // WG0 participates in cross-warpgroup lse_indexer reduction
+            // (WG1 needs WG0's rL_indexer via plan.sL; both must arrive at the barrier)
+            if constexpr (INDEXER_TOPK > 0) {
+                // Fence: ensure all sL reads from reduce_L() are done before we overwrite sL
+                NamedBarrier::arrive_and_wait(256, NamedBarriers::epilogue_sync);
+                rL_indexer[0] += __shfl_xor_sync(0xffffffff, rL_indexer[0], 1);
+                rL_indexer[0] += __shfl_xor_sync(0xffffffff, rL_indexer[0], 2);
+                rL_indexer[1] += __shfl_xor_sync(0xffffffff, rL_indexer[1], 1);
+                rL_indexer[1] += __shfl_xor_sync(0xffffffff, rL_indexer[1], 2);
+                if (idx_in_warpgroup%4 == 0)
+                    plan.sL[threadIdx.x/4] = make_float2(rL_indexer[0], rL_indexer[1]);
+                NamedBarrier::arrive_and_wait(256, NamedBarriers::sL_ready);
+            }
+
             store_O();
         } else {
             // Warpgroup 1
@@ -435,9 +461,34 @@ __device__ void KernelTemplate<D_QK, HAVE_TOPK_LENGTH>::devfunc(const SparseAttn
                 plan.bar_k0_free[1].arrive();
 
                 cur_bar_wait_phase ^= 1;
+
+                if constexpr (INDEXER_TOPK > 0) {
+                    constexpr int INDEXER_N_BLOCKS = INDEXER_TOPK / B_TOPK;
+                    if (block_idx + 2 == INDEXER_N_BLOCKS) {
+                        rM_indexer[0] = rM[0]; rM_indexer[1] = rM[1];
+                        rL_indexer[0] = rL[0]; rL_indexer[1] = rL[1];
+                    }
+                }
             }
 
             reduce_L();
+
+            // Cross-warpgroup lse_indexer reduction (paired with WG0 above)
+            if constexpr (INDEXER_TOPK > 0) {
+                // Fence: ensure all sL reads from reduce_L() are done before we overwrite sL
+                NamedBarrier::arrive_and_wait(256, NamedBarriers::epilogue_sync);
+                rL_indexer[0] += __shfl_xor_sync(0xffffffff, rL_indexer[0], 1);
+                rL_indexer[0] += __shfl_xor_sync(0xffffffff, rL_indexer[0], 2);
+                rL_indexer[1] += __shfl_xor_sync(0xffffffff, rL_indexer[1], 1);
+                rL_indexer[1] += __shfl_xor_sync(0xffffffff, rL_indexer[1], 2);
+                if (idx_in_warpgroup%4 == 0)
+                    plan.sL[threadIdx.x/4] = make_float2(rL_indexer[0], rL_indexer[1]);
+                NamedBarrier::arrive_and_wait(256, NamedBarriers::sL_ready);
+                float2 peer_L = plan.sL[(threadIdx.x/4)^32];
+                rL_indexer[0] += peer_L.x;
+                rL_indexer[1] += peer_L.y;
+            }
+
             store_O();
 
             // Save lse
@@ -447,6 +498,11 @@ __device__ void KernelTemplate<D_QK, HAVE_TOPK_LENGTH>::devfunc(const SparseAttn
                     bool is_no_valid_tokens = rL[row] == 0.0f;
                     plan.final_max_logits[real_row] = is_no_valid_tokens ? -INFINITY : rM[row]*CUDART_LN2_F;
                     plan.final_lse[real_row] = is_no_valid_tokens ? +INFINITY : logf(rL[row]) + rM[row]*CUDART_LN2_F;
+
+                    if constexpr (INDEXER_TOPK > 0) {
+                        bool is_indexer_empty = rL_indexer[row] == 0.0f;
+                        plan.final_lse_indexer[real_row] = is_indexer_empty ? +INFINITY : logf(rL_indexer[row]) + rM_indexer[row]*CUDART_LN2_F;
+                    }
                 }
                 fence_view_async_shared();
             }
@@ -456,6 +512,10 @@ __device__ void KernelTemplate<D_QK, HAVE_TOPK_LENGTH>::devfunc(const SparseAttn
                 int g_offset = s_q_idx*params.h_q + q_h_idx*B_H;
                 SM90_BULK_COPY_S2G::copy(plan.final_max_logits, params.max_logits + g_offset, B_H*sizeof(float));
                 SM90_BULK_COPY_S2G::copy(plan.final_lse, params.lse + g_offset, B_H*sizeof(float));
+                if constexpr (INDEXER_TOPK > 0) {
+                    if (params.lse_indexer != nullptr)
+                        SM90_BULK_COPY_S2G::copy(plan.final_lse_indexer, params.lse_indexer + g_offset, B_H*sizeof(float));
+                }
                 cute::tma_store_arrive();
             }
         }
@@ -571,8 +631,9 @@ sparse_attn_fwd_kernel(__grid_constant__ const SparseAttnFwdParams params, __gri
     Kernel::devfunc(params, tma_params);
 }
 
-template<int D_QK, bool HAVE_TOPK_LENGTH>
-void KernelTemplate<D_QK, HAVE_TOPK_LENGTH>::run(const SparseAttnFwdParams &params) {
+template<int D_QK, bool HAVE_TOPK_LENGTH, int INDEXER_TOPK>
+void KernelTemplate<D_QK, HAVE_TOPK_LENGTH, INDEXER_TOPK>::run(const SparseAttnFwdParams &params) {
+    static_assert(INDEXER_TOPK % (2*B_TOPK) == 0, "INDEXER_TOPK must be a multiple of 2*B_TOPK (SM90 processes 2 blocks per iteration)");
     KU_ASSERT(params.h_kv == 1);
     KU_ASSERT(params.topk % (2*B_TOPK) == 0);   // To save some boundry checkings
     KU_ASSERT(params.topk > 0);
@@ -620,7 +681,7 @@ void KernelTemplate<D_QK, HAVE_TOPK_LENGTH>::run(const SparseAttnFwdParams &para
         shape_Q, tma_Q,
         tensor_map_O
     };
-    auto kernel = &sparse_attn_fwd_kernel<KernelTemplate<D_QK, HAVE_TOPK_LENGTH>, decltype(tma_params)>;
+    auto kernel = &sparse_attn_fwd_kernel<KernelTemplate<D_QK, HAVE_TOPK_LENGTH, INDEXER_TOPK>, decltype(tma_params)>;
 
     constexpr size_t smem_size = sizeof(SharedMemoryPlan);
     KU_CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
@@ -638,9 +699,9 @@ void KernelTemplate<D_QK, HAVE_TOPK_LENGTH>::run(const SparseAttnFwdParams &para
     KU_CHECK_KERNEL_LAUNCH();
 }
 
-template<int D_QK, bool HAVE_TOPK_LENGTH>
+template<int D_QK, bool HAVE_TOPK_LENGTH, int INDEXER_TOPK>
 void run_fwd_phase1_kernel(const SparseAttnFwdParams& params) {
-    KernelTemplate<D_QK, HAVE_TOPK_LENGTH>::run(params);
+    KernelTemplate<D_QK, HAVE_TOPK_LENGTH, INDEXER_TOPK>::run(params);
 }
 
 }

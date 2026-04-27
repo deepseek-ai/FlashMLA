@@ -15,7 +15,7 @@ namespace sm90::fwd {
 
 using namespace cute;
 
-template<int D_QK, bool HAVE_TOPK_LENGTH>
+template<int D_QK, bool HAVE_TOPK_LENGTH, int INDEXER_TOPK = 0>
 class KernelTemplate {
 public:
 
@@ -77,7 +77,7 @@ struct SharedMemoryPlan {
     bool is_kv_valid[2][B_TOPK];
     float2 sM[32];
     float2 sL[64];   // For reduction across WG0/1 in epilogue
-    float final_max_logits[64], final_lse[64];
+    float final_max_logits[64], final_lse[64], final_lse_indexer[64];
     transac_bar_t bar_q, bar_k0_free[2], bar_k0_ready[2], bar_k1_free[2], bar_k1_ready[2], bar_is_kv_valid_ready;
 };
 
