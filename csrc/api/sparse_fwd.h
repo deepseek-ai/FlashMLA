@@ -18,7 +18,8 @@ enum class FwdFeatures : int {
 
     ATTN_SINK,
     SINK_LSE,
-    TOPK_LENGTH
+    TOPK_LENGTH,
+    INDEXER_TOPK
 };
 
 class FwdImplBase : public ImplBase<
@@ -34,7 +35,8 @@ class Fwd_Sm90_Impl : public FwdImplBase {
         FwdFeatures::HEAD_DIM_576,
         FwdFeatures::ATTN_SINK,
         FwdFeatures::SINK_LSE,
-        FwdFeatures::TOPK_LENGTH
+        FwdFeatures::TOPK_LENGTH,
+        FwdFeatures::INDEXER_TOPK
     )
 
 protected:
@@ -62,7 +64,8 @@ class Fwd_Sm100_Head64_Impl : public FwdImplBase {
         FwdFeatures::HEAD_DIM_576,
         FwdFeatures::ATTN_SINK,
         FwdFeatures::SINK_LSE,
-        FwdFeatures::TOPK_LENGTH
+        FwdFeatures::TOPK_LENGTH,
+        FwdFeatures::INDEXER_TOPK
     )
 
 protected:
@@ -105,12 +108,19 @@ class Fwd_Sm100_Head128_Small_TopK_Impl : public FwdImplBase {
         FwdFeatures::HEAD_DIM_512,
         FwdFeatures::ATTN_SINK,
         FwdFeatures::SINK_LSE,
-        FwdFeatures::TOPK_LENGTH
+        FwdFeatures::TOPK_LENGTH,
+        FwdFeatures::INDEXER_TOPK
     )
 
 protected:
     void run_(const SparseAttnFwdParams &params, const std::vector<FeatureT> &required_features) override {
-        sm100::fwd_for_small_topk::head128::run_fwd_for_small_topk_phase1_kernel<SparseAttnFwdMode::Prefill, 512>(params);
+        if (params.indexer_topk == 1024) {
+            sm100::fwd_for_small_topk::head128::run_fwd_for_small_topk_phase1_kernel<SparseAttnFwdMode::Prefill, 512, 1024>(params);
+        } else if (params.indexer_topk == 512) {
+            sm100::fwd_for_small_topk::head128::run_fwd_for_small_topk_phase1_kernel<SparseAttnFwdMode::Prefill, 512, 512>(params);
+        } else {
+            sm100::fwd_for_small_topk::head128::run_fwd_for_small_topk_phase1_kernel<SparseAttnFwdMode::Prefill, 512>(params);
+        }
     }
 };
 
@@ -148,7 +158,8 @@ static std::vector<at::Tensor> sparse_attn_prefill_interface(
     TORCH_CHECK(d_qk == 576 || d_qk == 512, "Invalid d_qk: ", d_qk);
     TORCH_CHECK(d_v == 512, "Invalid d_v", d_v);
     TORCH_CHECK(indexer_topk == 0 || indexer_topk == 512 || indexer_topk == 1024 || indexer_topk == 2048, "indexer_topk must be 0, 512, 1024, or 2048, got ", indexer_topk);
-    TORCH_CHECK(!(h_q == 128 && indexer_topk > 0), "indexer_topk > 0 is not supported for h_q == 128");
+    TORCH_CHECK(!(h_q == 128 && d_qk == 576 && indexer_topk > 0), "indexer_topk > 0 with h_q == 128 currently requires d_qk == 512");
+    TORCH_CHECK(!(h_q == 128 && indexer_topk == 2048), "indexer_topk == 2048 is not supported for h_q == 128 (small-topk only instantiates 512/1024)");
     
     KU_CHECK_DEVICE(q);
     KU_CHECK_DEVICE(kv);
@@ -234,6 +245,9 @@ static std::vector<at::Tensor> sparse_attn_prefill_interface(
     }
     if (have_topk_length) {
         required_features.push_back(FwdFeatures::TOPK_LENGTH);
+    }
+    if (indexer_topk > 0) {
+        required_features.push_back(FwdFeatures::INDEXER_TOPK);
     }
 
     if (is_sm90a) {
