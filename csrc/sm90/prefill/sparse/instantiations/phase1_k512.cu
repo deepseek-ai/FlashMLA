@@ -7,6 +7,7 @@ namespace sm90::fwd {
 // = true / false respectively, to compile them in parallel.
 template void run_fwd_phase1_kernel<512, false>(const SparseAttnFwdParams& params);
 template void run_fwd_phase1_kernel<512, false, 512>(const SparseAttnFwdParams& params);
+template void run_fwd_phase1_kernel<512, false, 1024>(const SparseAttnFwdParams& params);
 template void run_fwd_phase1_kernel<512, false, 2048>(const SparseAttnFwdParams& params);
 
 }

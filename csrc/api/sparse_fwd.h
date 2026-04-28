@@ -43,6 +43,8 @@ protected:
             DISPATCH_BOOLEAN_FLAG(params.topk_length != nullptr, HAVE_TOPK_LENGTH, [&]() {
                 if (params.indexer_topk == 2048) {
                     sm90::fwd::run_fwd_phase1_kernel<HEAD_DIM_QK, HAVE_TOPK_LENGTH, 2048>(params);
+                } else if (params.indexer_topk == 1024) {
+                    sm90::fwd::run_fwd_phase1_kernel<HEAD_DIM_QK, HAVE_TOPK_LENGTH, 1024>(params);
                 } else if (params.indexer_topk == 512) {
                     sm90::fwd::run_fwd_phase1_kernel<HEAD_DIM_QK, HAVE_TOPK_LENGTH, 512>(params);
                 } else {
@@ -68,6 +70,8 @@ protected:
         DISPATCH_HEAD_DIM(params.d_qk, HEAD_DIM_QK, [&]() {
             if (params.indexer_topk == 2048) {
                 sm100::fwd::head64::run_fwd_phase1_kernel<HEAD_DIM_QK, 2048>(params);
+            } else if (params.indexer_topk == 1024) {
+                sm100::fwd::head64::run_fwd_phase1_kernel<HEAD_DIM_QK, 1024>(params);
             } else if (params.indexer_topk == 512) {
                 sm100::fwd::head64::run_fwd_phase1_kernel<HEAD_DIM_QK, 512>(params);
             } else {
@@ -143,7 +147,7 @@ static std::vector<at::Tensor> sparse_attn_prefill_interface(
 
     TORCH_CHECK(d_qk == 576 || d_qk == 512, "Invalid d_qk: ", d_qk);
     TORCH_CHECK(d_v == 512, "Invalid d_v", d_v);
-    TORCH_CHECK(indexer_topk == 0 || indexer_topk == 512 || indexer_topk == 2048, "indexer_topk must be 0, 512, or 2048, got ", indexer_topk);
+    TORCH_CHECK(indexer_topk == 0 || indexer_topk == 512 || indexer_topk == 1024 || indexer_topk == 2048, "indexer_topk must be 0, 512, 1024, or 2048, got ", indexer_topk);
     TORCH_CHECK(!(h_q == 128 && indexer_topk > 0), "indexer_topk > 0 is not supported for h_q == 128");
     
     KU_CHECK_DEVICE(q);
