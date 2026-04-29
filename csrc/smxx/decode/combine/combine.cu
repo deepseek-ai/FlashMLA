@@ -18,11 +18,12 @@ namespace smxx::decode {
 template<typename ElementT, int HEAD_DIM_V, int BLOCK_SIZE_M, int MAX_SPLITS, int NUM_THREADS>
 __global__ void __launch_bounds__(NUM_THREADS)
 flash_fwd_mla_combine_kernel(__grid_constant__ const CombineParams params) {
-    // grid_shape: [batch_size, s_q, h_q/BLOCK_SIZE_M]
+    // grid_shape: [batch_size*s_q, 1, h_q/BLOCK_SIZE_M]
     // Each CTA gathers the activation of some heads from one batch, do scaling & accumulation, and save the result
     static_assert(NUM_THREADS/32 == BLOCK_SIZE_M); // The number of warps == block_size_m
-    const int batch_idx = blockIdx.x;
-    const int s_q_idx = blockIdx.y;
+    const int batch_s_q_idx = blockIdx.x;
+    const int batch_idx = batch_s_q_idx / params.s_q;
+    const int s_q_idx = batch_s_q_idx - batch_idx * params.s_q;
     const int h_block_idx = blockIdx.z;
     const int warp_idx = threadIdx.x / 32;
     const int lane_idx = threadIdx.x % 32;
@@ -199,7 +200,7 @@ void run_flash_mla_combine_kernel(CombineParams &params) {
         attribute[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
         attribute[0].val.programmaticStreamSerializationAllowed = 1;
         cudaLaunchConfig_t combine_kernel_config = {
-            dim3(params.b, params.s_q, ku::ceil_div(params.h_q, BLOCK_SIZE_M)),
+            dim3(params.b * params.s_q, 1, ku::ceil_div(params.h_q, BLOCK_SIZE_M)),
             dim3(NUM_THREADS, 1, 1),
             0,
             params.stream,
