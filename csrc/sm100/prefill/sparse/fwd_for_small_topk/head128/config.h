@@ -13,7 +13,7 @@ namespace sm100::fwd_for_small_topk::head128 {
 
 using namespace cute;
 
-template<SparseAttnFwdMode FWD_MODE, int D_QK>
+template<SparseAttnFwdMode FWD_MODE, int D_QK, int INDEXER_TOPK = 0>
 struct KernelTemplate {
 
 using ArgT = SparseFwdArgT<FWD_MODE>;

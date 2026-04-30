@@ -19,9 +19,9 @@ namespace sm100::fwd_for_small_topk::head128 {
 using namespace cute;
 using FwdMode = SparseAttnFwdMode;
 
-template<FwdMode FWD_MODE, int D_QK>
+template<FwdMode FWD_MODE, int D_QK, int INDEXER_TOPK>
 __device__ void
-KernelTemplate<FWD_MODE, D_QK>::sparse_attn_fwd_kernel_devfunc(const ArgT &params, const TmaParams &tma_params) {
+KernelTemplate<FWD_MODE, D_QK, INDEXER_TOPK>::sparse_attn_fwd_kernel_devfunc(const ArgT &params, const TmaParams &tma_params) {
 #ifdef KERUTILS_ENABLE_SM100A
     // Grid shape: [2*s_q, 1, 1] for prefilling, [2*s_q, num_sm_parts, 1] for decoding
     // Cluster shape: [2, 1, 1]
@@ -797,6 +797,9 @@ KernelTemplate<FWD_MODE, D_QK>::sparse_attn_fwd_kernel_devfunc(const ArgT &param
             float mi = MAX_INIT_VAL;
             float li = 0.0f;
             float real_mi = -CUDART_INF_F;
+            // Snapshots of mi/li after the first INDEXER_TOPK/B_TOPK blocks (the indexer/compress portion).
+            float mi_indexer = MAX_INIT_VAL;
+            float li_indexer = 0.0f;
             static constexpr int NUM_ELEMS_PER_THREAD = B_TOPK / 2;
 
             CUTE_NO_UNROLL
@@ -854,6 +857,16 @@ KernelTemplate<FWD_MODE, D_QK>::sparse_attn_fwd_kernel_devfunc(const ArgT &param
                 float cur_sum = get_s_from_p<NUM_ELEMS_PER_THREAD>(s, p, params.sm_scale_div_log2, new_max);
                 li = fmaf(li, scale_for_old, cur_sum);
 
+                // Snapshot mi/li at the end of the indexer (compress) phase.
+                // Only meaningful in prefill mode (enforced by static_assert in run()).
+                if constexpr (INDEXER_TOPK > 0) {
+                    constexpr int INDEXER_N_BLOCKS = INDEXER_TOPK / B_TOPK;
+                    if (k == INDEXER_N_BLOCKS - 1) {
+                        mi_indexer = mi;
+                        li_indexer = li;
+                    }
+                }
+
                 // Store S
                 smem.bar_SV_done.wait(bar_phase^1);
                 CUTE_UNROLL
@@ -888,6 +901,15 @@ KernelTemplate<FWD_MODE, D_QK>::sparse_attn_fwd_kernel_devfunc(const ArgT &param
             NamedBarrier::arrive_and_wait(128, barrier_ids::WG2_SYNC);
             li += smem.rowwise_li_buf[idx_in_warpgroup];
 
+            // Reduce li_indexer (reuses rowwise_li_buf; the leading sync ensures the
+            // previous reduction's reads are complete before we overwrite peer slots).
+            if constexpr (INDEXER_TOPK > 0) {
+                NamedBarrier::arrive_and_wait(128, barrier_ids::WG2_SYNC);
+                smem.rowwise_li_buf[idx_in_warpgroup^64] = li_indexer;
+                NamedBarrier::arrive_and_wait(128, barrier_ids::WG2_SYNC);
+                li_indexer += smem.rowwise_li_buf[idx_in_warpgroup];
+            }
+
             if (idx_in_warpgroup < H_Q/2) {
                 // Calculate output_scale and save
                 int head_idx = cta_idx*(H_Q/2) + idx_in_warpgroup;
@@ -907,6 +929,15 @@ KernelTemplate<FWD_MODE, D_QK>::sparse_attn_fwd_kernel_devfunc(const ArgT &param
                     int global_index = args.s_q_idx*params.h_q + head_idx;
                     params.max_logits[global_index] = real_mi*CUDART_LN2_F;
                     params.lse[global_index] = cur_lse;
+
+                    // LSE over the indexer (compress) portion only.
+                    if constexpr (INDEXER_TOPK > 0) {
+                        if (params.lse_indexer != nullptr) {
+                            float cur_lse_indexer = fmaf(mi_indexer, CUDART_LN2_F, logf(li_indexer));
+                            cur_lse_indexer = cur_lse_indexer == -CUDART_INF_F ? +CUDART_INF_F : cur_lse_indexer;
+                            params.lse_indexer[global_index] = cur_lse_indexer;
+                        }
+                    }
                 } else {
                     if (FWD_MODE != FwdMode::DecodeWithSplitKV || args.is_no_split) {
                         params.lse[args.batch_idx*params.stride_lse_b + args.s_q_idx*params.stride_lse_s_q + head_idx] = cur_lse;
@@ -944,9 +975,11 @@ flash_fwd_splitkv_mla_fp8_sparse_kernel(__grid_constant__ const typename Kernel:
     Kernel::sparse_attn_fwd_kernel_devfunc(params, tma_params);
 }
 
-template<FwdMode FWD_MODE, int D_QK>
-void KernelTemplate<FWD_MODE, D_QK>::run(const ArgT& params) {
+template<FwdMode FWD_MODE, int D_QK, int INDEXER_TOPK>
+void KernelTemplate<FWD_MODE, D_QK, INDEXER_TOPK>::run(const ArgT& params) {
     static_assert(D_QK == 576 || D_QK == 512);
+    static_assert(INDEXER_TOPK % B_TOPK == 0, "INDEXER_TOPK must be a multiple of B_TOPK");
+    static_assert(IS_PREFILL || INDEXER_TOPK == 0, "INDEXER_TOPK > 0 is only supported in prefill mode");
 
     KU_ASSERT(params.h_kv == 1);
     KU_ASSERT(params.topk % B_TOPK == 0);   // To save some boundry checkings
@@ -1075,7 +1108,7 @@ void KernelTemplate<FWD_MODE, D_QK>::run(const ArgT& params) {
         };
     }
     
-    auto kernel = IS_PREFILL ? &sparse_attn_fwd_for_small_topk_kernel<KernelTemplate<FWD_MODE, D_QK>> : &flash_fwd_splitkv_mla_fp8_sparse_kernel<KernelTemplate<FWD_MODE, D_QK>>;
+    auto kernel = IS_PREFILL ? &sparse_attn_fwd_for_small_topk_kernel<KernelTemplate<FWD_MODE, D_QK, INDEXER_TOPK>> : &flash_fwd_splitkv_mla_fp8_sparse_kernel<KernelTemplate<FWD_MODE, D_QK, INDEXER_TOPK>>;
     constexpr size_t smem_size = sizeof(SharedMemoryPlan);
     KU_CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
 
@@ -1098,9 +1131,9 @@ void KernelTemplate<FWD_MODE, D_QK>::run(const ArgT& params) {
     ));
 }
 
-template<FwdMode FWD_MODE, int D_QK>
+template<FwdMode FWD_MODE, int D_QK, int INDEXER_TOPK>
 void run_fwd_for_small_topk_phase1_kernel(const SparseFwdArgT<FWD_MODE>& params) {
-    using Kernel = KernelTemplate<FWD_MODE, D_QK>;
+    using Kernel = KernelTemplate<FWD_MODE, D_QK, INDEXER_TOPK>;
     Kernel::run(params);
 }
 

@@ -4,7 +4,7 @@
 
 namespace sm100::fwd_for_small_topk::head128 {
 
-template<SparseAttnFwdMode FWD_MODE, int D_QK>
+template<SparseAttnFwdMode FWD_MODE, int D_QK, int INDEXER_TOPK = 0>
 void run_fwd_for_small_topk_phase1_kernel(const SparseFwdArgT<FWD_MODE>& params);
 
 }
