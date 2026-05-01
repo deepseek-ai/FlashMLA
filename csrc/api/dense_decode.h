@@ -6,7 +6,12 @@
 #include "common.h"
 #include "params.h"
 
+#ifndef FLASH_MLA_DISABLE_SM90
 #include "sm90/decode/dense/splitkv_mla.h"
+#endif
+#ifndef FLASH_MLA_DISABLE_SM80
+#include "sm80/decode/dense/splitkv_mla.h"
+#endif
 #include "smxx/decode/get_decoding_sched_meta/get_decoding_sched_meta.h"
 #include "smxx/decode/combine/combine.h"
 
@@ -24,8 +29,8 @@ dense_attn_decode_interface(
 ) {
     // Check arch
     Arch arch = Arch();
-    if (!arch.is_sm90a()) {
-        TORCH_CHECK(false, "Dense decode MLA is only supported on SM90a architecture");
+    if (!arch.is_sm90a() && !arch.is_sm80()) {
+        TORCH_CHECK(false, "Dense decode MLA is only supported on SM80 or SM90a architectures");
     }
 
     // Check data types
@@ -172,17 +177,44 @@ dense_attn_decode_interface(
 
     params.stream = at::cuda::getCurrentCUDAStream().stream();
 
+#define DISPATCH_DENSE_DECODE_KERNEL(SCALAR_T) \
+    do { \
+        if (arch.is_sm90a()) { \
+            CALL_SM90_DENSE_DECODE(SCALAR_T); \
+        } else if (arch.is_sm80()) { \
+            CALL_SM80_DENSE_DECODE(SCALAR_T); \
+        } else { \
+            TORCH_CHECK(false, "Unsupported arch for dense MLA decode"); \
+        } \
+    } while (0)
+
+#ifndef FLASH_MLA_DISABLE_SM90
+#define CALL_SM90_DENSE_DECODE(SCALAR_T) sm90::run_flash_splitkv_mla_kernel<SCALAR_T>(params)
+#else
+#define CALL_SM90_DENSE_DECODE(SCALAR_T) TORCH_CHECK(false, "FlashMLA was built with FLASH_MLA_DISABLE_SM90; cannot run on SM90 GPU")
+#endif
+
+#ifndef FLASH_MLA_DISABLE_SM80
+#define CALL_SM80_DENSE_DECODE(SCALAR_T) sm80::run_flash_splitkv_mla_kernel<SCALAR_T>(params)
+#else
+#define CALL_SM80_DENSE_DECODE(SCALAR_T) TORCH_CHECK(false, "FlashMLA was built with FLASH_MLA_DISABLE_SM80; cannot run on SM80 GPU")
+#endif
+
     if (q_dtype == torch::kBFloat16) {
-        sm90::run_flash_splitkv_mla_kernel<cutlass::bfloat16_t>(params);
+        DISPATCH_DENSE_DECODE_KERNEL(cutlass::bfloat16_t);
     } else if (q_dtype == torch::kHalf) {
 #ifdef FLASH_MLA_DISABLE_FP16
         TORCH_CHECK(false, "FlashMLA is compiled with -DFLASH_MLA_DISABLE_FP16. Please remove this flag from your environment and re-compile FlashMLA.");
 #else
-        sm90::run_flash_splitkv_mla_kernel<cutlass::half_t>(params);
+        DISPATCH_DENSE_DECODE_KERNEL(cutlass::half_t);
 #endif
     } else {
-        TORCH_CHECK(false, "Unsupported dtype for dense MLA on SM90");
+        TORCH_CHECK(false, "Unsupported dtype for dense MLA decode");
     }
+
+#undef DISPATCH_DENSE_DECODE_KERNEL
+#undef CALL_SM90_DENSE_DECODE
+#undef CALL_SM80_DENSE_DECODE
 
     CombineParams combine_params = {
         batch_size, seqlen_q_ori,
