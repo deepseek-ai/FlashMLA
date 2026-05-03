@@ -119,7 +119,7 @@ struct Sm100FmhaFwdEpilogueTmaWarpspecialized {
       if (cumulative_length_q != nullptr) {
           int max_length_q = get<0>(problem_shape).max_length;
           get<0>(problem_shape_O).max_length = max(1, max_length_q);
-          // for variable sequence lenght, the batch is in units of row_stride
+          // for variable sequence length, the batch is in units of row_stride
           get<2,1>(dO) = get<0>(dO);
           get<2,1>(problem_shape_O) = max(1, max_length_q * (1 + get<2,1>(problem_shape_O)));
           // offset ptr by the amount we add back in later
