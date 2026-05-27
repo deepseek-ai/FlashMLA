@@ -67,6 +67,7 @@ struct SparseAttnDecodeParams {
     float sm_scale, sm_scale_div_log2;
     int num_blocks, page_block_size, topk;
     ModelType model_type;
+    bool is_bf16_kvcache;
 
     cutlass::bfloat16_t* __restrict__ q;   // [b, s_q, h_q, d_qk]
     cutlass::bfloat16_t* __restrict__ kv;  // [num_blocks, page_block_size, d_qk]

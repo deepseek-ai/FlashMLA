@@ -6,6 +6,7 @@
 
 #include "sm90/decode/sparse_fp8/splitkv_mla.h"
 #include "sm100/decode/head64/kernel.h"
+#include "sm100/decode/head64_bf16/kernel.h"
 #include "sm100/prefill/sparse/fwd_for_small_topk/head128/phase1.h"
 #include "smxx/decode/get_decoding_sched_meta/get_decoding_sched_meta.h"
 #include "smxx/decode/combine/combine.h"
@@ -180,6 +181,81 @@ protected:
     }
 };
 
+// BF16 KV cache implementations for SM100
+class Decode_Sm100_Head64_BF16_Impl : public DecodeImplBase {
+    DECLARE_SUPPORTED_FEATURES(
+        DecodeFeatures::HEAD_64,
+        DecodeFeatures::HEAD_DIM_512,
+        DecodeFeatures::HEAD_DIM_576,
+        DecodeFeatures::V32_KVCACHE_FORMAT,
+        DecodeFeatures::MODEL1_KVCACHE_FORMAT,
+        DecodeFeatures::ATTN_SINK,
+        DecodeFeatures::TOPK_LENGTH,
+        DecodeFeatures::EXTRA_KVCACHE,
+        DecodeFeatures::EXTRA_TOPK_LENGTH
+    )
+
+public:
+    DecodeImplMeta get_meta(int h_q, int s_q) override {
+        Arch arch = Arch();
+        return {
+            std::max(arch.num_sms / s_q, 1),
+            5,
+            64
+        };
+    }
+
+protected:
+    void run_(const SparseAttnDecodeParams &params, const std::vector<FeatureT> &required_features) override {
+        DISPATCH_MODEL_TYPE(params.model_type, MODEL_TYPE, [&]() {
+            sm100::decode::head64_bf16::run_flash_splitkv_mla_bf16_sparse_kernel<MODEL_TYPE>(params);
+        });
+    }
+};
+
+class Decode_Sm100_Head64x2_BF16_Impl : public DecodeImplBase {
+    DECLARE_SUPPORTED_FEATURES(
+        DecodeFeatures::HEAD_128,
+        DecodeFeatures::HEAD_DIM_512,
+        DecodeFeatures::HEAD_DIM_576,
+        DecodeFeatures::V32_KVCACHE_FORMAT,
+        DecodeFeatures::MODEL1_KVCACHE_FORMAT,
+        DecodeFeatures::ATTN_SINK,
+        DecodeFeatures::TOPK_LENGTH,
+        DecodeFeatures::EXTRA_KVCACHE,
+        DecodeFeatures::EXTRA_TOPK_LENGTH
+    )
+
+public:
+    DecodeImplMeta get_meta(int h_q, int s_q) override {
+        Arch arch = Arch();
+        return {
+            std::max(arch.num_sms / s_q, 1),
+            5,
+            64
+        };
+    }
+
+protected:
+    void run_(const SparseAttnDecodeParams &params, const std::vector<FeatureT> &required_features) override {
+        DISPATCH_MODEL_TYPE(params.model_type, MODEL_TYPE, [&]() {
+            for (int start_head_idx = 0; start_head_idx < 128; start_head_idx += 64) {
+                SparseAttnDecodeParams cur_params = params;
+                cur_params.q += start_head_idx * params.stride_q_h_q;
+                if (cur_params.attn_sink) {
+                    cur_params.attn_sink += start_head_idx;
+                }
+                cur_params.lse += start_head_idx;
+                cur_params.out += start_head_idx * params.stride_o_h_q;
+                cur_params.lse_accum += start_head_idx;
+                cur_params.o_accum += start_head_idx * params.stride_o_accum_h_q;
+                cur_params.h_q = 64;
+                sm100::decode::head64_bf16::run_flash_splitkv_mla_bf16_sparse_kernel<MODEL_TYPE>(cur_params);
+            }
+        });
+    }
+};
+
 static std::tuple<at::Tensor, at::Tensor, std::optional<at::Tensor>, std::optional<at::Tensor>>
 sparse_attn_decode_interface(
     const at::Tensor &q,   // [b, s_q, h_q, d_qk]
@@ -257,9 +333,16 @@ sparse_attn_decode_interface(
 
     // Check data type
     KU_CHECK_DTYPE(q, torch::kBFloat16);
-    TORCH_CHECK(kv.dtype() == torch::kFloat8_e4m3fn || kv.dtype() == torch::kInt8 || kv.dtype() == torch::kUInt8, "key must have dtype fp8_e4m3fn, int8 or uint8");
+    bool is_bf16_kvcache = (kv.dtype() == torch::kBFloat16);
+    if (!is_bf16_kvcache) {
+        TORCH_CHECK(kv.dtype() == torch::kFloat8_e4m3fn || kv.dtype() == torch::kInt8 || kv.dtype() == torch::kUInt8, "key must have dtype bfloat16, fp8_e4m3fn, int8 or uint8");
+    }
     if (extra_kv.has_value()) {
-        TORCH_CHECK(extra_kv->dtype() == torch::kFloat8_e4m3fn || extra_kv->dtype() == torch::kInt8 || extra_kv->dtype() == torch::kUInt8, "extra k cache must have dtype fp8_e4m3fn, int8 or uint8");
+        if (is_bf16_kvcache) {
+            TORCH_CHECK(extra_kv->dtype() == torch::kBFloat16, "extra k cache must have dtype bfloat16 when kv is bfloat16");
+        } else {
+            TORCH_CHECK(extra_kv->dtype() == torch::kFloat8_e4m3fn || extra_kv->dtype() == torch::kInt8 || extra_kv->dtype() == torch::kUInt8, "extra k cache must have dtype fp8_e4m3fn, int8 or uint8");
+        }
     }
     KU_CHECK_DTYPE(indices, torch::kInt32);
     KU_CHECK_DTYPE(topk_length, torch::kInt32);
@@ -285,7 +368,10 @@ sparse_attn_decode_interface(
     
     // Check shape
     KU_CHECK_SHAPE(q, b, s_q, h_q, d_qk);
-    {
+    if (is_bf16_kvcache) {
+        KU_CHECK_SHAPE(kv, num_blocks, page_block_size, h_kv, d_qk);
+        KU_CHECK_SHAPE(extra_kv, extra_num_blocks, extra_page_block_size, h_kv, d_qk);
+    } else {
         int bytes_per_token;
         if (d_qk == 576 && d_v == 512) {
             // V3.2 style
@@ -361,20 +447,33 @@ sparse_attn_decode_interface(
 
     DecodeImplBase* impl;
     if (arch.is_sm100f()) {
-        if (h_q == 64) {
-            impl = new Decode_Sm100_Head64_Impl();
-        } else if (h_q == 128) {
-            if (d_qk == 576) {
-                impl = new Decode_Sm100_Head64x2_Impl();
-            } else if (d_qk == 512) {
-                impl = new Decode_Sm100_Head128_Impl();
+        if (is_bf16_kvcache) {
+            // BF16 KV cache path
+            if (h_q == 64) {
+                impl = new Decode_Sm100_Head64_BF16_Impl();
+            } else if (h_q == 128) {
+                impl = new Decode_Sm100_Head64x2_BF16_Impl();
             } else {
-                TORCH_CHECK(false, "Unsupported d_qk: ", d_qk);
+                TORCH_CHECK(false, "Unsupported h_q: ", h_q);
             }
         } else {
-            TORCH_CHECK(false, "Unsupported h_q: ", h_q);
+            // FP8 KV cache path
+            if (h_q == 64) {
+                impl = new Decode_Sm100_Head64_Impl();
+            } else if (h_q == 128) {
+                if (d_qk == 576) {
+                    impl = new Decode_Sm100_Head64x2_Impl();
+                } else if (d_qk == 512) {
+                    impl = new Decode_Sm100_Head128_Impl();
+                } else {
+                    TORCH_CHECK(false, "Unsupported d_qk: ", d_qk);
+                }
+            } else {
+                TORCH_CHECK(false, "Unsupported h_q: ", h_q);
+            }
         }
     } else if (arch.is_sm90a()) {
+        TORCH_CHECK(!is_bf16_kvcache, "BF16 KV cache is not supported on SM90a for sparse decode");
         impl = new Decode_Sm90_Impl();
     } else {
         TORCH_CHECK(false, "Unsupported architecture for sparse decode fwd");
@@ -387,6 +486,7 @@ sparse_attn_decode_interface(
         sm_scale, sm_scale * LOG_2_E,
         num_blocks, page_block_size, topk,
         model_type,
+        is_bf16_kvcache,
 
         (bf16*)q.data_ptr(),
         (bf16*)kv.data_ptr(),
@@ -402,13 +502,16 @@ sparse_attn_decode_interface(
         ku::get_optional_tensor_ptr<int>(extra_topk_length),
 
         int64_stride_to_int(q.stride(0)), int64_stride_to_int(q.stride(1)), int64_stride_to_int(q.stride(2)),
-        int64_stride_to_int(kv.stride(0)), int64_stride_to_int(kv.stride(1)),
+        // For BF16: stride is in bf16 elements, need to convert to bytes for TMA
+        // For FP8: stride is already in bytes (tensor is uint8)
+        is_bf16_kvcache ? int64_stride_to_int(kv.stride(0) * 2) : int64_stride_to_int(kv.stride(0)),
+        is_bf16_kvcache ? int64_stride_to_int(kv.stride(1) * 2) : int64_stride_to_int(kv.stride(1)),
         int64_stride_to_int(indices.stride(0)), int64_stride_to_int(indices.stride(1)),
         int64_stride_to_int(lse.stride(0)), int64_stride_to_int(lse.stride(1)),
         int64_stride_to_int(out.stride(0)), int64_stride_to_int(out.stride(1)), int64_stride_to_int(out.stride(2)),
 
-        have_extra_kcache ? int64_stride_to_int(extra_kv->stride(0)) : 0,
-        have_extra_kcache ? int64_stride_to_int(extra_kv->stride(1)) : 0,
+        have_extra_kcache ? (is_bf16_kvcache ? int64_stride_to_int(extra_kv->stride(0) * 2) : int64_stride_to_int(extra_kv->stride(0))) : 0,
+        have_extra_kcache ? (is_bf16_kvcache ? int64_stride_to_int(extra_kv->stride(1) * 2) : int64_stride_to_int(extra_kv->stride(1))) : 0,
         have_extra_kcache ? int64_stride_to_int(extra_indices->stride(0)) : 0,
         have_extra_kcache ? int64_stride_to_int(extra_indices->stride(1)) : 0,
         at::cuda::getCurrentCUDAStream().stream()

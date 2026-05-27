@@ -102,6 +102,10 @@ ext_modules.append(
             "csrc/sm100/decode/head64/instantiations/v32.cu",
             "csrc/sm100/decode/head64/instantiations/model1.cu",
             "csrc/sm100/prefill/sparse/fwd_for_small_topk/head128/instantiations/phase1_decode_k512.cu",
+
+            # sm100 sparse decode bf16
+            "csrc/sm100/decode/head64_bf16/instantiations/v32.cu",
+            "csrc/sm100/decode/head64_bf16/instantiations/model1.cu",
         ],
         extra_compile_args={
             "cxx": cxx_args + get_features_args(),

@@ -151,7 +151,6 @@ def flash_mla_with_kvcache(
     if topk is not None:
         # Sparse attention
         assert not causal, "causal must be False when sparse attention is enabled"
-        assert is_fp8_kvcache, "is_fp8_kvcache must be True when sparse attention is enabled"
         out, lse, new_tile_scheduler_metadata, new_num_splits = flash_mla_cuda.sparse_decode_fwd(
             q, k_cache, indices_in_kvcache, topk_length, attn_sink,
             sched_meta.tile_scheduler_metadata, sched_meta.num_splits,
