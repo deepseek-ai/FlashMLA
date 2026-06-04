@@ -316,18 +316,24 @@ def run_flash_mla_sparse_fwd(p: TestParam, t: Testcase, return_p_sum: bool):
         topk_length=t.topk_length
     )
 
-def run_flash_mla_decode(p: TestParam, t: TestcaseForDecode, tile_scheduler_metadata, num_splits):
+def run_flash_mla_decode(p: TestParam, t: TestcaseForDecode, tile_scheduler_metadata, num_splits, is_bf16_kvcache: bool = False):
     assert p.decode is not None
+    if is_bf16_kvcache:
+        kv = t.kv_scope.blocked_k
+        extra_kv = t.extra_kv_scope.blocked_k if t.extra_kv_scope is not None else None
+    else:
+        kv = t.kv_scope.get_kvcache_for_flash_mla()
+        extra_kv = t.extra_kv_scope.get_kvcache_for_flash_mla() if t.extra_kv_scope is not None else None
     return flash_mla.flash_mla_with_kvcache(
         t.q,
-        t.kv_scope.get_kvcache_for_flash_mla(),
+        kv,
         None, None, p.d_v,
         tile_scheduler_metadata, num_splits,
 
-        t.sm_scale, False, True,
+        t.sm_scale, False, not is_bf16_kvcache,
         t.kv_scope.indices_in_kvcache,
         t.attn_sink,
-        t.extra_kv_scope.get_kvcache_for_flash_mla() if t.extra_kv_scope is not None else None,
+        extra_kv,
         t.extra_kv_scope.indices_in_kvcache if t.extra_kv_scope is not None else None,
         t.kv_scope.topk_length,
         t.extra_kv_scope.topk_length if t.extra_kv_scope is not None and t.extra_kv_scope.topk_length is not None else None

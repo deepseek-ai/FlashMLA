@@ -139,21 +139,22 @@ class Result:
 _counter = kk.Counter()
 
 @torch.inference_mode()
-def test_flash_mla(p: TestParam) -> Result:
+def test_flash_mla(p: TestParam, is_bf16_kvcache: bool = False) -> Result:
     if p.seed == -1:
         global _counter
         p.seed = _counter.next()
     assert p.decode
 
+    kvcache_mode = "BF16" if is_bf16_kvcache else "FP8"
     print("================")
-    print(f"Running on {p}")
+    print(f"Running [{kvcache_mode}] on {p}")
     torch.cuda.empty_cache()
 
     t = lib.generate_testcase_for_decode(p)
 
     tile_scheduler_metadata, _ = flash_mla.get_mla_metadata()
     def run_decode():
-        return lib.run_flash_mla_decode(p, t, tile_scheduler_metadata, None)
+        return lib.run_flash_mla_decode(p, t, tile_scheduler_metadata, None, is_bf16_kvcache=is_bf16_kvcache)
     
     # We first run the kernel once to generate output data for the correctness test
     # We must do this first, otherwise when allocating tensors for storing answers,
@@ -172,7 +173,7 @@ def test_flash_mla(p: TestParam) -> Result:
     else:
         result = kk.bench_kineto(run_decode, p.num_runs)
 
-        splitkv_kernel_name = "flash_fwd_splitkv_mla_fp8_sparse_kernel"
+        splitkv_kernel_name = "flash_fwd_splitkv_mla_bf16_sparse_kernel" if is_bf16_kvcache else "flash_fwd_splitkv_mla_fp8_sparse_kernel"
         combine_kernel_name = "flash_fwd_mla_combine_kernel"
         
         # Get individual kernel time usages
@@ -245,25 +246,32 @@ def main():
     raw_testcases = gen_testcase()
     testcases = [t.to_test_param() for t in raw_testcases]
 
-    print(f"{kk.colors['CYAN_BG']}{len(testcases)} testcases to run{kk.colors['CLEAR']}")
+    # Run each testcase for both FP8 and BF16 kvcache modes
+    kvcache_modes = [False, True]  # is_bf16_kvcache: False=FP8, True=BF16
+    total = len(testcases) * len(kvcache_modes)
+    print(f"{kk.colors['CYAN_BG']}{len(testcases)} testcases x {len(kvcache_modes)} kvcache modes = {total} runs{kk.colors['CLEAR']}")
 
     is_no_cooldown = lib.is_no_cooldown()
-    num_testcases_len = len(str(len(testcases)))
+    num_testcases_len = len(str(total))
     failed_cases = []
-    results: List[Tuple[TestParam, Result]] = []
-    for testcase_idx, testcase in enumerate(testcases):
-        if testcase != testcases[0] and testcase.num_runs > 0 and not is_no_cooldown:
-            time.sleep(0.3) # Cooldown
-        print(f"[{testcase_idx+1:{num_testcases_len}d}/{len(testcases)}, {testcase_idx/len(testcases)*100:3.0f}%]  ", end='')
-        result = test_flash_mla(testcase)
-        results.append((testcase, result))
-        if not result.is_correct:
-            failed_cases.append(testcase)
-            import sys
-            sys.exit(1)
+    results: List[Tuple[TestParam, bool, Result]] = []  # (testcase, is_bf16_kvcache, result)
+    run_idx = 0
+    for testcase in testcases:
+        for is_bf16_kvcache in kvcache_modes:
+            run_idx += 1
+            if run_idx > 1 and testcase.num_runs > 0 and not is_no_cooldown:
+                time.sleep(0.3) # Cooldown
+            print(f"[{run_idx:{num_testcases_len}d}/{total}, {run_idx/total*100:3.0f}%]  ", end='')
+            result = test_flash_mla(testcase, is_bf16_kvcache=is_bf16_kvcache)
+            results.append((testcase, is_bf16_kvcache, result))
+            if not result.is_correct:
+                failed_cases.append((testcase, is_bf16_kvcache))
+                import sys
+                sys.exit(1)
 
-    console = rich.console.Console(width=120)
+    console = rich.console.Console(width=130)
     table = rich.table.Table(show_header=True, header_style="bold cyan")
+    table.add_column("KV")
     table.add_column("topk")
     table.add_column("Bsz")
     table.add_column("h_q&k")
@@ -277,10 +285,11 @@ def main():
     table.add_column("us")
     table.add_column(" ")
 
-    for testcase, result in results:
+    for testcase, is_bf16_kvcache, result in results:
         assert testcase.decode
         topk_str = f"{testcase.topk}" if testcase.decode.extra_topk is None else f"{testcase.topk}+{testcase.decode.extra_topk}"
         table.add_row(
+            "B16" if is_bf16_kvcache else "FP8",
             topk_str,
             str(testcase.decode.b),
             f"{testcase.h_q:3d} {testcase.h_kv}",
@@ -300,16 +309,16 @@ def main():
         import numpy
         return numpy.exp(numpy.mean(numpy.log(l)))
     
-    num_correct_testcases = [result.is_correct for t, result in results if t.check_correctness].count(True)
-    num_correctness_cases = sum([1 for t in testcases if t.check_correctness])
+    num_correct_testcases = [result.is_correct for t, _, result in results if t.check_correctness].count(True)
+    num_correctness_cases = sum([1 for t, _, _ in results if t.check_correctness])
     if num_correct_testcases == num_correctness_cases:
         print(f"{kk.colors['GREEN_BG']}{num_correct_testcases}/{num_correctness_cases} correctness cases passed{kk.colors['CLEAR']}")
     else:
         print(f"{kk.colors['RED_BG']}{num_correct_testcases}/{num_correctness_cases} correctness cases passed{kk.colors['CLEAR']}")
-        for t in failed_cases:
-            print(f"\t{t},")
+        for t, is_bf16 in failed_cases:
+            print(f"\t[{'BF16' if is_bf16 else 'FP8'}] {t},")
 
-    valid_achieved_tflops = [result.achieved_tflops for _, result in results if result.achieved_tflops > 0.1]
+    valid_achieved_tflops = [result.achieved_tflops for _, _, result in results if result.achieved_tflops > 0.1]
     if len(valid_achieved_tflops) > 0:
         achieved_tflops_geomean = geomean(valid_achieved_tflops)    # > 0.1 to prune out correctness cases
         print(f"TFlops     geomean: {achieved_tflops_geomean:.1f}")
