@@ -31,8 +31,8 @@ void call_run_fmha_fwd([[maybe_unused]] Mask mask, [[maybe_unused]] Varlen is_va
 void FMHACutlassSM100FwdRun(at::Tensor workspace_buffer, at::Tensor q, at::Tensor k,
                             at::Tensor v, at::Tensor cumulative_seqlen_q,
                             at::Tensor cumulative_seqlen_kv, at::Tensor o, at::Tensor lse,
-                            int mask_mode_code, float sm_scale, int max_seqlen_q,
-                            int max_seqlen_kv, bool is_varlen) {
+                            int64_t mask_mode_code, double sm_scale, int64_t max_seqlen_q,
+                            int64_t max_seqlen_kv, bool is_varlen) {
   const c10::cuda::OptionalCUDAGuard device_guard(q.device());
   CHECK(q.scalar_type() == k.scalar_type());
   auto scalar_type_in = q.scalar_type();

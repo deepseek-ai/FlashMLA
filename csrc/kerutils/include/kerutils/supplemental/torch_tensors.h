@@ -2,7 +2,7 @@
 
 #include <functional>
 
-#include <torch/python.h>
+#include <torch/all.h>  // libtorch C++ API without pybind (Py_LIMITED_API-safe)
 
 #include "kerutils/common/common.h"
 

@@ -3,7 +3,9 @@ import dataclasses
 
 import torch
 
-import flash_mla.cuda as flash_mla_cuda
+# torch.ops.flash_mla is the op namespace registered by the _C extension (loaded in
+# __init__.py). Alias it to the old pybind module name so the call sites below are unchanged.
+flash_mla_cuda = torch.ops.flash_mla
 
 @dataclasses.dataclass
 class FlashMLASchedMeta:
@@ -69,6 +71,8 @@ def flash_mla_with_kvcache(
     extra_topk_length: Optional[torch.Tensor] = None
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
+    Run Dense Attention Decode Forward or Sparse Attention Decode Forward.
+
     Arguments:
         q: (batch_size, seq_len_q, num_heads_q, head_dim).
         k_cache: (num_blocks, page_block_size, num_heads_k, head_dim).
@@ -192,7 +196,7 @@ def flash_mla_sparse_fwd(
     topk_length: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    Sparse attention prefill kernel
+    Run Sparse Attention Prefill Forward.
 
     Args:
         q: [s_q, h_q, d_qk], bfloat16
@@ -392,6 +396,8 @@ def flash_attn_varlen_func(
     deterministic: bool = False,
     is_varlen: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Run Dense Attention Prefill Forward and Backward (cutlass FMHA)."""
+
     assert dropout_p == 0.0
     assert not deterministic
     return FlashAttnVarlenFunc.apply(

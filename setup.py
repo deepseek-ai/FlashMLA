@@ -169,6 +169,9 @@ ext_modules.append(
             Path(CUDA_HOME) / "targets" / "x86_64-linux" / "include" / "cccl",   # for cuda/std headers in CUDA 13+
             Path(CUDA_HOME) / "targets" / "sbsa-linux" / "include" / "cccl",
         ],
+        # Build against CPython's Limited API (abi3) so one wheel works across
+        # multiple CPython versions, which is possible now that pybind11 is gone
+        py_limited_api=True,
     )
 )
 
@@ -187,4 +190,5 @@ setup(
     packages=find_packages(include=['flash_mla']),
     ext_modules=ext_modules,
     cmdclass={"build_ext": BuildExtension},
+    options={"bdist_wheel": {"py_limited_api": "cp310"}},
 )

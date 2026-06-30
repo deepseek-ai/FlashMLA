@@ -34,19 +34,19 @@ static std::vector<at::Tensor> fused_norm_rope_attn_rope_cast_fwd(
     const at::Tensor &q,
     const at::Tensor &kv,
     const at::Tensor &indices,
-    float sm_scale,
-    int d_v,    // TODO change int to uint32_t
+    double sm_scale,
+    int64_t d_v,    // TODO handle like uint32_t; tho torch schema `int` requires int64_t here
     const std::optional<at::Tensor> &attn_sink,
     const std::optional<at::Tensor> &topk_length,
     bool enable_q_norm,
-    float rms_norm_eps,
+    double rms_norm_eps,
     const at::Tensor &token_positions,
     bool is_rope_neox_style,
-    uint32_t rope_dim,
+    int64_t rope_dim,
     const at::Tensor &cos_sin_cache,
 
-    uint32_t n_wv_group,
-    uint32_t num_per_channels,
+    int64_t n_wv_group,
+    int64_t num_per_channels,
     bool use_tma_aligned_col_major_sf,
     bool round_sf,
     bool use_packed_ue8m0
@@ -69,9 +69,9 @@ static std::vector<at::Tensor> fused_norm_rope_attn_rope_cast_fwd(
     int h_kv = kv.size(1);
     int d_qk = q.size(2);
     int topk = indices.size(2);
-    uint32_t wv_group_size = h_q / n_wv_group;
 
-    TORCH_CHECK(h_q % n_wv_group == 0, "h_q %% n_wv_group != 0");
+    TORCH_CHECK(n_wv_group > 0 && h_q % n_wv_group == 0, "n_wv_group <= 0 or h_q %% n_wv_group != 0");
+    uint32_t wv_group_size = static_cast<uint32_t>(h_q / n_wv_group);
     TORCH_CHECK(is_rope_neox_style == false, "Only `is_rope_neox_style == False` is supported");
     TORCH_CHECK(use_tma_aligned_col_major_sf == true, "`use_tma_aligned_col_major_sf` must be True");
     TORCH_CHECK(round_sf == true, "`round_sf` must be True");
@@ -128,7 +128,7 @@ static std::vector<at::Tensor> fused_norm_rope_attn_rope_cast_fwd(
     KU_CHECK_CONTIGUOUS(lse);
 
     Params params = {
-        s_q, s_kv, h_q, h_kv, d_qk, d_v, topk,
+        s_q, s_kv, h_q, h_kv, d_qk, static_cast<int>(d_v), topk,
         sm_scale, sm_scale * LOG_2_E,
 
         (bf16*)q.data_ptr(),
@@ -152,12 +152,12 @@ static std::vector<at::Tensor> fused_norm_rope_attn_rope_cast_fwd(
         rms_norm_eps,
         (uint32_t*)token_positions.data_ptr(),
         is_rope_neox_style,
-        rope_dim,
+        static_cast<uint32_t>(rope_dim),
         (float*)cos_sin_cache.data_ptr(),
 
-        n_wv_group,
+        static_cast<uint32_t>(n_wv_group),
         wv_group_size,
-        num_per_channels,
+        static_cast<uint32_t>(num_per_channels),
         use_tma_aligned_col_major_sf,
         round_sf,
         use_packed_ue8m0,
@@ -183,22 +183,22 @@ static std::vector<at::Tensor> fused_norm_rope_attn_rope_cast_decode(
     const at::Tensor &q,        // [s_q, h_q, d_qk]
     const at::Tensor &kv,       // [num_blocks, page_block_size, h_kv, bytes_per_token], paged quantized KV cache
     const at::Tensor &indices,  // [s_q, topk]
-    float sm_scale,
-    int d_v,
+    double sm_scale,
+    int64_t d_v,
     const std::optional<at::Tensor> &attn_sink,         // [h_q]
     const std::optional<at::Tensor> &topk_length,       // [s_q]
     const std::optional<at::Tensor> &extra_kv,          // [extra_num_blocks, extra_page_block_size, h_kv, bytes_per_token]
     const std::optional<at::Tensor> &extra_indices,     // [s_q, extra_topk]
     const std::optional<at::Tensor> &extra_topk_length, // [s_q]
     bool enable_q_norm,
-    float rms_norm_eps,
+    double rms_norm_eps,
     const at::Tensor &token_positions,  // [s_q]
     bool is_rope_neox_style,
-    uint32_t rope_dim,
+    int64_t rope_dim,
     const at::Tensor &cos_sin_cache,    // [*, rope_dim]
 
-    uint32_t n_wv_group,
-    uint32_t num_per_channels,
+    int64_t n_wv_group,
+    int64_t num_per_channels,
     bool use_tma_aligned_col_major_sf,
     bool round_sf,
     bool use_packed_ue8m0
@@ -243,8 +243,8 @@ static std::vector<at::Tensor> fused_norm_rope_attn_rope_cast_decode(
     TORCH_CHECK(d_qk == 512, "Only head_size_k == 512 (V4 / V4.1) is supported");
     TORCH_CHECK(d_v == 512, "Only head_size_v == 512 is supported");
     TORCH_CHECK(topk > 0);
-    TORCH_CHECK(h_q % n_wv_group == 0, "h_q %% n_wv_group != 0");
-    uint32_t wv_group_size = h_q / n_wv_group;
+    TORCH_CHECK(n_wv_group > 0 && h_q % n_wv_group == 0, "n_wv_group <= 0 or h_q %% n_wv_group != 0");
+    uint32_t wv_group_size = static_cast<uint32_t>(h_q / n_wv_group);
 
     if (have_extra_kvcache) {
         TORCH_CHECK(extra_indices.has_value(), "extra_indices must be provided when extra_kv is provided");
@@ -335,7 +335,7 @@ static std::vector<at::Tensor> fused_norm_rope_attn_rope_cast_decode(
     KU_CHECK_CONTIGUOUS(lse);
 
     SparseAttnDecodeParams base_params = {
-        1 /* b */, s_q, h_q, h_kv, d_qk, d_v,
+        1 /* b */, s_q, h_q, h_kv, d_qk, static_cast<int>(d_v),
         sm_scale, sm_scale * LOG_2_E,
         num_blocks, page_block_size, topk,
         model_type, extra_model_type,
@@ -376,12 +376,12 @@ static std::vector<at::Tensor> fused_norm_rope_attn_rope_cast_decode(
         rms_norm_eps,
         (uint32_t*)token_positions.data_ptr(),
         is_rope_neox_style,
-        rope_dim,
+        static_cast<uint32_t>(rope_dim),
         (float*)cos_sin_cache.data_ptr(),
 
-        n_wv_group,
+        static_cast<uint32_t>(n_wv_group),
         wv_group_size,
-        num_per_channels,
+        static_cast<uint32_t>(num_per_channels),
         use_tma_aligned_col_major_sf,
         round_sf,
         use_packed_ue8m0,
@@ -413,8 +413,8 @@ static std::vector<at::Tensor> fused_norm_rope_attn_rope_cast_decode(
 static std::vector<at::Tensor> permute_q_b_proj(
     const at::Tensor &q_b_proj,
     const at::Tensor &scale_factors,
-    int h_q,
-    int d_q
+    int64_t h_q,
+    int64_t d_q
 ) {
     KU_CHECK_NDIM(q_b_proj, 2);
     KU_CHECK_NDIM(scale_factors, 2);
@@ -472,8 +472,8 @@ static std::vector<at::Tensor> permute_q_b_proj(
 static std::vector<at::Tensor> permute_wv_proj(
     const at::Tensor &wv_proj,
     const at::Tensor &scale_factors,
-    int wv_group_size,
-    int d_o
+    int64_t wv_group_size,
+    int64_t d_o
 ) {
     KU_CHECK_NDIM(wv_proj, 3);
     KU_CHECK_NDIM(scale_factors, 3);
@@ -533,15 +533,9 @@ static std::vector<at::Tensor> permute_wv_proj(
 }
 
 
-void register_fused_norm_rope_attn_rope_cast_fwd(pybind11::module_& m) {
-    m.def("fused_norm_rope_attn_rope_cast_fwd", 
-        &fused_norm_rope_attn_rope_cast_fwd, 
-        "Run Fused Norm + RoPE + Core Attn + RoPE + Cast");
-    m.def("fused_norm_rope_attn_rope_cast_decode",
-        &fused_norm_rope_attn_rope_cast_decode,
-        "Run Fused Norm + RoPE + Core Attn + RoPE + Cast (Decoding, with paged quantized KV cache)");
-    m.def("permute_q_b_proj", &permute_q_b_proj,
-        "Permute q_b_proj weight layout for fused norm rope attn rope cast fwd");
-    m.def("permute_wv_proj", &permute_wv_proj,
-        "Permute wv_proj weight layout for fused norm rope attn rope cast fwd");
+TORCH_LIBRARY_IMPL(flash_mla, CUDA, m) {
+    m.impl("fused_norm_rope_attn_rope_cast_fwd", &fused_norm_rope_attn_rope_cast_fwd);
+    m.impl("fused_norm_rope_attn_rope_cast_decode", &fused_norm_rope_attn_rope_cast_decode);
+    m.impl("permute_q_b_proj", &permute_q_b_proj);
+    m.impl("permute_wv_proj", &permute_wv_proj);
 }

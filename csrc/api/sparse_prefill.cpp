@@ -96,8 +96,8 @@ static std::vector<at::Tensor> sparse_attn_prefill_interface(
     const at::Tensor &q,
     const at::Tensor &kv,
     const at::Tensor &indices,
-    float sm_scale,
-    int d_v,
+    double sm_scale,
+    int64_t d_v,
     const std::optional<at::Tensor> &attn_sink,
     const std::optional<at::Tensor> &topk_length
 ) {
@@ -236,8 +236,6 @@ static std::vector<at::Tensor> sparse_attn_prefill_interface(
     return {out, max_logits, lse};
 }
 
-void register_sparse_prefill(pybind11::module_& m) {
-    m.def("sparse_prefill_fwd",
-        &sparse_attn_prefill_interface,
-        "Run Sparse Attention Prefill Forward");
+TORCH_LIBRARY_IMPL(flash_mla, CUDA, m) {
+    m.impl("sparse_prefill_fwd", &sparse_attn_prefill_interface);
 }

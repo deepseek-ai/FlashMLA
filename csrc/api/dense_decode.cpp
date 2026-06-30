@@ -10,15 +10,15 @@
 
 static std::tuple<at::Tensor, at::Tensor, std::optional<at::Tensor>, std::optional<at::Tensor>>
 dense_attn_decode_interface(
-    at::Tensor &q,                               // batch_size x seqlen_q x num_heads x head_size
+    at::Tensor q,                                // batch_size x seqlen_q x num_heads x head_size
     const at::Tensor &kcache,                    // num_blocks x page_block_size x num_heads_k x head_size (when is_fp8 is False) or num_blocks x num_heads_k x (page_block_size*656) (when is_fp8 is True)
-    const int head_size_v,
+    const int64_t head_size_v,
     const at::Tensor &seqlens_k,                 // batch_size
     const at::Tensor &block_table,               // batch_size x max_num_blocks_per_seq
-    const float softmax_scale,
+    const double softmax_scale,
     bool is_causal,
-    std::optional<at::Tensor> &tile_scheduler_metadata,   // num_sm_parts x (DecodingSchedMetaSize/4)
-    std::optional<at::Tensor> &num_splits                 // batch_size + 1
+    std::optional<at::Tensor> tile_scheduler_metadata,    // num_sm_parts x (DecodingSchedMetaSize/4)
+    std::optional<at::Tensor> num_splits                  // batch_size + 1
 ) {
     // Check arch
     Arch arch = Arch();
@@ -222,8 +222,6 @@ dense_attn_decode_interface(
     return {out, lse, tile_scheduler_metadata, num_splits};
 }
 
-void register_dense_decode(pybind11::module_& m) {
-    m.def("dense_decode_fwd",
-        &dense_attn_decode_interface,
-        "Run Dense Attention Decode Forward");
+TORCH_LIBRARY_IMPL(flash_mla, CUDA, m) {
+    m.impl("dense_decode_fwd", &dense_attn_decode_interface);
 }

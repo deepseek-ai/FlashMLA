@@ -224,13 +224,13 @@ sparse_attn_decode_interface(
     const at::Tensor &indices,    // [b, s_q, topk]
     const std::optional<at::Tensor> &topk_length,   // [b, s_q]
     const std::optional<at::Tensor> &attn_sink, // [h_q]
-    std::optional<at::Tensor> &tile_scheduler_metadata,   // num_sm_parts x (DecodingSchedMetaSize/4)
-    std::optional<at::Tensor> &num_splits,                // batch_size + 1
+    std::optional<at::Tensor> tile_scheduler_metadata,    // num_sm_parts x (DecodingSchedMetaSize/4)
+    std::optional<at::Tensor> num_splits,                 // batch_size + 1
     const std::optional<at::Tensor> &extra_kv,
     const std::optional<at::Tensor> &extra_indices,
     const std::optional<at::Tensor> &extra_topk_length,
-    int d_v,
-    float sm_scale
+    int64_t d_v,
+    double sm_scale
 ) {
     using bf16 = cutlass::bfloat16_t;
 
@@ -535,8 +535,6 @@ sparse_attn_decode_interface(
     return {out, lse.transpose(1, 2), tile_scheduler_metadata, num_splits};
 }
 
-void register_sparse_decode(pybind11::module_& m) {
-    m.def("sparse_decode_fwd",
-        &sparse_attn_decode_interface,
-        "Run Sparse Attention Decode Forward");
+TORCH_LIBRARY_IMPL(flash_mla, CUDA, m) {
+    m.impl("sparse_decode_fwd", &sparse_attn_decode_interface);
 }

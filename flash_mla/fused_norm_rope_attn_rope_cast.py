@@ -2,7 +2,9 @@ from typing import Optional, Tuple
 
 import torch
 
-import flash_mla.cuda as flash_mla_cuda
+# The extension is loaded in flash_mla.__init__, where it registers these
+# custom operators.
+flash_mla_cuda = torch.ops.flash_mla
 
 
 def prefill(
@@ -29,6 +31,8 @@ def prefill(
     topk_length: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
+    Run Fused Norm + RoPE + Core Attn + RoPE + Cast.
+
     A fused kernel for Q Norm + Q RoPE + Core Attn (sparse attention) + O RoPE + O cast to FP8, for DeepSeek-V4 & DeepSeek-V4.1
     Only support sm100 / sm103 GPU architecture.
 
@@ -106,6 +110,8 @@ def decode(
     extra_topk_length: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
+    Run Fused Norm + RoPE + Core Attn + RoPE + Cast (Decoding, with paged quantized KV cache).
+
     Fused Decoding kernel: Q Norm + Q RoPE + Core Attn (decode, with paged FP8 KV cache) + O RoPE + O cast to FP8, for DeepSeek-V4 & DeepSeek-V4.1
     Only support sm100 / sm103 GPU architecture.
 
@@ -162,6 +168,8 @@ def permute_q_b_proj(
     d_q: int,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
+    Permute q_b_proj weight layout for fused norm rope attn rope cast fwd.
+
     Permute the layout of the q_b_proj weight and its scale factors into the layout required by
     fused_norm_rope_attn_rope_cast_fwd / fused_norm_rope_attn_rope_cast_decode.
 
@@ -185,6 +193,8 @@ def permute_wv_proj(
     d_o: int,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
+    Permute wv_proj weight layout for fused norm rope attn rope cast fwd.
+
     Permute the layout of the wv_proj weight and its scale factors into the layout required by
     fused_norm_rope_attn_rope_cast_fwd / fused_norm_rope_attn_rope_cast_decode.
     Note: regardless of the input quantization granularity, the output granularity is always 32.
