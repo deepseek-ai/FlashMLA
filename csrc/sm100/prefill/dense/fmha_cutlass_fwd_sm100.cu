@@ -72,12 +72,15 @@ void FMHACutlassSM100FwdRun(at::Tensor workspace_buffer, at::Tensor q, at::Tenso
                           cumulative_seqlen_q, cumulative_seqlen_kv, o, lse, sm_scale,
                           max_seqlen_q, max_seqlen_kv);
       } else {
-        std::cout << "No kernel instantiated for head_dim_qk=" << head_dim_qk
-                  << " head_dim_vo=" << head_dim_vo << std::endl;
+        TORCH_CHECK(false,
+                    "No kernel instantiated for head_dim_qk=", head_dim_qk,
+                    " head_dim_vo=", head_dim_vo,
+                    ". Supported combinations: (192, 128) and (128, 128).");
       }
     });
 
   } else {
-    FLASH_MLA_ASSERT(false);
+    TORCH_CHECK(false, "Unsupported dtype for SM100 dense prefill fwd. "
+                "Expected BFloat16, got q: ", scalar_type_in, ", o: ", scalar_type_out);
   }
 }
