@@ -1,4 +1,8 @@
-__version__ = "1.0.0"
+try:
+    from importlib.metadata import version as _get_version
+    __version__ = _get_version("flash_mla")
+except (ImportError, ModuleNotFoundError):
+    from flash_mla._version import __version__
 
 from flash_mla.flash_mla_interface import (
     get_mla_metadata,

@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+# torch is NOT listed above because pip's isolated build would pull a CPU-only
+# wheel from PyPI, which lacks CUDA support. FlashMLA requires a CUDA-capable
+# torch pre-installed in the target environment before building.
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "flash_mla"
+dynamic = ["version"]
+description = "DeepSeek's library of optimized attention kernels, powering DeepSeek-V3 and DeepSeek-V3.2-Exp models"
+readme = "README.md"
+license = {text = "MIT"}
+authors = [
+    {name = "DeepSeek"},
+]
+requires-python = ">=3.8"
+dependencies = [
+    "torch",
+]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+]
+
+[project.urls]
+Homepage = "https://github.com/deepseek-ai/FlashMLA"
+Repository = "https://github.com/deepseek-ai/FlashMLA"
+
+# [tool.setuptools.dynamic] is intentionally omitted.
+# Version is computed in setup.py (base from flash_mla/_version.py + git hash).
+# The attr directive is unusable here: importing any flash_mla submodule
+# triggers __init__.py, which imports the C extension that is not yet built.
