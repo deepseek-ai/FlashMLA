@@ -45,6 +45,96 @@ char load_indices_and_generate_mask(
 
 
 /*
+Derive an "effective topk_length" for one row of the indices tensor when the `topk_length`
+argument is not provided, by locating the last valid index (i.e. 0 <= index < s_kv) in the row.
+
+Trailing k-blocks that contain no valid index can then be skipped entirely (exactly as if the
+caller had passed `topk_length`), instead of being masked: a fully-masked k-block still runs
+both GEMMs and the whole softmax pass, so with heavily padded rows (e.g. indices padded with
+-1 to a fixed width) this wastes a full compute iteration per padded k-block. Invalid indices
+that appear before the last valid one are still handled by the regular masking path, so this
+is safe for arbitrary (not necessarily front-packed) index layouts.
+
+The scan starts from the tail and inspects 256 indices (2 int4 chunks per lane) per round, so
+it usually finishes within the first round. To keep the first round's memory latency off the
+critical path, its loads are issued separately (issue_topk_length_scan) at the very beginning
+of the kernel, so that they are in flight while the prologue runs, and are only consumed
+(get_effective_topk_length) after the prologue's __syncthreads(). Later rounds load on demand;
+they only happen for rows whose padding exceeds 256 indices, which then save whole k-blocks.
+
+Must be called with all 32 lanes of a warp active; every warp computes the same value from the
+same read-only global data, so the result is uniform across the CTA (and the cluster) without
+any extra synchronization.
+*/
+constexpr int TOPK_SCAN_CHUNKS_PER_LANE = 2;
+constexpr int TOPK_SCAN_CHUNKS_PER_ROUND = 32 * TOPK_SCAN_CHUNKS_PER_LANE;
+
+CUTE_DEVICE
+void issue_topk_length_scan(
+    const int* gIndices,
+    int topk,
+    int4 (&round0_chunks)[TOPK_SCAN_CHUNKS_PER_LANE]
+) {
+    const int lane_idx = threadIdx.x % 32;
+    // topk % B_TOPK == 0 is guaranteed by the launcher, so int4 loads are safe
+    int round_end = topk/4, round_start = max(round_end - TOPK_SCAN_CHUNKS_PER_ROUND, 0);
+    CUTE_UNROLL
+    for (int i = 0; i < TOPK_SCAN_CHUNKS_PER_LANE; ++i) {
+        int chunk_idx = round_start + i*32 + lane_idx;
+        round0_chunks[i] = chunk_idx < round_end ?
+            __ldg((const int4*)gIndices + chunk_idx) : make_int4(-1, -1, -1, -1);
+    }
+}
+
+CUTE_DEVICE
+int get_effective_topk_length(
+    const int* gIndices,
+    int topk,
+    int s_kv,
+    const int4 (&round0_chunks)[TOPK_SCAN_CHUNKS_PER_LANE]
+) {
+    const int lane_idx = threadIdx.x % 32;
+    auto get_last_valid_pos_in_chunk = [&](int4 chunk, int chunk_idx) -> int {
+        auto is_valid = [&](int index) -> bool { return index >= 0 && index < s_kv; };
+        return is_valid(chunk.w) ? chunk_idx*4 + 3 :
+               is_valid(chunk.z) ? chunk_idx*4 + 2 :
+               is_valid(chunk.y) ? chunk_idx*4 + 1 :
+               is_valid(chunk.x) ? chunk_idx*4 : -1;
+    };
+    auto reduce_round = [&](int round_start, int round_end, auto get_chunk) -> int {
+        int last_valid_pos = -1;
+        CUTE_UNROLL
+        for (int i = 0; i < TOPK_SCAN_CHUNKS_PER_LANE; ++i) {
+            int chunk_idx = round_start + i*32 + lane_idx;
+            if (chunk_idx < round_end) {
+                last_valid_pos = max(last_valid_pos, get_last_valid_pos_in_chunk(get_chunk(i, chunk_idx), chunk_idx));
+            }
+        }
+        return __reduce_max_sync(0xffffffff, last_valid_pos);
+    };
+
+    // Round 0 (the trailing 256 indices) consumes the loads pre-issued by issue_topk_length_scan
+    int round_start = max(topk/4 - TOPK_SCAN_CHUNKS_PER_ROUND, 0);
+    int last_valid_pos = reduce_round(round_start, topk/4,
+        [&](int i, int chunk_idx) { return round0_chunks[i]; });
+    if (last_valid_pos >= 0) {
+        return last_valid_pos + 1;
+    }
+
+    // Later rounds load on demand
+    CUTE_NO_UNROLL
+    for (int round_end = round_start; round_end > 0; round_end -= TOPK_SCAN_CHUNKS_PER_ROUND) {
+        last_valid_pos = reduce_round(max(round_end - TOPK_SCAN_CHUNKS_PER_ROUND, 0), round_end,
+            [&](int i, int chunk_idx) { return __ldg((const int4*)gIndices + chunk_idx); });
+        if (last_valid_pos >= 0) {
+            return last_valid_pos + 1;
+        }
+    }
+    return 0;
+}
+
+
+/*
 Get P from Tensor Memory, reduce P within shared memory, perform masking, and store back if necessary
 
 Initially, since dual gemm is used, we have two P pieces in Tensor Memory, one occupying rows 0 ~ 63 while the other occupying rows 64 ~ 127. We'd like to have them reduced into one single P piece, stored in registers with layout:
