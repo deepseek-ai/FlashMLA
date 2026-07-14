@@ -101,7 +101,7 @@ using SmemLayoutOBuf_TMA = decltype(tile_to_shape(
 static_assert(D_V == 512);
 using SmemLayoutOAccumBuf = Layout<
     Shape<Int<B_H>, Int<D_V>>,
-    Stride<Int<520>, _1>	// We use stride = 520 here to avoid bank conflict
+    Stride<Int<516>, _1>	// We use stride = 516 here to avoid bank conflict
 >;
 
 using SmemLayoutS = decltype(tile_to_shape(
