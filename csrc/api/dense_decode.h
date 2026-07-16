@@ -19,6 +19,7 @@ dense_attn_decode_interface(
     const at::Tensor &block_table,               // batch_size x max_num_blocks_per_seq
     const float softmax_scale,
     bool is_causal,
+    int window_size,                                      // SWA: causal sliding-window width; <=0 disables (full causal)
     std::optional<at::Tensor> &tile_scheduler_metadata,   // num_sm_parts x (DecodingSchedMetaSize/4)
     std::optional<at::Tensor> &num_splits                 // batch_size + 1
 ) {
@@ -133,6 +134,7 @@ dense_attn_decode_interface(
     params.num_blocks = num_blocks;
     params.q_head_per_hk = num_q_heads_per_hk;
     params.is_causal = is_causal;
+    params.window_size = window_size;
     params.d = head_size_k;
     params.d_v = head_size_v;
     params.scale_softmax = softmax_scale;

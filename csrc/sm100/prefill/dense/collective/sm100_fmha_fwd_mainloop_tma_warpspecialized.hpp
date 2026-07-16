@@ -197,6 +197,9 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
 
     // scaling factor to quantize O
     float inv_scale_o = 1.0f;
+
+    // SWA: causal sliding-window width. <=0 disables (plain causal).
+    int window_size = -1;
   };
 
   struct Params {
@@ -206,6 +209,8 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
     float scale_softmax_log2;
 
     float scale_output;
+
+    int window_size;
   };
 
   template<class ProblemShape>
@@ -229,7 +234,8 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
         Load::to_underlying_arguments(problem_shape, args.load, workspace),
         args.scale_q * args.scale_k * scale_softmax,
         args.scale_q * args.scale_k * log2_e * scale_softmax,
-        args.scale_v * args.inv_scale_o
+        args.scale_v * args.inv_scale_o,
+        args.window_size
     };
   }
 
@@ -269,7 +275,7 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
     auto pipeline_q_release_state = pipeline_q_consumer_state;
     auto pipeline_kv_release_state = pipeline_kv_consumer_state;
 
-    int mask_tile_count = Mask{}.get_trip_count(blk_coord, TileShape{}, problem_shape);
+    int mask_tile_count = Mask{}.get_trip_count(blk_coord, TileShape{}, problem_shape, params.window_size);
 
     typename CollectiveMmaQK::TiledMma mma_qk;
     ThrMMA thr_mma_qk = mma_qk.get_slice(0);
@@ -569,7 +575,7 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
     copy(tiled_tmem_load, tTMEM_LOADtS, tTMEM_LOADrS);
 
     if constexpr (need_apply_mask) {
-      Mask{}.apply_mask(tTMEM_LOADrS, tTMEM_LOADcS, problem_shape);
+      Mask{}.apply_mask(tTMEM_LOADrS, tTMEM_LOADcS, problem_shape, params.window_size);
     }
 
     ElementQK old_row_max = row_max;
@@ -720,7 +726,11 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
       PipelineC& pipeline_c, typename PipelineC::PipelineState& pipeline_c_producer_state,
       OrderBarrierSoftmax& order_s) {
 
-    int mask_tile_count = Mask{}.get_unmasked_trip_count(blk_coord, TileShape{}, problem_shape);
+    // SWA: when window active, get_unmasked_trip_count == 0 (all tiles need
+    // masking) so the unmasked loop is skipped and every tile goes through the
+    // masked loop below (apply_mask), covering both the causal diagonal and the
+    // window lower edge.
+    int mask_tile_count = Mask{}.get_unmasked_trip_count(blk_coord, TileShape{}, problem_shape, params.window_size);
 
     ElementQK row_max = -INFINITY;
     ElementQK row_sum = 0;
@@ -739,7 +749,7 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
       softmax_step<false /* need_apply_mask */>(
           row_max, row_sum, stage,
           (mask_tile_count == 1) &&
-              (Mask{}.get_masked_trip_count(blk_coord, TileShape{}, problem_shape) == 0),
+              (Mask{}.get_masked_trip_count(blk_coord, TileShape{}, problem_shape, params.window_size) == 0),
           blk_coord, cS, params, problem_shape,
           pipeline_s, pipeline_s_consumer_state,
           pipeline_c, pipeline_c_producer_state,
@@ -750,7 +760,7 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
     }
 
     // Masked iterations
-    mask_tile_count = Mask{}.get_masked_trip_count(blk_coord, TileShape{}, problem_shape);
+    mask_tile_count = Mask{}.get_masked_trip_count(blk_coord, TileShape{}, problem_shape, params.window_size);
 
     CUTLASS_PRAGMA_NO_UNROLL
     for (; mask_tile_count > 0; mask_tile_count -= 1) {
@@ -963,7 +973,7 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
       PipelineE& pipeline_epi, typename PipelineE::PipelineState& pipeline_epi_producer_state,
       CollectiveEpilogue& epilogue) {
 
-    int mask_tile_count = Mask{}.get_trip_count(blk_coord, TileShape{}, problem_shape);
+    int mask_tile_count = Mask{}.get_trip_count(blk_coord, TileShape{}, problem_shape, params.window_size);
 
     int thread_idx = threadIdx.x % (4 * cutlass::NumThreadsPerWarp);
 

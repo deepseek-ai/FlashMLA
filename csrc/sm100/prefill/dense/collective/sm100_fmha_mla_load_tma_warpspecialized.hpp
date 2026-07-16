@@ -88,13 +88,15 @@ struct Sm100MlaFwdLoadTmaWarpspecialized {
     TMA_Q tma_load_q;
     TMA_K tma_load_k;
     TMA_V tma_load_v;
+    int window_size = -1;   // SWA: forwarded from the mainloop to skip leading K/V tiles
   };
 
   template<class ProblemShape>
   static Params to_underlying_arguments(
       ProblemShape const& problem_shape,
       Arguments const& args,
-      void* workspace) {
+      void* workspace,
+      int window_size = -1) {
 
     auto ptr_Q = args.ptr_Q;
     auto ptr_K = args.ptr_K;
@@ -141,7 +143,8 @@ struct Sm100MlaFwdLoadTmaWarpspecialized {
     return Params{
         params_qk.tma_load_a,
         params_qk.tma_load_b,
-        params_pv.tma_load_b
+        params_pv.tma_load_b,
+        window_size
     };
   }
 
@@ -168,7 +171,11 @@ struct Sm100MlaFwdLoadTmaWarpspecialized {
     auto problem_shape_qk = replace<2>(problem_shape, get<2, 0>(problem_shape) + get<2, 1>(problem_shape));
     auto problem_shape_v = replace<2>(problem_shape, get<2, 0>(problem_shape));
 
-    int mask_tile_count = Mask{}.get_trip_count(blk_coord_in, TileShape{}, problem_shape);
+    // SWA: skip leading out-of-window K/V tiles. Start the gmem tile cursor at
+    // swa_trip_start and load only (get_trip_count - swa_trip_start) tiles, in
+    // lockstep with mma/softmax/correction which subtract the same start.
+    int swa_trip_start = Mask{}.get_trip_start(blk_coord_in, TileShape{}, problem_shape, params.window_size);
+    int mask_tile_count = Mask{}.get_trip_count(blk_coord_in, TileShape{}, problem_shape, params.window_size) - swa_trip_start;
 
     using X = Underscore;
 
@@ -261,7 +268,7 @@ struct Sm100MlaFwdLoadTmaWarpspecialized {
     ++pipeline_q_producer_state;
 
     // K1
-    int k_index = 0;
+    int k_index = swa_trip_start;   // SWA: first in-window K/V tile (0 if no window)
     pipeline_kv.producer_acquire(pipeline_kv_producer_state);
     if (lane_predicate) {
       auto tma_barrier = pipeline_kv.producer_get_barrier(pipeline_kv_producer_state);

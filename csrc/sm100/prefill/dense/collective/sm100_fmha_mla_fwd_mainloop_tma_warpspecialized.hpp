@@ -215,6 +215,14 @@ struct Sm100MlaFwdMainloopTmaWarpspecialized {
 
     // scaling factor to quantize O
     float inv_scale_o = 1.0f;
+
+    // SWA: causal sliding-window width. <=0 disables (plain causal). When >0,
+    // each query attends only to the last `window_size` keys (q-W < k <= q).
+    int window_size = -1;
+
+    // gpt-oss attention sink: per-head [h_q] learnable logit folded into the softmax
+    // denominator (value-less). nullptr disables. Makes O + LSE sink-aware in-kernel.
+    const float* sink_bias = nullptr;
   };
 
   struct Params {
@@ -224,6 +232,9 @@ struct Sm100MlaFwdMainloopTmaWarpspecialized {
     float scale_softmax_log2;
 
     float scale_output;
+
+    int window_size;
+    const float* sink_bias;
   };
 
   template<class ProblemShape>
@@ -244,10 +255,12 @@ struct Sm100MlaFwdMainloopTmaWarpspecialized {
     float log2_e = static_cast<float>(std::log2(std::exp(1.0)));
 
     return Params{
-        Load::to_underlying_arguments(problem_shape, args.load, workspace),
+        Load::to_underlying_arguments(problem_shape, args.load, workspace, args.window_size),
         args.scale_q * args.scale_k * scale_softmax,
         args.scale_q * args.scale_k * log2_e * scale_softmax,
-        args.scale_v * args.inv_scale_o
+        args.scale_v * args.inv_scale_o,
+        args.window_size,
+        args.sink_bias
     };
   }
 
@@ -287,7 +300,12 @@ struct Sm100MlaFwdMainloopTmaWarpspecialized {
     auto pipeline_q_release_state = pipeline_q_consumer_state;
     auto pipeline_kv_release_state = pipeline_kv_consumer_state;
 
-    int mask_tile_count = Mask{}.get_trip_count(blk_coord, TileShape{}, problem_shape);
+    // SWA safe-baseline: window_size is passed through but get_trip_count keeps
+    // the full causal count (no leading-tile skip); apply_mask zeros out-of-window
+    // keys. mma/softmax/correction/load all use the same count -> pipelines stay
+    // in lockstep.
+    int mask_tile_count = Mask{}.get_trip_count(blk_coord, TileShape{}, problem_shape, params.window_size)
+                        - Mask{}.get_trip_start(blk_coord, TileShape{}, problem_shape, params.window_size);
 
     typename CollectiveMmaQK::TiledMma mma_qk;
     ThrMMA thr_mma_qk = mma_qk.get_slice(0);
@@ -589,7 +607,7 @@ struct Sm100MlaFwdMainloopTmaWarpspecialized {
 
     if constexpr (need_mask) {
       if(need_apply_mask) {
-        Mask{}.apply_mask(tTMEM_LOADrS, tTMEM_LOADcS, problem_shape);
+        Mask{}.apply_mask(tTMEM_LOADrS, tTMEM_LOADcS, problem_shape, params.window_size);
       }
     }
 
@@ -724,6 +742,18 @@ struct Sm100MlaFwdMainloopTmaWarpspecialized {
       // re-acquire the S part in the final step
       pipeline_s.consumer_wait(pipeline_s_consumer_state);
 
+      // gpt-oss attention sink: fold a per-head value-less logit into the denominator.
+      // row_sum = sum exp(scale_softmax*(S - row_max)); O-scale = scale_output/row_sum and
+      // LSE = log(row_sum) + scale_softmax*row_max (see correction_epilogue), so adding
+      // exp(sink - scale_softmax*row_max) here makes both O and LSE sink-aware. row_max is
+      // finite for any attended (causal) row; masked-only rows are not used.
+      if (params.sink_bias != nullptr && row_max != -INFINITY) {
+        // flat q-head index = crd2idx of the head coord (h_r,h_k); get<2,1> is batch (cf.
+        // the LSE write). For per-head MLA training (h_r=1) this is just the kv-head index.
+        int head = crd2idx(get<2,0>(blk_coord), get<3,0>(problem_shape));
+        row_sum += ::expf(params.sink_bias[head] - params.scale_softmax * row_max);
+      }
+
       Tensor tTMEM_STOREVrS = make_tensor<ElementQK>(shape(tTMEM_STOREVcS));
       tTMEM_STOREVrS(kIdxFinalRowMax) = row_max;
       tTMEM_STOREVrS(kIdxFinalRowSum) = row_sum;
@@ -740,8 +770,14 @@ struct Sm100MlaFwdMainloopTmaWarpspecialized {
       PipelineS& pipeline_s, typename PipelineS::PipelineState& pipeline_s_consumer_state,
       PipelineC& pipeline_c, typename PipelineC::PipelineState& pipeline_c_producer_state,
       OrderBarrierSoftmax& order_s) {
-    const int mask_trip_count = Mask{}.get_masked_trip_count(blk_coord, TileShape{}, problem_shape);
-    const int total_trip_count = Mask{}.get_trip_count(blk_coord, TileShape{}, problem_shape);
+    // SWA: skip leading out-of-window K-tiles. swa_trip_start is the first tile
+    // any query in this block attends to; we drop the [0, swa_trip_start) tiles
+    // from the count (the load warp + cS cursor below start there too). With the
+    // window active get_masked_trip_count == get_trip_count, so masked == total
+    // after the shift -> apply_mask runs on every kept tile (window edge + diagonal).
+    const int swa_trip_start = Mask{}.get_trip_start(blk_coord, TileShape{}, problem_shape, params.window_size);
+    const int mask_trip_count = Mask{}.get_masked_trip_count(blk_coord, TileShape{}, problem_shape, params.window_size) - swa_trip_start;
+    const int total_trip_count = Mask{}.get_trip_count(blk_coord, TileShape{}, problem_shape, params.window_size) - swa_trip_start;
     int trip_idx = total_trip_count;
 
     ElementQK row_max = -INFINITY;
@@ -750,7 +786,9 @@ struct Sm100MlaFwdMainloopTmaWarpspecialized {
     Tensor cS_base = make_identity_tensor(select<0,1>(TileShapeQK{}));
     auto logical_offset = make_coord(
         get<0>(blk_coord) * get<0>(TileShape{}) + (stage % get<0>(ThreadShape{})) * get<0>(TileShapeQK{}),
-        0 + (stage % get<1>(ThreadShape{})) * get<1>(TileShapeQK{})
+        // SWA: start the K cursor at the first in-window tile so apply_mask sees
+        // the correct absolute key index for the (skipped-start) loaded tiles.
+        swa_trip_start * get<1>(TileShapeQK{}) + (stage % get<1>(ThreadShape{})) * get<1>(TileShapeQK{})
     );
     Tensor cS = domain_offset(logical_offset, cS_base);
 
@@ -971,7 +1009,9 @@ struct Sm100MlaFwdMainloopTmaWarpspecialized {
       PipelineE& pipeline_epi, typename PipelineE::PipelineState& pipeline_epi_producer_state,
       CollectiveEpilogue& epilogue) {
 
-    int mask_tile_count = Mask{}.get_trip_count(blk_coord, TileShape{}, problem_shape);
+    // SWA: same windowed count as mma/softmax/load (baseline: unchanged causal count).
+    int mask_tile_count = Mask{}.get_trip_count(blk_coord, TileShape{}, problem_shape, params.window_size)
+                        - Mask{}.get_trip_start(blk_coord, TileShape{}, problem_shape, params.window_size);
 
     int thread_idx = threadIdx.x % (4 * cutlass::NumThreadsPerWarp);
 

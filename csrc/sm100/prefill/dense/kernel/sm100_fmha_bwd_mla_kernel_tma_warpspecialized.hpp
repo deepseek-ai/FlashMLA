@@ -308,6 +308,10 @@ struct Sm100FmhaBwdMlaKernelTmaWarpSpecialized {
     TensorStride stride_dq_acc;
 
     ElementAcc softmax_scale = 1.0f / sqrtf(TileShapeDQK{});
+
+    // SWA: causal sliding-window width. <=0 disables (plain causal). MUST equal
+    // the forward window so the backward masks S identically (gradient correctness).
+    int window_size = -1;
   };
 
   using TMA_K = typename CollectiveMmaQK::Params::TMA_B;
@@ -1247,7 +1251,15 @@ struct Sm100FmhaBwdMlaKernelTmaWarpSpecialized {
         trailing_residual_masking = warp_uniform((iter_index == last_iter) || is_residual_k);
       }
 
-      dispatch_bool(leading_causal_masking || trailing_residual_masking, [&](auto is_masked_tile) {
+      // SWA safe-baseline: causal `leading_causal_masking` only flags tiles on the
+      // diagonal band; the sliding-window LOWER edge sits on interior tiles where
+      // q is far above k (q_left > kv_right), which causal leaves unmasked. When a
+      // window is active we therefore force apply_mask on EVERY iterated tile so
+      // out-of-window (q - k >= W) keys are zeroed. Identical predicate to the
+      // forward (CausalMask<false>) keeps dP/dS/dQ/dK/dV gated consistently.
+      bool swa_active = warp_uniform(mainloop_args.window_size > 0);
+
+      dispatch_bool(leading_causal_masking || trailing_residual_masking || swa_active, [&](auto is_masked_tile) {
 
         // compute P = softmax(S, LSE)
         cute::copy(tiled_t2r, tTR_tST, tTR_rST);
@@ -1256,7 +1268,7 @@ struct Sm100FmhaBwdMlaKernelTmaWarpSpecialized {
           Mask{}.apply_mask(tTR_rST, [&](int i) {
             auto c_transpose = tTR_cST(i);
             return make_coord(get<0>(c_transpose) + iter_index * TileShapeQ{}, get<1>(c_transpose) + get<1>(blk_coord) * TileShapeK{});
-          }, problem_shape);
+          }, problem_shape, mainloop_args.window_size);
         }
 
         ElementAcc log2_e = static_cast<ElementAcc>(M_LOG2E);

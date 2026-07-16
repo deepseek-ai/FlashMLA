@@ -5,6 +5,31 @@ import torch
 
 import flash_mla.cuda as flash_mla_cuda
 
+
+def _resolve_window_size(window_size) -> int:
+    """Map a FlashAttention-style ``window_size`` to FlashMLA's kernel int.
+
+    Accepts the FA convention ``(left, right)`` tuple (``(-1, -1)`` disables), a
+    bare int (kernel convention: number of keys kept looking back; ``<=0``
+    disables), or ``None``. Returns the kernel int W: the causal window keeps the
+    last W keys, i.e. query q attends to keys k with ``q - W < k <= q``.
+
+    The kernel implements a causal LEFT window only, so ``right`` must be 0
+    (``(W-1, 0)`` for a causal window of width W, matching tests/test_fmha_sm100).
+    """
+    if window_size is None:
+        return -1
+    if isinstance(window_size, int):
+        return window_size
+    left, right = window_size
+    if left < 0 and right < 0:
+        return -1
+    assert right == 0, (
+        "FlashMLA sliding window supports a causal left-window only "
+        f"(right must be 0); got window_size={window_size}"
+    )
+    return left + 1
+
 @dataclasses.dataclass
 class FlashMLASchedMeta:
     """
@@ -66,7 +91,8 @@ def flash_mla_with_kvcache(
     extra_k_cache: Optional[torch.Tensor] = None,
     extra_indices_in_kvcache: Optional[torch.Tensor] = None,
     topk_length: Optional[torch.Tensor] = None,
-    extra_topk_length: Optional[torch.Tensor] = None
+    extra_topk_length: Optional[torch.Tensor] = None,
+    window_size=(-1, -1),   # FA-style (left, right); (-1,-1) disables. Dense decode only.
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Arguments:
@@ -159,15 +185,23 @@ def flash_mla_with_kvcache(
             head_dim_v, softmax_scale
         )
     else:
-        # Dense attention
-        assert indices_in_kvcache is None and attn_sink is None and extra_k_cache is None and extra_indices_in_kvcache is None and topk_length is None and extra_topk_length is None, "indices_in_kvcache, attn_sink, extra_k_cache, extra_indices_in_kvcache, topk_length and extra_topk_length must be None when dense attention is used."
+        # Dense attention (incl. SWA via window_size). attn_sink IS allowed here and is
+        # applied as a post-rescale below (the dense decode kernel has no native sink);
+        # the other sparse-only args must still be None.
+        assert indices_in_kvcache is None and extra_k_cache is None and extra_indices_in_kvcache is None and topk_length is None and extra_topk_length is None, "indices_in_kvcache, extra_k_cache, extra_indices_in_kvcache, topk_length and extra_topk_length must be None when dense attention is used."
         assert block_table is not None and cache_seqlens is not None, "block_table and cache_seqlens must be provided when dense attention is used."
         out, lse, new_tile_scheduler_metadata, new_num_splits = flash_mla_cuda.dense_decode_fwd(
             q, k_cache, head_dim_v,
             cache_seqlens, block_table,
-            softmax_scale, causal,
+            softmax_scale, causal, _resolve_window_size(window_size),
             sched_meta.tile_scheduler_metadata, sched_meta.num_splits
         )
+        if attn_sink is not None:
+            # gpt-oss per-head sink for dense/SWA decode: out *= sigmoid(lse - sink)
+            # (= exp(lse)/(exp(lse)+exp(sink))), lse unaffected (matches the sparse path's
+            # native attn_sink convention). lse: (b, h_q, s_q); out: (b, s_q, h_q, d_v).
+            scale = torch.sigmoid(lse.float() - attn_sink.float().view(1, -1, 1))
+            out = (out.float() * scale.permute(0, 2, 1).unsqueeze(-1)).to(out.dtype)
     sched_meta.tile_scheduler_metadata = new_tile_scheduler_metadata
     sched_meta.num_splits = new_num_splits
     return (out, lse)
@@ -279,6 +313,8 @@ def _flash_attn_varlen_forward(
     causal: bool = False,
     softmax_scale: Optional[float] = None,
     is_varlen: bool = True,
+    window_size: int = -1,
+    sink_bias: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     qo_total_len, num_qo_heads, head_dim_qk = q.shape
     kv_total_len, num_kv_heads, head_dim_vo = v.shape
@@ -308,6 +344,10 @@ def _flash_attn_varlen_forward(
         max_seqlen_qo,
         max_seqlen_kv,
         is_varlen,
+        window_size,
+        # kernel reads sink as fp32 (const float*); bf16 training stores the sink param
+        # in bf16, so cast here.
+        (sink_bias.float() if sink_bias is not None else None),
     )
 
     return out, lse
@@ -330,6 +370,8 @@ def _flash_attn_varlen_backward(
     causal: bool = False,
     softmax_scale: Optional[float] = None,
     is_varlen: bool = True,
+    window_size: int = -1,
+    sink_bias: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     qo_total_len, num_qo_heads, head_dim_qk = q.shape
     kv_total_len, num_kv_heads, head_dim_vo = v.shape
@@ -357,6 +399,10 @@ def _flash_attn_varlen_backward(
     if num_qo_heads != num_kv_heads:
         workspace_bytes += 2 * kv_total_len * num_qo_heads * (head_dim_qk + head_dim_vo)  # dKV_acc
     workspace_buffer = torch.empty(workspace_bytes, dtype=torch.uint8, device=q.device)
+    # gpt-oss attention sink: its logit gradient d_sink is accumulated INTO the bwd's
+    # existing sum_OdO pass (zero extra cost). d_sink must be zero-initialized.
+    d_sink = (torch.zeros(num_qo_heads, device=q.device, dtype=torch.float32)
+              if sink_bias is not None else None)
     flash_mla_cuda.dense_prefill_bwd(
         workspace_buffer,
         do,
@@ -375,9 +421,14 @@ def _flash_attn_varlen_backward(
         max_seqlen_qo,
         max_seqlen_kv,
         is_varlen,
+        window_size,
+        # kernel reads sink as fp32 (const float*); bf16 training stores the sink param
+        # in bf16, so cast here. d_sink is fp32 (set above).
+        (sink_bias.float() if sink_bias is not None else None),
+        d_sink,
     )
 
-    return dq, dk, dv
+    return dq, dk, dv, d_sink
 
 
 class FlashAttnVarlenFunc(torch.autograd.Function):
@@ -393,19 +444,29 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         causal: bool = False,
         softmax_scale: Optional[float] = None,
         is_varlen: bool = True,
+        window_size: int = -1,
+        sink_bias: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        # gpt-oss per-head attention sink (SWA training): folded into the softmax
+        # denominator IN-KERNEL, so out + lse come back sink-aware (zero extra pass). The
+        # sink-aware lse makes the bwd's P=exp(S-lse) correct -> dQ/dK/dV need no change;
+        # only d(sink) is added below.
         out, lse = _flash_attn_varlen_forward(
             q, k, v,
             cu_seqlens_qo, cu_seqlens_kv, max_seqlen_qo, max_seqlen_kv,
             causal=causal, softmax_scale=softmax_scale,
-            is_varlen=is_varlen,
+            is_varlen=is_varlen, window_size=window_size,
+            sink_bias=sink_bias,
         )
-        ctx.save_for_backward(q, k, v, out, lse, cu_seqlens_qo, cu_seqlens_kv)
+        ctx.save_for_backward(q, k, v, out, lse, cu_seqlens_qo, cu_seqlens_kv,
+                              sink_bias if sink_bias is not None else q.new_empty(0))
         ctx.max_seqlen_qo = max_seqlen_qo
         ctx.max_seqlen_kv = max_seqlen_kv
         ctx.causal = causal
         ctx.softmax_scale = softmax_scale
         ctx.is_varlen = is_varlen
+        ctx.window_size = window_size
+        ctx.has_sink = sink_bias is not None
         return out, lse
 
     def backward(
@@ -414,14 +475,24 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         dlse: torch.Tensor,
     ):
         del dlse  # LSE doesn't support backward currently
-        q, k, v, out, lse, cu_seqlens_qo, cu_seqlens_kv = ctx.saved_tensors
-        dq, dk, dv = _flash_attn_varlen_backward(
+        q, k, v, out, lse, cu_seqlens_qo, cu_seqlens_kv, sink_bias = ctx.saved_tensors
+        # d(sink) is folded into the bwd's sum_OdO pass (zero extra cost): out + lse are
+        # sink-aware (in-kernel fwd), so dQ/dK/dV are already correct and d_sink comes back
+        # from the same kernel. None when no sink was used.
+        dq, dk, dv, d_sink = _flash_attn_varlen_backward(
             do, q, k, v, out, lse,
             cu_seqlens_qo, cu_seqlens_kv, ctx.max_seqlen_qo, ctx.max_seqlen_kv,
             causal=ctx.causal, softmax_scale=ctx.softmax_scale,
-            is_varlen=ctx.is_varlen,
+            is_varlen=ctx.is_varlen, window_size=ctx.window_size,
+            sink_bias=(sink_bias if ctx.has_sink else None),
         )
-        return dq, dk, dv, None, None, None, None, None, None, None
+        # Forward inputs: q,k,v,cu_qo,cu_kv,max_qo,max_kv,causal,softmax_scale,is_varlen,
+        # window_size,sink_bias -> dq,dk,dv + 8 Nones + d_sink.
+        # d_sink comes back fp32; match the sink param's dtype (bf16 in bf16 training) so
+        # autograd accepts the grad for the bf16 sink Parameter.
+        if d_sink is not None and ctx.has_sink:
+            d_sink = d_sink.to(sink_bias.dtype)
+        return dq, dk, dv, None, None, None, None, None, None, None, None, d_sink
 
 
 def flash_attn_varlen_func(
@@ -437,13 +508,16 @@ def flash_attn_varlen_func(
     causal: bool = False,
     deterministic: bool = False,
     is_varlen: bool = True,
+    window_size=(-1, -1),   # FA-style (left, right); (-1,-1) disables. int also accepted.
+    sink_bias: Optional[torch.Tensor] = None,   # gpt-oss per-head attention sink [h_q], fp32
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     assert dropout_p == 0.0
     assert not deterministic
     return FlashAttnVarlenFunc.apply(
         q, k, v,
         cu_seqlens_qo, cu_seqlens_kv, max_seqlen_qo, max_seqlen_kv,
-        causal, softmax_scale, is_varlen,
+        causal, softmax_scale, is_varlen, _resolve_window_size(window_size),
+        sink_bias,
     )
 
 
@@ -457,13 +531,14 @@ def flash_attn_varlen_qkvpacked_func(
     causal: bool = False,
     deterministic: bool = False,
     is_varlen: bool = True,
+    window_size=(-1, -1),   # FA-style (left, right); (-1,-1) disables. int also accepted.
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     assert dropout_p == 0.0
     assert not deterministic
     return FlashAttnVarlenFunc.apply(
         qkv[:, :, :head_dim_qk], qkv[:, :, head_dim_qk:head_dim_qk * 2], qkv[:, :, head_dim_qk * 2:],
         cu_seqlens, cu_seqlens, max_seqlen, max_seqlen,
-        causal, softmax_scale, is_varlen,
+        causal, softmax_scale, is_varlen, _resolve_window_size(window_size),
     )
 
 
@@ -480,11 +555,12 @@ def flash_attn_varlen_kvpacked_func(
     causal: bool = False,
     deterministic: bool = False,
     is_varlen: bool = True,
+    window_size=(-1, -1),   # FA-style (left, right); (-1,-1) disables. int also accepted.
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     assert dropout_p == 0.0
     assert not deterministic
     return FlashAttnVarlenFunc.apply(
         q, kv[:, :, :head_dim_qk], kv[:, :, head_dim_qk:],
         cu_seqlens_qo, cu_seqlens_kv, max_seqlen_qo, max_seqlen_kv,
-        causal, softmax_scale, is_varlen,
+        causal, softmax_scale, is_varlen, _resolve_window_size(window_size),
     )

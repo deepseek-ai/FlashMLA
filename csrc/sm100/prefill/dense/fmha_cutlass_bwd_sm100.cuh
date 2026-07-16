@@ -97,7 +97,9 @@ struct BwdRunner {
                   at::Tensor v, at::Tensor o, at::Tensor lse,
                   at::Tensor cumulative_seqlen_q, at::Tensor cumulative_seqlen_kv,
                   at::Tensor dq, at::Tensor dk, at::Tensor dv,
-                  float softmax_scale, int max_seqlen_q, int max_seqlen_kv) {
+                  float softmax_scale, int max_seqlen_q, int max_seqlen_kv,
+                  int window_size = -1, const float *sink_ptr = nullptr,
+                  float *d_sink_ptr = nullptr) {
     const at::cuda::CUDAGuard device_guard{(char)q.get_device()};
     const int device_id = q.get_device();
 
@@ -175,6 +177,8 @@ struct BwdRunner {
       (static_cast<Element*>(dk.data_ptr())), stride_dK,
       (static_cast<Element*>(dv.data_ptr())), stride_dV,
       static_cast<ElementAccumulator>(softmax_scale),
+      window_size,
+      sink_ptr, d_sink_ptr,   // gpt-oss attention sink (folded into sum_OdO); nullptr disables
       hw_info
     };
 
@@ -195,9 +199,12 @@ void run_fmha_bwd(at::Tensor workspace_buffer, at::Tensor d_o, at::Tensor q, at:
                   at::Tensor v, at::Tensor o, at::Tensor lse,
                   at::Tensor cumulative_seqlen_q, at::Tensor cumulative_seqlen_kv,
                   at::Tensor dq, at::Tensor dk, at::Tensor dv,
-                  float softmax_scale, int max_seqlen_q, int total_seqlen_kv) {
+                  float softmax_scale, int max_seqlen_q, int total_seqlen_kv,
+                  int window_size = -1, const float *sink_ptr = nullptr,
+                  float *d_sink_ptr = nullptr) {
   BwdRunner<DType, kIsVarlen, kIsMla, TileShape, Mask>::run(workspace_buffer, d_o, q, k, v, o, lse,
                                                      cumulative_seqlen_q, cumulative_seqlen_kv,
                                                      dq, dk, dv,
-                                                     softmax_scale, max_seqlen_q, total_seqlen_kv);
+                                                     softmax_scale, max_seqlen_q, total_seqlen_kv, window_size,
+                                                     sink_ptr, d_sink_ptr);
 }

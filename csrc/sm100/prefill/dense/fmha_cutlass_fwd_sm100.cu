@@ -15,7 +15,8 @@ void call_run_fmha_fwd([[maybe_unused]] Mask mask, [[maybe_unused]] Varlen is_va
                        [[maybe_unused]] Mla mla, at::Tensor workspace_buffer, at::Tensor q,
                        at::Tensor k, at::Tensor v, at::Tensor cumulative_seqlen_q,
                        at::Tensor cumulative_seqlen_kv, at::Tensor o, at::Tensor lse,
-                       float softmax_scale, int max_seqlen_q, int max_seqlen_kv) {
+                       float softmax_scale, int max_seqlen_q, int max_seqlen_kv,
+                       int window_size, const float *sink_ptr) {
   static constexpr bool IsVarlen = std::is_same_v<Varlen, true_type>;
   static constexpr bool IsMla = std::is_same_v<Mla, true_type>;
   static constexpr bool IsCausalMask = std::is_same_v<Mask, CausalMask<false>>;
@@ -25,15 +26,18 @@ void call_run_fmha_fwd([[maybe_unused]] Mask mask, [[maybe_unused]] Varlen is_va
 
   run_fmha_fwd<Element, ElementOut, IsVarlen, IsMla, Mask, Option>(
       workspace_buffer, q, k, v, cumulative_seqlen_q, cumulative_seqlen_kv, o, lse,
-      softmax_scale, max_seqlen_q, max_seqlen_kv);
+      softmax_scale, max_seqlen_q, max_seqlen_kv, window_size, sink_ptr);
 }
 
 void FMHACutlassSM100FwdRun(at::Tensor workspace_buffer, at::Tensor q, at::Tensor k,
                             at::Tensor v, at::Tensor cumulative_seqlen_q,
                             at::Tensor cumulative_seqlen_kv, at::Tensor o, at::Tensor lse,
                             int mask_mode_code, float sm_scale, int max_seqlen_q,
-                            int max_seqlen_kv, bool is_varlen) {
+                            int max_seqlen_kv, bool is_varlen, int window_size,
+                            std::optional<at::Tensor> attn_sink) {
   const c10::cuda::OptionalCUDAGuard device_guard(q.device());
+  // gpt-oss per-head attention sink ([h_q], fp32). nullptr disables (in-kernel fold-in).
+  const float *sink_ptr = attn_sink.has_value() ? attn_sink->data_ptr<float>() : nullptr;
   CHECK(q.scalar_type() == k.scalar_type());
   auto scalar_type_in = q.scalar_type();
   auto scalar_type_out = o.scalar_type();
@@ -66,11 +70,11 @@ void FMHACutlassSM100FwdRun(at::Tensor workspace_buffer, at::Tensor q, at::Tenso
       if (head_dim_qk == 192 && head_dim_vo == 128) {
         call_run_fmha_fwd(mask, varlen, in, out, true_type{}, workspace_buffer, q, k, v,
                           cumulative_seqlen_q, cumulative_seqlen_kv, o, lse, sm_scale,
-                          max_seqlen_q, max_seqlen_kv);
+                          max_seqlen_q, max_seqlen_kv, window_size, sink_ptr);
       } else if (head_dim_qk == 128 && head_dim_vo == 128) {
         call_run_fmha_fwd(mask, varlen, in, out, false_type{}, workspace_buffer, q, k, v,
                           cumulative_seqlen_q, cumulative_seqlen_kv, o, lse, sm_scale,
-                          max_seqlen_q, max_seqlen_kv);
+                          max_seqlen_q, max_seqlen_kv, window_size, sink_ptr);
       } else {
         std::cout << "No kernel instantiated for head_dim_qk=" << head_dim_qk
                   << " head_dim_vo=" << head_dim_vo << std::endl;

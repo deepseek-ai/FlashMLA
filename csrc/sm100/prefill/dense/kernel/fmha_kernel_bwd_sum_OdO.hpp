@@ -62,6 +62,12 @@ struct FmhaKernelBwdSumOdO {
 
     ElementAcc sum_odo_scale = 1.0;
     ElementAcc lse_scale = 1.0;
+
+    // gpt-oss attention sink: per-head [h_q] logit (sink_bias) -> accumulate its logit
+    // gradient d_sink[h] = -sum_q exp(sink[h]-lse[q,h]) * (O.dO)_q, folded into this pass
+    // (the delta `acc` is already computed here) -> zero extra cost. nullptr disables.
+    const ElementAcc* sink_bias = nullptr;
+    ElementAcc* ptr_d_sink = nullptr;   // [h_q] output, zero-initialized; atomic-accumulated
   };
 
   using Params = Arguments;
@@ -154,6 +160,12 @@ struct FmhaKernelBwdSumOdO {
         *ptr_sum_OdO_bhq = params.sum_odo_scale * acc;
         if (params.ptr_scaled_lse) {
           *ptr_scaled_lse_bhq = params.lse_scale * *ptr_lse_bhq;
+        }
+        // attention-sink logit gradient, folded into this delta pass (acc = O.dO, base-e
+        // sink-aware lse). blockIdx.y is the flat q-head. d_sink accumulated atomically.
+        if (params.ptr_d_sink != nullptr) {
+          ElementAcc p_sink = ::expf(params.sink_bias[blockIdx.y] - *ptr_lse_bhq);
+          atomicAdd(&params.ptr_d_sink[blockIdx.y], -p_sink * acc);
         }
       }
     }
