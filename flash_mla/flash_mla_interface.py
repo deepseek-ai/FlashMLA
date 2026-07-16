@@ -211,6 +211,61 @@ def flash_mla_sparse_fwd(
     return results
 
 
+def flash_mla_sparse_bwd(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    o: torch.Tensor,
+    do_grad: torch.Tensor,
+    indices: torch.Tensor,
+    lse: torch.Tensor,
+    dq_acc_workspace: torch.Tensor,
+    dkv_acc_workspace: torch.Tensor,
+    sm_scale: float,
+    d_v: int = 512,
+    fuse_reducesum: bool = True,
+):
+    """
+    Sparse MLA attention prefill backward (sm100 only).
+
+    The LSE handed in must be base-2 (matching FlashMLA fwd's output) —
+    multiply external base-e LSEs by log2(e) before calling.
+
+    dq_acc_workspace and dkv_acc_workspace are caller-allocated persistent
+    fp32 buffers (mirrors the dense FMHA BWD workspace pattern). The kernel
+    memsets and accumulates into these but does NOT manage their lifetime.
+    Reuse a single buffer pair across all BWD calls (e.g. keep them at module
+    level in the training framework). Sizes:
+        dq_acc_workspace  : s_q * h_q * d_qk floats
+        dkv_acc_workspace : s_kv * d_qk      floats
+
+    Args:
+        q:        [s_q, h_q, d_qk] bf16          (d_qk in {576, 512})
+        kv:       [s_kv, 1, d_qk]  bf16          (h_kv must be 1)
+        o:        [s_q, h_q, d_v]  bf16          (forward output, saved tensor)
+        do_grad:  [s_q, h_q, d_v]  bf16          (upstream gradient)
+        indices:  [s_q, 1, topk]   int32         (causal top-k; -1 = pad)
+        lse:      [s_q, h_q]       float32       (base-2)
+        dq_acc_workspace:  [>= s_q * h_q * d_qk]   float32 (caller-allocated)
+        dkv_acc_workspace: [>= s_kv * d_qk]        float32 (caller-allocated)
+        sm_scale: float                          (typically 1/sqrt(d_qk))
+        d_v:      int                            (only 512 supported)
+        fuse_reducesum: bool                     (also emit kl_target for the
+                                                  un-gated KL indexer loss,
+                                                  fused into the same launch)
+
+    Returns:
+        if fuse_reducesum:  (dq, dkv, kl_target)
+        else:               (dq, dkv)
+        where dq is [s_q, h_q, d_qk] bf16, dkv is [s_kv, 1, d_qk] bf16
+              (dV occupies dkv[:, :, :d_v]), kl_target is [s_q, topk] float32.
+    """
+    return flash_mla_cuda.sparse_prefill_bwd(
+        q, kv, o, do_grad, indices, lse,
+        dq_acc_workspace, dkv_acc_workspace,
+        sm_scale, d_v, fuse_reducesum
+    )
+
+
 def _flash_attn_varlen_forward(
     q: torch.Tensor,
     k: torch.Tensor,

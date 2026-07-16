@@ -6,7 +6,8 @@ from flash_mla.flash_mla_interface import (
     flash_attn_varlen_func,
     flash_attn_varlen_qkvpacked_func,
     flash_attn_varlen_kvpacked_func,
-    flash_mla_sparse_fwd
+    flash_mla_sparse_fwd,
+    flash_mla_sparse_bwd,
 )
 
 __all__ = [
@@ -15,5 +16,6 @@ __all__ = [
     "flash_attn_varlen_func",
     "flash_attn_varlen_qkvpacked_func",
     "flash_attn_varlen_kvpacked_func",
-    "flash_mla_sparse_fwd"
+    "flash_mla_sparse_fwd",
+    "flash_mla_sparse_bwd",
 ]

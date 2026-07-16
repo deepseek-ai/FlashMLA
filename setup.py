@@ -98,6 +98,9 @@ ext_modules.append(
             "csrc/sm100/prefill/sparse/fwd/head128/instantiations/phase1_k576.cu",
             "csrc/sm100/prefill/sparse/fwd_for_small_topk/head128/instantiations/phase1_prefill_k512.cu",
 
+            # sm100 sparse prefill backward (CUTLASS-3 warp-specialized)
+            "csrc/sm100/prefill/sparse/bwd/instantiations/sparse_bwd_k576.cu",
+
             # sm100 sparse decode
             "csrc/sm100/decode/head64/instantiations/v32.cu",
             "csrc/sm100/decode/head64/instantiations/model1.cu",
