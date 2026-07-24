@@ -179,6 +179,15 @@ flash_fwd_mla_combine_kernel(__grid_constant__ const CombineParams params) {
         } else if (NUM_SPLITS <= 160) {                    \
             constexpr static int NAME = 160;               \
             return __VA_ARGS__();                          \
+        } else if (NUM_SPLITS <= 192) {                    \
+            constexpr static int NAME = 192;               \
+            return __VA_ARGS__();                          \
+        } else if (NUM_SPLITS <= 224) {                    \
+            constexpr static int NAME = 224;               \
+            return __VA_ARGS__();                          \
+        } else if (NUM_SPLITS <= 256) {                    \
+            constexpr static int NAME = 256;               \
+            return __VA_ARGS__();                          \
         } else {                                           \
             FLASH_ASSERT(false);                           \
         }                                                  \
