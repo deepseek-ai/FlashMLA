@@ -62,6 +62,7 @@ Support matrix:
 | :---: | :---: | :---: | :---: |
 | Dense Decoding | SM90 | MQA | BF16 |
 | Sparse Decoding | SM90 & SM100 | MQA | FP8 [1] |
+| Packed Sparse Decoding | SM90 | MQA | V3.2 FP8 [1] |
 | Dense Prefill | SM100 | MHA |  |
 | Sparse Prefill | SM90 & SM100 | MQA |  |
 
@@ -135,6 +136,70 @@ The kernel returns `(out, lse)`, where:
 -   `lse` is the log-sum-exp value of the attention scores for each query head.
 
 See `tests/test_flash_mla_decoding.py` for a complete example.
+
+### Packed sparse MLA decoding (SM90)
+
+When selected physical indices are available before attention, SM90 callers
+may pack the selected V3.2 FP8 records into a contiguous workspace and run the
+packed sparse-decode specialization:
+
+```python
+from flash_mla import (
+    flash_mla_with_packed_kvcache,
+    get_packed_mla_metadata,
+    pack_selected_kv,
+)
+
+packed_meta = get_packed_mla_metadata(
+    batch_size=q.shape[0],
+    query_len=q.shape[1],
+    num_heads=q.shape[2],
+    topk=indices.shape[-1],
+    device=q.device,
+    # Pass the corresponding host-side lengths here for partial prefixes.
+    topk_length=[indices.shape[-1]] * q.shape[0],
+)
+
+# This launch can run earlier on a caller-managed stream.
+packed_kv = pack_selected_kv(k_cache, indices, topk_length)
+
+out, lse = flash_mla_with_packed_kvcache(
+    q,
+    packed_kv,
+    head_dim_v=512,
+    tile_scheduler_metadata=packed_meta,
+    topk_length=topk_length,
+)
+```
+
+This path is opt-in and available only on SM90. It requires the 656-byte V3.2
+FP8 cache format, `H in {64, 128}`, and a top-k capacity divisible by 64.
+Within each selection row, valid physical indices must form a prefix; suffix
+records are zero-filled by the packer and masked by attention. The returned
+workspace is owned by FlashMLA and should otherwise be treated as opaque.
+For pooling, allocate contiguous `uint8` storage using
+`get_packed_kv_workspace_size`, pass it as `out=`, and retain the view returned
+by `pack_selected_kv`.
+
+Packing is a separate operation so runtimes can overlap it with preceding
+work. Without overlap, packing plus attention may be slower than native sparse
+decode. The H=64 helper uses the compact scheduler selected by the L20X
+experiments, with a native-scheduler fallback for the measured full-prefix
+`B*S_q=16` regime. Full-length H=128 uses native sparse decode's scheduler.
+If an early pack reads a current-token slot before its KV is initialized, the
+runtime must update that packed record and synchronize it before launching
+attention; current-token patch orchestration is outside this interface.
+
+Run correctness coverage and the multi-shape latency matrix on SM90 with:
+
+```bash
+python tests/test_flash_mla_packed_sparse_decoding.py
+python benchmark/bench_flash_mla_packed_sparse_decode.py
+```
+
+The benchmark reports packing, packed attention, native attention, unhidden
+total latency, and an identical-scheduler control. Its default axes are
+`B={1,2,4,7,8}`, `S_q={1,2,3,4,8,16}`, `H={64,128}`, with `topk=2048`.
 
 ### Sparse MLA Prefill
 

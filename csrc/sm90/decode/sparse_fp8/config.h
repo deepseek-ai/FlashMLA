@@ -12,7 +12,7 @@ using namespace cute;
 
 namespace sm90::decode::sparse_fp8 {
 
-template<ModelType MODEL_TYPE, int NUM_HEADS>
+template<ModelType MODEL_TYPE, int NUM_HEADS, bool PACKED_KV = false>
 class KernelTemplate {
 public:
 
