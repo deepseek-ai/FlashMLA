@@ -1,5 +1,7 @@
 #pragma once
 
+#include <memory>
+
 #include "common.h"
 
 #include "params.h"
@@ -359,15 +361,15 @@ sparse_attn_decode_interface(
         features.push_back(DecodeFeatures::EXTRA_TOPK_LENGTH);
     }
 
-    DecodeImplBase* impl;
+    std::unique_ptr<DecodeImplBase> impl;
     if (arch.is_sm100f()) {
         if (h_q == 64) {
-            impl = new Decode_Sm100_Head64_Impl();
+            impl = std::make_unique<Decode_Sm100_Head64_Impl>();
         } else if (h_q == 128) {
             if (d_qk == 576) {
-                impl = new Decode_Sm100_Head64x2_Impl();
+                impl = std::make_unique<Decode_Sm100_Head64x2_Impl>();
             } else if (d_qk == 512) {
-                impl = new Decode_Sm100_Head128_Impl();
+                impl = std::make_unique<Decode_Sm100_Head128_Impl>();
             } else {
                 TORCH_CHECK(false, "Unsupported d_qk: ", d_qk);
             }
@@ -375,7 +377,7 @@ sparse_attn_decode_interface(
             TORCH_CHECK(false, "Unsupported h_q: ", h_q);
         }
     } else if (arch.is_sm90a()) {
-        impl = new Decode_Sm90_Impl();
+        impl = std::make_unique<Decode_Sm90_Impl>();
     } else {
         TORCH_CHECK(false, "Unsupported architecture for sparse decode fwd");
     }
@@ -488,8 +490,6 @@ sparse_attn_decode_interface(
         at::cuda::getCurrentCUDAStream().stream()
     };
     smxx::decode::run_flash_mla_combine_kernel<bf16>(combine_params);
-
-    delete impl;
 
     return {out, lse.transpose(1, 2), tile_scheduler_metadata, num_splits};
 }
