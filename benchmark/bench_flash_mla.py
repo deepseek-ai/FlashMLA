@@ -97,8 +97,6 @@ def run_flash_infer(q, block_table, blocked_k, max_seqlen_pad, block_size, b, s_
         num_blocks = (seq_len + block_size - 1) // block_size
         kv_indices.extend(block_table[i, :num_blocks])
         kv_indptr.append(kv_indptr[-1] + num_blocks)
-    for seq_len in cache_seqlens[1:]:
-        kv_indptr.append((seq_len + block_size - 1) // block_size + kv_indptr[-1])
         
     q_indptr = torch.arange(0, b + 1).int() * s_q
     kv_indptr = torch.tensor(kv_indptr, dtype=torch.int32)
