@@ -73,7 +73,7 @@ void FMHACutlassSM100BwdRun(at::Tensor workspace_buffer, at::Tensor d_o, at::Ten
                           dq, dk, dv,
                           softmax_scale, max_seqlen_q, max_seqlen_kv);      }
       else {
-        std::cout << "No kernel instantiated for head_dim_qk=" << head_dim_qk << " head_dim_vo=" << head_dim_vo << std::endl;
+        TORCH_CHECK(false, "No kernel instantiated for head_dim_qk=", head_dim_qk, " head_dim_vo=", head_dim_vo);
       }
     });
 
