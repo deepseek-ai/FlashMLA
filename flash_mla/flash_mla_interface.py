@@ -1,4 +1,4 @@
-from typing import Optional, Tuple
+from typing import Optional, Sequence, Tuple
 import dataclasses
 
 import torch
@@ -48,6 +48,243 @@ def get_mla_metadata(
         A tuple. Due to historical reasons, we return a tuple of (FlashMLASchedMeta, None) now. Only the first element is useful.
     """
     return FlashMLASchedMeta(), None
+
+
+def get_packed_kv_workspace_size(
+    batch_size: int,
+    query_len: int,
+    topk: int,
+) -> int:
+    """Return the packed V3.2 sparse-decode workspace size in bytes."""
+    if batch_size < 1 or query_len < 1:
+        raise ValueError("batch_size and query_len must be positive")
+    if topk < 1 or topk % 64:
+        raise ValueError("topk must be positive and divisible by 64")
+    return batch_size * query_len * topk * 656
+
+
+def get_packed_mla_metadata(
+    *,
+    batch_size: int,
+    query_len: int,
+    num_heads: int,
+    topk: int,
+    device: torch.device | str,
+    topk_length: Optional[int | Sequence[int]] = None,
+    num_sms: Optional[int] = None,
+) -> FlashMLASchedMeta:
+    """Create the measured H=64 packed scheduler.
+
+    ``topk_length`` is a host integer or sequence, not a CUDA tensor.
+    Full-length H=128 intentionally returns empty metadata so packed decode
+    uses the same scheduler heuristic as native sparse decode. H=64 uses the
+    compact, request-local scheduler selected by the L20X experiments, except
+    for the measured B*S_q=16 full-prefix regime where the native scheduler is
+    faster. Partial H=128 requests receive a compact schedule so no row extends
+    beyond the valid prefix.
+    """
+    if batch_size < 1 or query_len < 1:
+        raise ValueError("batch_size and query_len must be positive")
+    if num_heads not in (64, 128):
+        raise ValueError("num_heads must be 64 or 128")
+    if topk < 1 or topk % 64:
+        raise ValueError("topk must be positive and divisible by 64")
+
+    if topk_length is None:
+        active_lengths = (topk,) * batch_size
+    elif isinstance(topk_length, int):
+        active_lengths = (topk_length,) * batch_size
+    else:
+        active_lengths = tuple(int(value) for value in topk_length)
+    if len(active_lengths) != batch_size:
+        raise ValueError("topk_length must have one value per batch")
+    if any(value < 1 or value > topk for value in active_lengths):
+        raise ValueError("topk lengths must be in [1, topk]")
+
+    meta = FlashMLASchedMeta()
+    if num_heads == 128 and all(
+        value == topk for value in active_lengths
+    ):
+        return meta
+
+    if num_sms is None:
+        num_sms = torch.cuda.get_device_properties(device).multi_processor_count
+    if num_sms < 1:
+        raise ValueError("num_sms must be positive")
+
+    if (
+        num_heads == 64
+        and num_sms == 132
+        and batch_size * query_len == 16
+        and topk == 2048
+        and all(value == topk for value in active_lengths)
+    ):
+        return meta
+
+    active_tiles = tuple((value + 63) // 64 for value in active_lengths)
+    native_num_parts = max(
+        num_sms // query_len // (num_heads // 64),
+        1,
+    )
+    total_weighted_blocks = sum(tiles + 5 for tiles in active_tiles)
+    real_tiles_per_split = max(
+        2,
+        (total_weighted_blocks + native_num_parts - 1)
+        // native_num_parts,
+    )
+    while sum(
+        (tiles + real_tiles_per_split - 1) // real_tiles_per_split
+        for tiles in active_tiles
+    ) > 160:
+        real_tiles_per_split += 1
+
+    rows: list[list[int]] = []
+    cumulative_splits = [0]
+    for batch_idx, tiles in enumerate(active_tiles):
+        splits = (
+            tiles + real_tiles_per_split - 1
+        ) // real_tiles_per_split
+        small_width, wide_split_count = divmod(tiles, splits)
+        begin_block = 0
+        is_split = int(splits > 1)
+        for split_idx in range(splits):
+            split_width = small_width + int(
+                split_idx < wide_split_count
+            )
+            end_block = begin_block + split_width
+            rows.append(
+                [
+                    batch_idx,
+                    batch_idx,
+                    begin_block,
+                    end_block,
+                    split_idx,
+                    is_split,
+                    is_split,
+                    0,
+                ]
+            )
+            begin_block = end_block
+        cumulative_splits.append(cumulative_splits[-1] + splits)
+
+    meta.tile_scheduler_metadata = torch.tensor(
+        rows,
+        dtype=torch.int32,
+        device=device,
+    )
+    meta.num_splits = torch.tensor(
+        cumulative_splits,
+        dtype=torch.int32,
+        device=device,
+    )
+    return meta
+
+
+def pack_selected_kv(
+    k_cache: torch.Tensor,
+    indices: torch.Tensor,
+    topk_length: Optional[torch.Tensor] = None,
+    out: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Pack selected V3.2 FP8 KV records into FlashMLA's opaque layout.
+
+    Valid indices must form a prefix in every selection row. Invalid suffix
+    entries are zero-filled and ignored by packed attention. ``out`` may be
+    any contiguous uint8 allocation with the size returned by
+    ``get_packed_kv_workspace_size``; always use the returned opaque view.
+    """
+    return flash_mla_cuda.pack_selected_kv(
+        k_cache,
+        indices,
+        topk_length,
+        out,
+    )
+
+
+def flash_mla_with_packed_kvcache(
+    q: torch.Tensor,
+    packed_k_cache: torch.Tensor,
+    head_dim_v: int,
+    tile_scheduler_metadata: FlashMLASchedMeta,
+    softmax_scale: Optional[float] = None,
+    topk_length: Optional[torch.Tensor] = None,
+    attn_sink: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Run SM90 V3.2 sparse decode from a packed selected-KV workspace."""
+    if not isinstance(tile_scheduler_metadata, FlashMLASchedMeta):
+        raise TypeError(
+            "tile_scheduler_metadata must be FlashMLASchedMeta"
+        )
+    if softmax_scale is None:
+        softmax_scale = q.shape[-1] ** (-0.5)
+
+    sched_meta = tile_scheduler_metadata
+    if not sched_meta.have_initialized:
+        pages_per_row, remainder = divmod(
+            packed_k_cache.shape[0],
+            q.shape[0] * q.shape[1],
+        )
+        if remainder:
+            raise ValueError(
+                "packed page count must be divisible by B*S_q"
+            )
+        sched_meta.have_initialized = True
+        sched_meta.config = FlashMLASchedMeta.Config(
+            q.shape[0],
+            q.shape[1],
+            q.shape[2],
+            64,
+            1,
+            False,
+            True,
+            pages_per_row * 64,
+            None,
+            None,
+        )
+    else:
+        assert sched_meta.config is not None
+        config = sched_meta.config
+        pages_per_row, remainder = divmod(
+            packed_k_cache.shape[0],
+            q.shape[0] * q.shape[1],
+        )
+        if remainder:
+            raise ValueError(
+                "packed page count must be divisible by B*S_q"
+            )
+        expected = (
+            config.b,
+            config.s_q,
+            config.h_q,
+            config.topk,
+        )
+        actual = (
+            q.shape[0],
+            q.shape[1],
+            q.shape[2],
+            pages_per_row * 64,
+        )
+        if expected != actual:
+            raise ValueError(
+                "packed inputs are inconsistent with cached scheduler "
+                f"metadata: expected {expected}, got {actual}"
+            )
+
+    out, lse, new_metadata, new_num_splits = (
+        flash_mla_cuda.packed_sparse_decode_fwd(
+            q,
+            packed_k_cache,
+            topk_length,
+            attn_sink,
+            sched_meta.tile_scheduler_metadata,
+            sched_meta.num_splits,
+            head_dim_v,
+            softmax_scale,
+        )
+    )
+    sched_meta.tile_scheduler_metadata = new_metadata
+    sched_meta.num_splits = new_num_splits
+    return out, lse
 
 
 def flash_mla_with_kvcache(

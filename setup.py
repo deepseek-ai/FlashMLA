@@ -79,6 +79,9 @@ ext_modules.append(
             "csrc/sm90/decode/sparse_fp8/instantiations/model1_persistent_h128.cu",
             "csrc/sm90/decode/sparse_fp8/instantiations/v32_persistent_h64.cu",
             "csrc/sm90/decode/sparse_fp8/instantiations/v32_persistent_h128.cu",
+            "csrc/sm90/decode/sparse_fp8/instantiations/v32_packed_multi_query_h64.cu",
+            "csrc/sm90/decode/sparse_fp8/instantiations/v32_packed_multi_query_h128.cu",
+            "csrc/sm90/decode/sparse_fp8/pack_selected_kv.cu",
 
             # sm90 sparse prefill
             "csrc/sm90/prefill/sparse/fwd.cu",
