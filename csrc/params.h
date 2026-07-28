@@ -27,6 +27,8 @@ struct DenseAttnDecodeParams { // TODO Change name to DenseAttnDecodeParams
     int num_blocks;     // Number of blocks in total
     int q_head_per_hk;  // The number of q_head(s) per KV head, = h_q / h_k
     bool is_causal;
+    int window_size;    // SWA: causal sliding-window width; <=0 disables (full
+                        // causal). Query at seq pos s attends to KV in (s-W, s].
     float scale_softmax, scale_softmax_log2;
     
     void *__restrict__ q_ptr;

@@ -336,6 +336,7 @@ __forceinline__ __device__ void wg0_bunch_0(
     Tensor<Engine4, Layout4> &sM,	// (BLOCK_SIZE_M)
     float rL[2],
     int rRightBorderForQSeq[2],
+    int rLeftBorderForQSeq[2],
     float scale_softmax_log2,
     int start_token_idx,
     int idx_in_warpgroup
@@ -349,11 +350,17 @@ __forceinline__ __device__ void wg0_bunch_0(
         float cur_max = MAX_INIT_VAL;
         CUTLASS_PRAGMA_UNROLL
         for (int i = local_row_idx ? 2 : 0; i < size(rP0); i += 4) {
+            int token_idx = start_token_idx + (i/4)*8 + idx_in_warpgroup%4*2;
             if constexpr (DO_OOB_FILLING) {
-                int token_idx = start_token_idx + (i/4)*8 + idx_in_warpgroup%4*2;
                 rP0(i) = token_idx < rRightBorderForQSeq[local_row_idx] ? rP0(i) : MAX_INIT_VAL;
                 rP0(i+1) = token_idx+1 < rRightBorderForQSeq[local_row_idx] ? rP0(i+1) : MAX_INIT_VAL;
             }
+            // SWA lower bound: mask keys before the window start. rLeftBorderForQSeq
+            // is 0 when the window is disabled (or doesn't reach below 0), making
+            // this a runtime no-op; runs on EVERY block (the window's lower edge is
+            // generally interior, not the causal tail that DO_OOB_FILLING covers).
+            if (token_idx < rLeftBorderForQSeq[local_row_idx]) rP0(i) = MAX_INIT_VAL;
+            if (token_idx+1 < rLeftBorderForQSeq[local_row_idx]) rP0(i+1) = MAX_INIT_VAL;
             cur_max = max(cur_max, max(rP0(i), rP0(i+1)));
         }
         cur_max = max(cur_max, __shfl_xor_sync(0xffffffff, cur_max, 1));
@@ -410,6 +417,7 @@ __forceinline__ __device__ void wg1_bunch_0(
     Tensor<Engine3, Layout3> &sM,	// (BLOCK_SIZE_M)
     float rL[2],
     int rRightBorderForQSeq[2],
+    int rLeftBorderForQSeq[2],
     Tensor<Engine4, Layout4> const &sScale0,	// (BLOCK_SIZE_M)
     Tensor<Engine5, Layout5> &rP1,	// ((2, 2, 8), 1, 1)
     float scale_softmax_log2,
@@ -424,15 +432,19 @@ __forceinline__ __device__ void wg1_bunch_0(
         float cur_max = MAX_INIT_VAL;
         CUTLASS_PRAGMA_UNROLL
         for (int i = local_row_idx ? 2 : 0; i < size(rP1); i += 4) {
+            int token_idx = start_token_idx + (i/4)*8 + idx_in_warpgroup%4*2;
             if constexpr (IS_BLK1_LAST || IS_BLK2_LAST) {
                 // Need to apply the mask when either this block is the last one, or
                 // the next block is the last one (because of the causal mask)
-                int token_idx = start_token_idx + (i/4)*8 + idx_in_warpgroup%4*2;
                 rP1(i) = token_idx < rRightBorderForQSeq[local_row_idx] ? rP1(i) : MAX_INIT_VAL;
                 rP1(i+1) = token_idx+1 < rRightBorderForQSeq[local_row_idx] ? rP1(i+1) : MAX_INIT_VAL;
             } else if constexpr (IS_BLK0_LAST) {
                 rP1(i) = rP1(i+1) = MAX_INIT_VAL;
             }
+            // SWA lower bound (see wg0_bunch_0): runtime, every block; no-op when
+            // rLeftBorderForQSeq == 0.
+            if (token_idx < rLeftBorderForQSeq[local_row_idx]) rP1(i) = MAX_INIT_VAL;
+            if (token_idx+1 < rLeftBorderForQSeq[local_row_idx]) rP1(i+1) = MAX_INIT_VAL;
             cur_max = max(cur_max, max(rP1(i), rP1(i+1)));
         }
         cur_max = max(cur_max, __shfl_xor_sync(0xffffffff, cur_max, 1));
@@ -754,6 +766,7 @@ __forceinline__ __device__ void wg0_subroutine(
     Tensor<Engine11, Layout11> &rO0,
     float rL[2],
     int rRightBorderForQSeq[2],
+    int rLeftBorderForQSeq[2],
     TMABarrier barriers_K0[9],
     TMABarrier barriers_K1[9],
     bool &cur_phase_K0,
@@ -775,7 +788,7 @@ __forceinline__ __device__ void wg0_subroutine(
 
     Tensor rPb = make_tensor<T::InputT>(Shape<Shape<_2, _2, _2>, _1, _4>{});
     // Calc P0 = softmax(P0)
-    wg0_bunch_0<T, IS_BLK0_LAST||IS_BLK1_LAST>(rPb, rP0, rO0, sScale0, sM, rL, rRightBorderForQSeq, params.scale_softmax_log2, start_token_idx, idx_in_warpgroup);
+    wg0_bunch_0<T, IS_BLK0_LAST||IS_BLK1_LAST>(rPb, rP0, rO0, sScale0, sM, rL, rRightBorderForQSeq, rLeftBorderForQSeq, params.scale_softmax_log2, start_token_idx, idx_in_warpgroup);
     NamedBarrier::arrive(T::NUM_THREADS, NamedBarriers::sScale0Ready);
 
     // Issue rO0 += rPb @ sV0L
@@ -866,6 +879,7 @@ __forceinline__ __device__ void wg1_subroutine(
     Tensor<Engine11, Layout11> &rO1,
     float rL[2],
     int rRightBorderForQSeq[2],
+    int rLeftBorderForQSeq[2],
     TMABarrier barriers_K0[9],
     TMABarrier barriers_K1[9],
     bool &cur_phase_K1,
@@ -888,7 +902,7 @@ __forceinline__ __device__ void wg1_subroutine(
 
     // Wait for rP1 and warpgroup 0, run bunch 1, notify warpgroup 0
     NamedBarrier::arrive_and_wait(T::NUM_THREADS, NamedBarriers::sScale0Ready);
-    wg1_bunch_0<T, IS_BLK0_LAST, IS_BLK1_LAST, IS_BLK2_LAST>(rP1b, sScale1, rO1, sM, rL, rRightBorderForQSeq, sScale0, rP1, params.scale_softmax_log2, start_token_idx+T::PAGE_BLOCK_SIZE, idx_in_warpgroup);
+    wg1_bunch_0<T, IS_BLK0_LAST, IS_BLK1_LAST, IS_BLK2_LAST>(rP1b, sScale1, rO1, sM, rL, rRightBorderForQSeq, rLeftBorderForQSeq, sScale0, rP1, params.scale_softmax_log2, start_token_idx+T::PAGE_BLOCK_SIZE, idx_in_warpgroup);
     NamedBarrier::arrive(T::NUM_THREADS, NamedBarriers::sScale1Ready);
 
     // Save rPb to sP, and issue rO1 += rP1b @ sV1R
@@ -1033,6 +1047,7 @@ flash_fwd_splitkv_mla_kernel(__grid_constant__ const DenseAttnDecodeParams param
         const bool is_no_split = batch_idx == sched_meta.begin_req_idx ? !sched_meta.is_first_req_splitted : (batch_idx == sched_meta.end_req_idx ? !sched_meta.is_last_req_splitted : true);
         
         int rRightBorderForQSeq[2];
+        int rLeftBorderForQSeq[2];
         if (params.is_causal) {
             // The causal mask looks like:
             // XXXX
@@ -1061,6 +1076,21 @@ flash_fwd_splitkv_mla_kernel(__grid_constant__ const DenseAttnDecodeParams param
             }
         } else {
             rRightBorderForQSeq[0] = rRightBorderForQSeq[1] = seqlen_k;
+        }
+
+        // SWA: per-row lower border for the causal sliding window. Basis
+        // (seqlen_k - get_mask_len) == query-seq-position + 1 (UN-clamped, unlike
+        // rRightBorderForQSeq which is end-block clamped). Keys with absolute KV
+        // index < basis - window_size are outside the window. 0 disables (window
+        // off, or the window reaches before position 0). Computed for both the
+        // causal and the single-token (is_causal forced false) decode paths so
+        // sliding window also limits single-step decode to the last W keys.
+        CUTLASS_PRAGMA_UNROLL
+        for (int local_row_idx = 0; local_row_idx < 2; ++local_row_idx) {
+            int row_idx = get_AorC_row_idx(local_row_idx, idx_in_warpgroup);
+            rLeftBorderForQSeq[local_row_idx] = (params.window_size > 0)
+                ? max(0, (seqlen_k - get_mask_len(params, m_block_idx, row_idx)) - params.window_size)
+                : 0;
         }
 
         // Define global tensors
@@ -1128,7 +1158,7 @@ flash_fwd_splitkv_mla_kernel(__grid_constant__ const DenseAttnDecodeParams param
             #define LAUNCH_WG0_SUBROUTINE(IS_BLK0_LAST, IS_BLK1_LAST) \
                 wg0_subroutine<T, IS_BLK0_LAST, IS_BLK1_LAST>( \
                     tma_gK, sQ, sK0, sK1, sP0, sP1, sM, sScale0, sScale1, \
-                    rQ8, rP0, rO, rL, rRightBorderForQSeq, \
+                    rQ8, rP0, rO, rL, rRightBorderForQSeq, rLeftBorderForQSeq, \
                     barriers_K0, barriers_K1, cur_phase_K0, \
                     tma_params, params, \
                     block_table_ptr, seqlen_k, block_idx, end_block_idx, idx_in_warpgroup \
@@ -1159,7 +1189,7 @@ flash_fwd_splitkv_mla_kernel(__grid_constant__ const DenseAttnDecodeParams param
             #define LAUNCH_WG1_SUBROUTINE(IS_BLK0_LAST, IS_BLK1_LAST, IS_BLK2_LAST) \
                 wg1_subroutine<T, IS_BLK0_LAST, IS_BLK1_LAST, IS_BLK2_LAST>( \
                     tma_gK, sQ, sK0, sK1, sP0, sP1, sM, sScale0, sScale1, \
-                    rQ8, rP1, rO, rL, rRightBorderForQSeq, \
+                    rQ8, rP1, rO, rL, rRightBorderForQSeq, rLeftBorderForQSeq, \
                     barriers_K0, barriers_K1, cur_phase_K1, \
                     tma_params, params, \
                     block_table_ptr, seqlen_k, block_idx, end_block_idx, idx_in_warpgroup \

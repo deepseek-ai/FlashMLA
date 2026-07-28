@@ -37,9 +37,10 @@
 #include "cute/tensor.hpp"
 #include "cute/layout.hpp"
 
-#include "../collective/fmha_common.hpp"
-#include "../collective/fmha_fusion.hpp"
-#include "../collective/sm100_fmha_load_tma_warpspecialized.hpp"
+#include "../../dense/collective/fmha_common.hpp"
+#include "../../dense/collective/fmha_fusion.hpp"
+#include "block_sparse_fwd_192_load.hpp"
+#include "../../dense/common/pipeline_mla.hpp"
 
 namespace cutlass::fmha::collective {
 
@@ -49,7 +50,7 @@ template<
   class Element_,
   class ElementQK_,
   class ElementPV_,
-  class TileShape_,
+  class ComposedTileShape_,
   class StrideQ_,
   class StrideK_,
   class StrideV_,
@@ -59,33 +60,39 @@ template<
   // (2, 1, 1) means that they are stacked (best for large Q since it loads the least K/V)
   // (1, 2, 1) means they sit side by side (best for small Q / large K)
   class ThreadShape = Shape<_2, _1, _1>,
-  // Since shared memory is sufficient for FMHA, there is no need to reuse shared memory.
   class OrderLoadEpilogue = cute::false_type
 >
-struct Sm100FmhaFwdMainloopTmaWarpspecialized {
+struct Sm100BlockSparseFwdMainloopTmaWarpspecialized {
 
   using Element = Element_;
   using ElementQK = ElementQK_;
   using ElementPV = ElementPV_;
-  using TileShape = TileShape_;
+  using ComposedTileShape = ComposedTileShape_;
   using StrideQ = StrideQ_;
   using StrideK = StrideK_;
   using StrideV = StrideV_;
   using Mask = Mask_;
 
   static constexpr int StageCountQ = 2;
-  static constexpr int StageCountKV = sizeof(Element_) == 1 ? 4 : 3;
+  static constexpr int StageCountK = 1;
+  static constexpr int StageCountV = 1;
+  static constexpr int StageCountKV = StageCountK + StageCountV;
+  // Support StageCountKV > 2 in the future. 
+  static_assert(StageCountK == 1 && StageCountV == 1, "Only support StageCountK = StageCountV = 1!");
+  static_assert(std::is_same_v<ThreadShape, Shape<_2, _1, _1>>, "Only support ThreadShape = Shape<_2, _1, _1>");
 
-  using StagesQ = cutlass::gemm::collective::StageCount<StageCountQ>;
-  using StagesKV = cutlass::gemm::collective::StageCount<StageCountKV>;
-  
   using ClusterShape = Shape<_1, _1, _1>;
 
   static const int Alignment = 128 / sizeof_bits_v<Element>;
 
-  using TileShapeQK = decltype(shape_div(TileShape{}, ThreadShape{}));
+  static constexpr auto  HeadDimLatent = size<2, 0>(ComposedTileShape{});
+  static constexpr auto  HeadDimRope = size<2, 1>(ComposedTileShape{});
+  static constexpr auto  HeadDimQK = HeadDimLatent + HeadDimRope;
+  static constexpr auto  HeadDimPV = HeadDimLatent;
 
-  using TileShapePV = decltype(select<0,2,1>(TileShapeQK{}));
+  using TileShapeQK = decltype(shape_div(replace<2>(ComposedTileShape{}, HeadDimQK), ThreadShape{}));
+  using TileShapePV = decltype(select<0,2,1>(shape_div(replace<2>(ComposedTileShape{}, HeadDimPV), ThreadShape{})));
+  using TileShape = decltype(replace<2>(ComposedTileShape{}, HeadDimLatent));
 
   using CollectiveMmaQK = typename cutlass::gemm::collective::CollectiveBuilder<
       cutlass::arch::Sm100, cutlass::arch::OpClassTensorOp,
@@ -105,18 +112,32 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
       cutlass::gemm::KernelTmaWarpSpecialized1SmSm100>::CollectiveOp;
 
   using SmemLayoutQ = decltype(unstageSmemLayout(typename CollectiveMmaQK::SmemLayoutA{}, Int<StageCountQ>{}));
-  using SmemLayoutK = decltype(unstageSmemLayout(typename CollectiveMmaQK::SmemLayoutB{}, Int<StageCountKV>{}));
-  using SmemLayoutV = decltype(unstageSmemLayout(typename CollectiveMmaPV::SmemLayoutB{}, Int<StageCountKV>{}));
+  using SmemLayoutK = decltype(unstageSmemLayout(typename CollectiveMmaQK::SmemLayoutB{}, Int<StageCountK>{}));
+  using SmemLayoutV = decltype(unstageSmemLayout(typename CollectiveMmaPV::SmemLayoutB{}, Int<StageCountV>{}));
 
-  // Reuse shared memory for V and O.
+  using SmemStorageOneStageO = decltype(make_layout(replace<2>(TileShapePV{}, _1{})));
+  
+  // Since the shared memory is not sufficient if we use separate Q, K, V, and O shared memory, 
+  // we reuse shared memory for V and O to address this problem, 
+  // and a barrier has been added to coordinate access to shared memory.
   static constexpr bool IsOrderLoadEpilogue = std::is_same_v<OrderLoadEpilogue, cute::true_type>;
-  struct TensorStorage {
+  static const int NumWarpsEpilogue = 1;
+  static const int NumWarpsLoad = 1;
+  
+  struct TensorStorageQKVO {
     cute::array_aligned<Element, cute::cosize_v<SmemLayoutQ>> smem_q;
-    union {
-      cute::array_aligned<Element, cute::cosize_v<SmemLayoutK>> smem_k;
-      cute::array_aligned<Element, cute::cosize_v<SmemLayoutV>> smem_v;
-    };
+    cute::array_aligned<Element, cute::cosize_v<SmemLayoutK>> smem_k; 
+    cute::array_aligned<Element, cute::cosize_v<SmemLayoutV>> smem_o; // use as O0
+    cute::array_aligned<Element, cute::cosize_v<SmemLayoutV>> smem_v; // use as V0 and O1
   };
+
+  struct TensorStorageQKV {
+    cute::array_aligned<Element, cute::cosize_v<SmemLayoutQ>> smem_q;
+    cute::array_aligned<Element, cute::cosize_v<SmemLayoutK>> smem_k; 
+    cute::array_aligned<Element, cute::cosize_v<SmemLayoutV>> smem_v;
+  };
+
+  using TensorStorage = std::conditional_t<IsOrderLoadEpilogue, TensorStorageQKVO, TensorStorageQKV>;
 
   enum class TmemAllocation : uint32_t {
     kSizeS = 128,
@@ -148,7 +169,7 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
   >;
 
   // from load to mma warp, protects k/v in smem
-  using PipelineKV = cutlass::PipelineTmaUmmaAsync<
+  using PipelineKV = cutlass::PipelineTmaAsyncMla<
     StageCountKV,
     typename CollectiveMmaQK::AtomThrShapeMNK
   >;
@@ -170,18 +191,15 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
   using OrderBarrierSoftmax = cutlass::OrderedSequenceBarrier<
     /*stages*/ 1, /*groups*/ 2>;
 
-  static const int TransactionBytesLoadQ = cutlass::bits_to_bytes(cosize(take<0,3>(SmemLayoutQ{})) * cute::sizeof_bits_v<Element>);
+  static constexpr int TransactionBytesLoadQ = cutlass::bits_to_bytes(cosize(take<0,3>(SmemLayoutQ{})) * cute::sizeof_bits_v<Element>);
+  static constexpr int TransactionBytesLoadK = cutlass::bits_to_bytes(cosize(take<0,3>(SmemLayoutK{})) * cute::sizeof_bits_v<Element>);
+  static constexpr int TransactionBytesLoadV = cutlass::bits_to_bytes(cosize(take<0,3>(SmemLayoutV{})) * cute::sizeof_bits_v<Element>);
 
-  static const int TransactionBytesLoadK = cutlass::bits_to_bytes(cosize(take<0,3>(SmemLayoutK{})) * cute::sizeof_bits_v<Element>);
-  static const int TransactionBytesLoadV = cutlass::bits_to_bytes(cosize(take<0,3>(SmemLayoutV{})) * cute::sizeof_bits_v<Element>);
-
-  static_assert(TransactionBytesLoadK == TransactionBytesLoadV, "K and V smem layouts must be of equal size");
-
-  using Load = Sm100FmhaLoadTmaWarpspecialized<
+  using Load = Sm100BlockSparseFwdLoadTmaWarpspecialized<
     Element, StrideQ, StrideK, StrideV,
     CollectiveMmaQK, CollectiveMmaPV,
     SmemLayoutQ, SmemLayoutK, SmemLayoutV,
-    TensorStorage, PipelineQ, PipelineKV, Mask, TileShape
+    TensorStorage, PipelineQ, PipelineKV, Mask, TileShape, OrderLoadEpilogue
   >;
 
   struct Arguments {
@@ -198,8 +216,13 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
     // scaling factor to quantize O
     float inv_scale_o = 1.0f;
 
-    // SWA: causal sliding-window width. <=0 disables (plain causal).
+    // SWA: causal sliding-window width. <=0 disables (plain causal). When >0,
+    // each query attends only to the last `window_size` keys (q-W < k <= q).
     int window_size = -1;
+
+    // gpt-oss attention sink: per-head [h_q] learnable logit folded into the softmax denominator
+    // (value-less) in-kernel, making O + LSE sink-aware. nullptr disables. Mirrors the dense MLA fwd.
+    const float* sink_bias = nullptr;
   };
 
   struct Params {
@@ -211,6 +234,7 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
     float scale_output;
 
     int window_size;
+    const float* sink_bias;
   };
 
   template<class ProblemShape>
@@ -226,22 +250,40 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
 
     float scale_softmax = args.scale_softmax;
     if (scale_softmax == 0.0f) {
-      scale_softmax = 1.0f / (float) std::sqrt(get<2>(problem_shape));
+      scale_softmax = 1.0f / (float) std::sqrt(get<2, 0>(problem_shape) + get<2, 1>(problem_shape));
     }
     float log2_e = static_cast<float>(std::log2(std::exp(1.0)));
 
     return Params{
-        Load::to_underlying_arguments(problem_shape, args.load, workspace),
+        Load::to_underlying_arguments(problem_shape, args.load, workspace, args.window_size),
         args.scale_q * args.scale_k * scale_softmax,
         args.scale_q * args.scale_k * log2_e * scale_softmax,
         args.scale_v * args.inv_scale_o,
-        args.window_size
+        args.window_size,
+        args.sink_bias
     };
   }
 
   CUTLASS_DEVICE
   static void prefetch_tma_descriptors(Params const& params) {
       Load::prefetch_tma_descriptors(params.load);
+  }
+
+  // block-sparse: number of selected K-blocks for this CTA's q-block (returns -1 => dense,
+  // i.e. fall back to the contiguous causal trip count). bs_base(...)[it] (it in [0,num)) =
+  // global K-tile id of the it-th selected block. q_block = get<0>(blk_coord) since
+  // TileShape Q = q_block_size (one q2k selection per CTA, shared by both half-tile stages).
+  template<class BlkCoord>
+  CUTLASS_DEVICE static int bs_num_sel(Params const& params, BlkCoord const& blk_coord) {
+    if (params.load.ptr_q2k == nullptr) return -1;
+    const int* base = params.load.ptr_q2k + get<0>(blk_coord) * params.load.topk;
+    int n = 0;
+    for (int i = 0; i < params.load.topk; ++i) { if (base[i] >= 0) ++n; else break; }
+    return n;
+  }
+  template<class BlkCoord>
+  CUTLASS_DEVICE static const int* bs_base(Params const& params, BlkCoord const& blk_coord) {
+    return params.load.ptr_q2k + get<0>(blk_coord) * params.load.topk;
   }
 
   template<class BlkCoord, class ProblemShape, class ParamsProblemShape>
@@ -275,7 +317,14 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
     auto pipeline_q_release_state = pipeline_q_consumer_state;
     auto pipeline_kv_release_state = pipeline_kv_consumer_state;
 
-    int mask_tile_count = Mask{}.get_trip_count(blk_coord, TileShape{}, problem_shape, params.window_size);
+    // SWA safe-baseline: window_size is passed through but get_trip_count keeps
+    // the full causal count (no leading-tile skip); apply_mask zeros out-of-window
+    // keys. mma/softmax/correction/load all use the same count -> pipelines stay
+    // in lockstep. block-sparse: the count is the number of selected K-blocks.
+    int bs_sel = bs_num_sel(params, blk_coord);
+    int mask_tile_count = (bs_sel >= 0) ? bs_sel
+                        : Mask{}.get_trip_count(blk_coord, TileShape{}, problem_shape, params.window_size)
+                          - Mask{}.get_trip_start(blk_coord, TileShape{}, problem_shape, params.window_size);
 
     typename CollectiveMmaQK::TiledMma mma_qk;
     ThrMMA thr_mma_qk = mma_qk.get_slice(0);
@@ -337,7 +386,7 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
     // gemm Q1 * K1 -> S1
     pipeline_s0.producer_acquire(pipeline_s0_producer_state);
 
-    gemm_zero_acc(mma_qk, tSrQ0, tSrK(_,_,_,k_index), tStS0);
+    gemm_zero_acc(mma_qk, tSrQ0, tSrK(_,_,_,k_index / 2), tStS0);
 
     pipeline_s0.producer_commit(pipeline_s0_producer_state);
     ++pipeline_s0_producer_state;
@@ -366,7 +415,7 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
     pipeline_s1.producer_acquire(pipeline_s1_producer_state);
 
     // gemm Q2 * K1 -> S2
-    gemm_zero_acc(mma_qk, tSrQ1, tSrK(_,_,_,k_index), tStS1);
+    gemm_zero_acc(mma_qk, tSrQ1, tSrK(_,_,_,k_index / 2), tStS1);
 
     pipeline_s1.producer_commit(pipeline_s1_producer_state);
     ++pipeline_s1_producer_state;
@@ -388,7 +437,7 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
     pipeline_s0.producer_acquire(pipeline_s0_producer_state);
 
     // gemm P1 * V1 -> O1
-    gemm_zero_acc(mma_pv_ts, tOrP0, tOrV(_,_,_,v_index), tOtO0);
+    gemm_zero_acc(mma_pv_ts, tOrP0, tOrV(_,_,_,v_index / 2), tOtO0);
 
     pipeline_corr.producer_commit(pipeline_corr_producer_state);
     ++pipeline_corr_producer_state;
@@ -410,7 +459,7 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
       ++pipeline_kv_consumer_state;
 
       // gemm Q1 * Ki -> S1
-      gemm_zero_acc(mma_qk, tSrQ0, tSrK(_,_,_,k_index), tStS0);
+      gemm_zero_acc(mma_qk, tSrQ0, tSrK(_,_,_,k_index / 2), tStS0);
 
       pipeline_s0.producer_commit(pipeline_s0_producer_state);
       ++pipeline_s0_producer_state;
@@ -430,7 +479,7 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
       pipeline_corr.producer_acquire(pipeline_corr_producer_state);
       pipeline_s1.producer_acquire(pipeline_s1_producer_state);
 
-      gemm_reset_zero_acc(mma_pv_ts, tOrP1, tOrV(_,_,_,v_index), tOtO1);
+      gemm_reset_zero_acc(mma_pv_ts, tOrP1, tOrV(_,_,_,v_index / 2), tOtO1);
 
       pipeline_corr.producer_commit(pipeline_corr_producer_state);
       ++pipeline_corr_producer_state;
@@ -446,7 +495,7 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
       }
 
       // gemm Q2 * Ki -> S2
-      gemm_zero_acc(mma_qk, tSrQ1, tSrK(_,_,_,k_index), tStS1);
+      gemm_zero_acc(mma_qk, tSrQ1, tSrK(_,_,_,k_index / 2), tStS1);
 
       pipeline_s1.producer_commit(pipeline_s1_producer_state);
       ++pipeline_s1_producer_state;
@@ -465,7 +514,7 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
 
       pipeline_s0.producer_acquire(pipeline_s0_producer_state);
 
-      gemm_reset_zero_acc(mma_pv_ts, tOrP0, tOrV(_,_,_,v_index), tOtO0);
+      gemm_reset_zero_acc(mma_pv_ts, tOrP0, tOrV(_,_,_,v_index / 2), tOtO0);
 
       pipeline_corr.producer_commit(pipeline_corr_producer_state);
       ++pipeline_corr_producer_state;
@@ -497,7 +546,7 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
     pipeline_corr.producer_acquire(pipeline_corr_producer_state);
     pipeline_s1.producer_acquire(pipeline_s1_producer_state);
 
-    gemm_reset_zero_acc(mma_pv_ts, tOrP1, tOrV(_,_,_,v_index), tOtO1);
+    gemm_reset_zero_acc(mma_pv_ts, tOrP1, tOrV(_,_,_,v_index / 2), tOtO1);
 
     pipeline_corr.producer_commit(pipeline_corr_producer_state);
     ++pipeline_corr_producer_state;
@@ -516,9 +565,10 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
     // Q1 * K1  , Q2 * K1  , S11 * V1 , Q1 * K2  , S21 * V1  , Q2 * K2 , S12 * V2 , Q1 * K3  , S22 * K2 , ...
   }
 
-  template<bool need_apply_mask, class Stage, class BlkCoord, class CoordTensor, class ProblemShape>
+  template<bool need_mask, class Stage, class BlkCoord, class CoordTensor, class ProblemShape>
   CUTLASS_DEVICE auto
   softmax_step(
+      bool need_apply_mask,
       float& row_max, float& row_sum,
       Stage stage, bool final_call,
       BlkCoord const& blk_coord, CoordTensor const& cS,
@@ -574,8 +624,10 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
     Tensor tTMEM_LOADrS = make_tensor<ElementQK>(shape(tTMEM_LOADcS));
     copy(tiled_tmem_load, tTMEM_LOADtS, tTMEM_LOADrS);
 
-    if constexpr (need_apply_mask) {
-      Mask{}.apply_mask(tTMEM_LOADrS, tTMEM_LOADcS, problem_shape, params.window_size);
+    if constexpr (need_mask) {
+      if(need_apply_mask) {
+        Mask{}.apply_mask(tTMEM_LOADrS, tTMEM_LOADcS, problem_shape, params.window_size);
+      }
     }
 
     ElementQK old_row_max = row_max;
@@ -623,7 +675,7 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
 
     NumericArrayConverter<Element, ElementQK, kConversionsPerStep> convert;
 
-    const int kReleasePipeCount = 10;  // must be multiple of 2
+    constexpr int kReleasePipeCount = 10;  // must be multiple of 2
 
     order_s.wait();
 
@@ -709,6 +761,16 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
       // re-acquire the S part in the final step
       pipeline_s.consumer_wait(pipeline_s_consumer_state);
 
+      // gpt-oss attention sink: fold a per-head value-less logit into the denominator (mirrors the
+      // dense MLA fwd mainloop). row_sum = sum exp(scale_softmax*(S-row_max)); O-scale =
+      // scale_output/row_sum and LSE = log(row_sum)+scale_softmax*row_max, so adding
+      // exp(sink - scale_softmax*row_max) makes both O and LSE sink-aware. row_max is finite for any
+      // attended row (block-sparse: every kept tile is a selected block; masked-only rows unused).
+      if (params.sink_bias != nullptr && row_max != -INFINITY) {
+        int head = crd2idx(get<2,0>(blk_coord), get<3,0>(problem_shape));
+        row_sum += ::expf(params.sink_bias[head] - params.scale_softmax * row_max);
+      }
+
       Tensor tTMEM_STOREVrS = make_tensor<ElementQK>(shape(tTMEM_STOREVcS));
       tTMEM_STOREVrS(kIdxFinalRowMax) = row_max;
       tTMEM_STOREVrS(kIdxFinalRowSum) = row_sum;
@@ -725,54 +787,62 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
       PipelineS& pipeline_s, typename PipelineS::PipelineState& pipeline_s_consumer_state,
       PipelineC& pipeline_c, typename PipelineC::PipelineState& pipeline_c_producer_state,
       OrderBarrierSoftmax& order_s) {
-
-    // SWA: when window active, get_unmasked_trip_count == 0 (all tiles need
-    // masking) so the unmasked loop is skipped and every tile goes through the
-    // masked loop below (apply_mask), covering both the causal diagonal and the
-    // window lower edge.
-    int mask_tile_count = Mask{}.get_unmasked_trip_count(blk_coord, TileShape{}, problem_shape, params.window_size);
+    // SWA: skip leading out-of-window K-tiles. swa_trip_start is the first tile
+    // any query in this block attends to; we drop the [0, swa_trip_start) tiles
+    // from the count (the load warp + cS cursor below start there too). With the
+    // window active get_masked_trip_count == get_trip_count, so masked == total
+    // after the shift -> apply_mask runs on every kept tile (window edge + diagonal).
+    const int swa_trip_start = Mask{}.get_trip_start(blk_coord, TileShape{}, problem_shape, params.window_size);
+    // block-sparse: iterate this q-block's selected K-blocks; the cS k-coordinate per
+    // iter is the SELECTED block's global position (sel_iter*TileShapeQK_k) so apply_mask
+    // (run on every tile) sees the right absolute key index. dense: contiguous causal range.
+    const int bs_sel = bs_num_sel(params, blk_coord);
+    const bool block_sparse = (bs_sel >= 0);
+    const int* q2k_base = block_sparse ? bs_base(params, blk_coord) : nullptr;
+    const int mask_trip_count = block_sparse ? bs_sel
+                              : Mask{}.get_masked_trip_count(blk_coord, TileShape{}, problem_shape, params.window_size) - swa_trip_start;
+    const int total_trip_count = block_sparse ? bs_sel
+                              : Mask{}.get_trip_count(blk_coord, TileShape{}, problem_shape, params.window_size) - swa_trip_start;
+    int trip_idx = total_trip_count;
 
     ElementQK row_max = -INFINITY;
     ElementQK row_sum = 0;
 
     Tensor cS_base = make_identity_tensor(select<0,1>(TileShapeQK{}));
-    auto logical_offset = make_coord(
-        get<0>(blk_coord) * get<0>(TileShape{}) + (stage % get<0>(ThreadShape{})) * get<0>(TileShapeQK{}),
-        0 + (stage % get<1>(ThreadShape{})) * get<1>(TileShapeQK{})
-    );
-    Tensor cS = domain_offset(logical_offset, cS_base);
+    const int q_off = get<0>(blk_coord) * get<0>(TileShape{}) + (stage % get<0>(ThreadShape{})) * get<0>(TileShapeQK{});
+    auto make_cS = [&](int k_tile) {
+      auto logical_offset = make_coord(
+          q_off,
+          k_tile * get<1>(TileShapeQK{}) + (stage % get<1>(ThreadShape{})) * get<1>(TileShapeQK{})
+      );
+      return domain_offset(logical_offset, cS_base);
+    };
 
     pipeline_c.producer_acquire(pipeline_c_producer_state);
 
+    constexpr bool NeedMask = !std::is_same_v<Mask, NoMask>;
+
+    // block-sparse: only the diagonal-region K-tiles need the causal mask. A K-tile
+    // (128 keys at k_tile*128) is fully BELOW this stage's first query row q_off when
+    // k_tile < q_off/128 -> all its keys are causal-valid -> skip apply_mask (saves the
+    // per-tile mask cost; the dominant overhead vs the stock dense fwd at low sparsity).
+    // k_tile >= q_off/128 is the diagonal tile (causal edge) or future (fully masked).
+    const int diag_k_tile = q_off / get<1>(TileShapeQK{});
+
     CUTLASS_PRAGMA_NO_UNROLL
-    for (; mask_tile_count > 0; mask_tile_count -= 1) {
-      softmax_step<false /* need_apply_mask */>(
+    for (; trip_idx > 0; trip_idx -= 1) {
+      int cur_iter = total_trip_count - trip_idx;  // 0,1,2,... (block-sparse selected-block index)
+      int k_tile = block_sparse ? q2k_base[cur_iter] : (swa_trip_start + cur_iter);
+      Tensor cS = make_cS(k_tile);
+      softmax_step<NeedMask /* need_mask */>(
+          block_sparse ? (k_tile >= diag_k_tile) : (trip_idx <= mask_trip_count),
           row_max, row_sum, stage,
-          (mask_tile_count == 1) &&
-              (Mask{}.get_masked_trip_count(blk_coord, TileShape{}, problem_shape, params.window_size) == 0),
+          trip_idx == 1,
           blk_coord, cS, params, problem_shape,
           pipeline_s, pipeline_s_consumer_state,
           pipeline_c, pipeline_c_producer_state,
           order_s
       );
-
-      cS.data() = cS.data() + E<1>{} * get<1>(ThreadShape{}) * get<1>(TileShapeQK{});
-    }
-
-    // Masked iterations
-    mask_tile_count = Mask{}.get_masked_trip_count(blk_coord, TileShape{}, problem_shape, params.window_size);
-
-    CUTLASS_PRAGMA_NO_UNROLL
-    for (; mask_tile_count > 0; mask_tile_count -= 1) {
-      softmax_step<true /* need_apply_mask */>(
-          row_max, row_sum, stage, mask_tile_count == 1,
-          blk_coord, cS, params, problem_shape,
-          pipeline_s, pipeline_s_consumer_state,
-          pipeline_c, pipeline_c_producer_state,
-          order_s
-      );
-
-      cS.data() = cS.data() + E<1>{} * get<1>(ThreadShape{}) * get<1>(TileShapeQK{});
     }
 
     pipeline_c.producer_commit(pipeline_c_producer_state);
@@ -800,7 +870,7 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
     // As opposed to the softmax, we do not have enough registers here
     // to load all of the values (for tile kv = 128), so we loop
     // good values would be either 32 or 64
-    const int kCorrectionTileSize = 32 / sizeof(ElementOut);
+    constexpr int kCorrectionTileSize = 32 / sizeof(ElementOut);
 
     using TMEM_LOAD = std::conditional_t<kCorrectionTileSize == 32, SM100_TMEM_LOAD_32dp32b32x, SM100_TMEM_LOAD_32dp32b16x>;  // 4x32 threads with 64 cols of 32b elem
 
@@ -885,7 +955,7 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
     // As opposed to the softmax, we do not have enough registers here
     // to load all of the values (for tile kv = 128), so we loop
     // good values would be either 32 or 64
-    const int kCorrectionTileSize = 16;
+    constexpr int kCorrectionTileSize = 16;
 
     using TMEM_LOAD = SM100_TMEM_LOAD_32dp32b16x;  // 4x32 threads with 64 cols of 32b elem
     using TMEM_STORE = SM100_TMEM_STORE_32dp32b16x;  // 4x32 threads with 64 cols of 32b elem
@@ -935,7 +1005,7 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
     //   TMEM_LOAD, FMUL2 scale, TMEM_STORE
     copy_in(0);
 
-    int count = get<2>(TileShape{}) / kCorrectionTileSize;
+    constexpr int count = get<2>(TileShape{}) / kCorrectionTileSize;
 
     CUTLASS_PRAGMA_UNROLL
     for (int i = 0; i < count; i++) {
@@ -973,7 +1043,13 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
       PipelineE& pipeline_epi, typename PipelineE::PipelineState& pipeline_epi_producer_state,
       CollectiveEpilogue& epilogue) {
 
-    int mask_tile_count = Mask{}.get_trip_count(blk_coord, TileShape{}, problem_shape, params.window_size);
+    // SWA: same windowed count as mma/softmax/load (baseline: unchanged causal count).
+    // block-sparse: the count is the number of selected K-blocks (correction is
+    // position-agnostic -- it only rescales O -- so only the count must match).
+    int bs_sel = bs_num_sel(params, blk_coord);
+    int mask_tile_count = (bs_sel >= 0) ? bs_sel
+                        : Mask{}.get_trip_count(blk_coord, TileShape{}, problem_shape, params.window_size)
+                          - Mask{}.get_trip_start(blk_coord, TileShape{}, problem_shape, params.window_size);
 
     int thread_idx = threadIdx.x % (4 * cutlass::NumThreadsPerWarp);
 
@@ -1081,7 +1157,6 @@ struct Sm100FmhaFwdMainloopTmaWarpspecialized {
     //    store to smem
     Tensor sO = make_tensor(make_smem_ptr(shared_storage_epi.smem_o.data()), typename TensorStorageEpi::SmemLayoutO{});
     Tensor gLSE = make_tensor(make_gmem_ptr(epilogue.params.ptr_LSE), select<0,3>(problem_shape), epilogue.params.dLSE);
-    
     correction_epilogue(params.scale_output / tTMEM_LOADVrS(kIdxFinalRowSum), _0{}, sO);
 
     if (epilogue.params.ptr_LSE != nullptr) {

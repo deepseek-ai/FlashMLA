@@ -15,14 +15,16 @@ void call_run_fmha_bwd([[maybe_unused]] Mask mask, [[maybe_unused]] Varlen is_va
                   at::Tensor v, at::Tensor o, at::Tensor lse,
                   at::Tensor cumulative_seqlen_q, at::Tensor cumulative_seqlen_kv,
                   at::Tensor dq, at::Tensor dk, at::Tensor dv,
-                  float softmax_scale, int max_seqlen_q, int total_seqlen_kv) {
+                  float softmax_scale, int max_seqlen_q, int total_seqlen_kv,
+                  int window_size, const float *sink_ptr, float *d_sink_ptr) {
   static constexpr bool IsVarlen = std::is_same_v<Varlen, true_type>;
   static constexpr bool IsMla = std::is_same_v<Mla, true_type>;
   using TileShape = std::conditional_t<IsMla, Shape<_64, _128, _192, _128>, Shape<_128, _128, _128, _128>>;
   run_fmha_bwd<Element, IsVarlen, IsMla, TileShape, Mask>(workspace_buffer, d_o, q, k, v, o, lse,
                           cumulative_seqlen_q, cumulative_seqlen_kv,
                           dq, dk, dv,
-                          softmax_scale, max_seqlen_q, total_seqlen_kv);
+                          softmax_scale, max_seqlen_q, total_seqlen_kv, window_size,
+                          sink_ptr, d_sink_ptr);
 }
 
 
@@ -30,9 +32,16 @@ void FMHACutlassSM100BwdRun(at::Tensor workspace_buffer, at::Tensor d_o, at::Ten
                             at::Tensor v, at::Tensor o, at::Tensor lse,
                             at::Tensor cumulative_seqlen_q, at::Tensor cumulative_seqlen_kv,
                             at::Tensor dq, at::Tensor dk, at::Tensor dv,
-                            int mask_mode_code, float softmax_scale, int max_seqlen_q, int max_seqlen_kv, bool is_varlen) {
+                            int mask_mode_code, float softmax_scale, int max_seqlen_q, int max_seqlen_kv, bool is_varlen,
+                            int window_size, std::optional<at::Tensor> attn_sink,
+                            std::optional<at::Tensor> d_sink) {
 
   const c10::cuda::OptionalCUDAGuard device_guard(q.device());
+
+  // gpt-oss attention sink (MLA only): per-head [h_q] logit + its output grad d_sink ([h_q],
+  // pre-zeroed). d_sink is folded into the sum_OdO pass (zero extra cost).
+  const float *sink_ptr = attn_sink.has_value() ? attn_sink->data_ptr<float>() : nullptr;
+  float *d_sink_ptr = d_sink.has_value() ? d_sink->data_ptr<float>() : nullptr;
 
   int head_dim_qk = q.size(-1);
   int head_dim_vo = v.size(-1);
@@ -66,12 +75,14 @@ void FMHACutlassSM100BwdRun(at::Tensor workspace_buffer, at::Tensor d_o, at::Ten
         call_run_fmha_bwd(mask, varlen, in, out, true_type{}, workspace_buffer, d_o, q, k, v, o, lse,
                           cumulative_seqlen_q, cumulative_seqlen_kv,
                           dq, dk, dv,
-                          softmax_scale, max_seqlen_q, max_seqlen_kv);
+                          softmax_scale, max_seqlen_q, max_seqlen_kv, window_size,
+                          sink_ptr, d_sink_ptr);   // MLA: attention-sink fold-in
       } else if (head_dim_qk == 128 && head_dim_vo == 128) {
         call_run_fmha_bwd(mask, varlen, in, out, false_type{}, workspace_buffer, d_o, q, k, v, o, lse,
                           cumulative_seqlen_q, cumulative_seqlen_kv,
                           dq, dk, dv,
-                          softmax_scale, max_seqlen_q, max_seqlen_kv);      }
+                          softmax_scale, max_seqlen_q, max_seqlen_kv, window_size,
+                          nullptr, nullptr);        }
       else {
         std::cout << "No kernel instantiated for head_dim_qk=" << head_dim_qk << " head_dim_vo=" << head_dim_vo << std::endl;
       }

@@ -42,10 +42,23 @@
 #include "cutlass/gemm/collective/collective_builder.hpp"
 
 #include <kerutils/kerutils.cuh> // for  KERUTILS_ENABLE_SM100A
-#include "../collective/fmha_common.hpp"
+
+// include dense MLA bwd's collective deps via absolute path. The original
+// `#include "../collective/fmha_common.hpp"` resolved against the dense kernel dir;
+// our v2 lives under `sparse/bwd/v2/` so we go up three levels to reach
+// `prefill/dense/collective/`.
+#include "../../dense/collective/fmha_common.hpp"
+#include "../../dense/collective/fmha_fusion.hpp"
+
+// kerutils sparse-gather intrinsic (the sparse variant will swap in for K/V TMA load).
+#include <kerutils/device/sm100/intrinsics.cuh>
 
 #include <cmath>
 
+// keep the inner struct under cutlass::fmha::kernel for type compatibility
+// with the dense MLA bwd's collective/util headers, but rename the struct itself so
+// it can coexist with `Sm100SparseBwdMlaKernelTmaWarpSpecialized` (dense path) in the
+// same translation unit.
 namespace cutlass::fmha::kernel {
 
 using namespace cutlass::fmha::collective;
@@ -59,7 +72,7 @@ template<
     class TileShape,
     class Mask
 >
-struct Sm100FmhaBwdMlaKernelTmaWarpSpecialized {
+struct Sm100SparseBwdMlaKernelTmaWarpSpecialized {
 
   using TileShapeQ = decltype(get<0>(TileShape{}));
   using TileShapeK = decltype(get<1>(TileShape{}));
@@ -111,6 +124,9 @@ struct Sm100FmhaBwdMlaKernelTmaWarpSpecialized {
 
   using ArchTag = cutlass::arch::Sm100;
 
+  // cluster<3,1,1> (cross-CTA partial-S reduction) hit "unspecified launch
+  // failure" at runtime and was reverted; the D_QK split is handled by giving
+  // each of 3 CTAs its own 192-col slice instead (see grid layout).
   using ClusterShape = Shape<_1, _1, _1>;
   using Schedule = cutlass::gemm::KernelTmaWarpSpecialized1SmSm100;
 
@@ -189,7 +205,10 @@ struct Sm100FmhaBwdMlaKernelTmaWarpSpecialized {
 
   // pipelines are named Pipeline<Producer><Consumer><Resource>
   static constexpr int kStagesComputeSmem = 1;
-  using PipelineLoadMmaQ = PipelineTmaUmmaAsync<2, ClusterShape>;
+  // D path: pipeline kStages 2 -> 1 forces Load+MMA strict serial (Load cannot
+  // race-ahead within iter). Fixes K SMEM race where Load's phase N+1 K write
+  // overwrites slot 0 before MMA chunk N reads it. SMEM unchanged.
+  using PipelineLoadMmaQ = PipelineTmaUmmaAsync<1, ClusterShape>;
   using PipelineLoadMmaDO = PipelineTmaUmmaAsync<1, ClusterShape>;
   using PipelineLoadComputeLSE = PipelineAsync<1>;
   using PipelineLoadComputeSumOdO = PipelineAsync<1>;
@@ -198,6 +217,11 @@ struct Sm100FmhaBwdMlaKernelTmaWarpSpecialized {
   using PipelineMmaReduceDQ = PipelineUmmaAsync<1>;
   using PipelineComputeMmaP = PipelineUmmaConsumerAsync<1>;
   using PipelineComputeMmaDS = PipelineUmmaConsumerAsync<kStagesComputeSmem>;
+  // Note: kStages=2 + compute restructure. kStages=1 hung at 879;
+  // kStages=8 left race window (882 dV cos 0.07-0.27 for chunks 0..2). kStages=2
+  // tighter buffer: MMA can have 1 outstanding ahead of consumer release, but
+  // chunk c+2 blocks at acquire until consumer released chunk c. TMEM race
+  // narrowed to 1 chunk window (still possible but very small).
   using PipelineMmaComputeDKDV = PipelineUmmaAsync<2>;
   static constexpr int kStagesReduceTmaStore = 2;
   using PipelineReduceTmaStore = PipelineTmaStore<kStagesReduceTmaStore>;
@@ -267,6 +291,10 @@ struct Sm100FmhaBwdMlaKernelTmaWarpSpecialized {
     alignas(1024) cute::array<ElementAcc, cute::cosize_v<SmemLayoutDQ>> smem_dq;
     alignas(16) cute::array<ElementAcc, cute::cosize_v<SmemLayoutLSE>> smem_lse;
     alignas(16) cute::array<ElementAcc, cute::cosize_v<SmemLayoutSumOdO>> smem_sum_odo;
+    // custom transac_bar_t for K gather4, mirroring sparse FWD's
+    // pattern. We use this instead of the pipeline's mbar to verify whether
+    // pipeline mbar + raw gather4 PTX is the incompatibility source.
+    alignas(16) kerutils::transac_bar_t sparse_k_gather_bar;
   };
 
   static constexpr int kTransactionsBytesLoadQ = cutlass::bits_to_bytes(cosize(take<0,3>(SmemLayoutQ{})) * cute::sizeof_bits_v<Element>);
@@ -288,15 +316,28 @@ struct Sm100FmhaBwdMlaKernelTmaWarpSpecialized {
   using TensorStride = TensorStrideContiguousK;  // S D (H B)
   using RowTensorStride = Stride<_1, Stride<int, int>>;    // S (H B)
 
+  // Index stride for the sparse indices tensor (per-q-token int32 [topk] view).
+  using IndicesStride = Stride<int, _1, Stride<int, int>>;   // Seq Topk (H B)
+
   struct MainloopArguments {
     const Element* ptr_q;
     TensorStride stride_q;
-    const Element* ptr_k;
-    TensorStride stride_k;
-    const Element* ptr_v;
-    TensorStride stride_v;
+    // Sparse K/V: one buffer (DSA absorbed-MLA); V occupies kv[:, :, :D_V].
+    const Element* ptr_kv;
+    TensorStride stride_kv;
+    // Kept for type signature compatibility with helpers ported from dense MLA bwd.
+    // The actual load fires through `tensor_map_kv` + ku::tma_gather4_cta_group_1.
+    const Element* ptr_k;   // alias for ptr_kv
+    TensorStride stride_k;  // alias for stride_kv
+    const Element* ptr_v;   // alias for ptr_kv
+    TensorStride stride_v;  // alias for stride_kv
     const Element* ptr_do;
     TensorStride stride_do;
+
+    // Sparse indices: int32 [s_q, h_kv=1, topk].
+    const int* ptr_indices;
+    IndicesStride stride_indices;
+    int topk;
 
     const ElementAcc* ptr_lse;
     RowTensorStride stride_lse;
@@ -308,10 +349,6 @@ struct Sm100FmhaBwdMlaKernelTmaWarpSpecialized {
     TensorStride stride_dq_acc;
 
     ElementAcc softmax_scale = 1.0f / sqrtf(TileShapeDQK{});
-
-    // SWA: causal sliding-window width. <=0 disables (plain causal). MUST equal
-    // the forward window so the backward masks S identically (gradient correctness).
-    int window_size = -1;
   };
 
   using TMA_K = typename CollectiveMmaQK::Params::TMA_B;
@@ -325,11 +362,26 @@ struct Sm100FmhaBwdMlaKernelTmaWarpSpecialized {
   ));
 
   struct MainloopParams {
+    // Inherited from dense MLA bwd. tma_load_k/v are kept as compile-time
+    // placeholders (some helpers reference their layout types); the actual
+    // load fires through `tensor_map_kv` + ku::tma_gather4_cta_group_1.
     TMA_K tma_load_k;
     TMA_V tma_load_v;
     TMA_Q tma_load_q;
     TMA_DO tma_load_do;
     TMA_DQ tma_red_dq;
+
+    // Sparse gather TMA descriptor for K and V (single buffer; V = kv[:, :, :D_V]).
+    // Built host-side via cuTensorMapEncodeTiled in the run wrapper.
+    CUtensorMap tensor_map_kv;
+
+    // dKV scatter descriptor (per-row SM90_TMA_REDUCE_ADD_2D issues at row
+    // indices[k_pos]; standard scatter4 not in atom set).
+    CUtensorMap tensor_map_dkv;
+
+    // kl_target [s_q, topk] FP32 store. FP32 + 64-elem-bf16-style box=64
+    // hits CUDA_ERROR_INVALID_VALUE on cuTensorMapEncodeTiled; use SWIZZLE_NONE.
+    CUtensorMap tensor_map_kl_target;
   };
 
   struct EpilogueArguments {
@@ -337,6 +389,13 @@ struct Sm100FmhaBwdMlaKernelTmaWarpSpecialized {
     TensorStride stride_dk;
     Element* ptr_dv;
     TensorStride stride_dv;
+    // FP32 dKV accumulator workspace (deterministic atomicAdd target).
+    // Shape [s_kv, h_kv=1, d_qk] FP32. Host allocates + zeros + post-casts to
+    // bf16 dKV after kernel. Replaces non-deterministic bf16 atomicAdd ordering.
+    ElementAcc* ptr_dkv_acc = nullptr;
+    // Fused reducesum: kl_target = sum_h(P) per (q, k_pos). FP32.
+    // Shape [s_q, topk]; nullptr disables the kl_target path.
+    ElementAcc* ptr_kl_target = nullptr;
   };
 
   struct Arguments {
@@ -405,6 +464,13 @@ struct Sm100FmhaBwdMlaKernelTmaWarpSpecialized {
         SmemLayoutDQ{}(_, _, _0{})
     );
 
+    // Sparse CUtensorMap descriptors (gather K/V, scatter dKV, store kl_target).
+    // Built via the host-side helper in sparse_bwd_host.cuh -- can't be done
+    // here because to_underlying_arguments must be device-callable in some
+    // CUTLASS paths and CUTLASS_CUDA_DRIVER_WRAPPER_CALL needs the driver shim
+    // resolved in a .cu compilation unit. So we zero-initialize them here and
+    // expect the host wrapper to fill them in before launch.
+    CUtensorMap zero_map{};
     return Params{
       args.problem_shape,
       args.mainloop,
@@ -413,7 +479,10 @@ struct Sm100FmhaBwdMlaKernelTmaWarpSpecialized {
         params_vdo.tma_load_b,
         params_kq.tma_load_a,
         params_vdo.tma_load_a,
-        tma_red_dq
+        tma_red_dq,
+        zero_map,   // tensor_map_kv     -- filled host-side
+        zero_map,   // tensor_map_dkv    -- filled host-side
+        zero_map,   // tensor_map_kl_target -- filled host-side
       },
       args.epilogue,
       args.hw_info
@@ -444,6 +513,9 @@ struct Sm100FmhaBwdMlaKernelTmaWarpSpecialized {
       BlkCoord const& blk_coord,
       BlkOffset const& blk_offset,
       ProblemShape_ const& problem_shape,
+      // in sparse semantics iter_index is K-tile-index (was Q-block in
+      // dense). Q/dO/LSE/sum_OdO load use `sq_idx` (= get<1>(blk_coord))
+      // instead, since the Q-token is fixed across all K-tile iterations.
       int iter_index,
       int iter_count,
       MainloopArguments const& mainloop_args,
@@ -508,31 +580,74 @@ struct Sm100FmhaBwdMlaKernelTmaWarpSpecialized {
     // set up lse and sum_odo
 
     auto [blk_coord_q, blk_coord_k, blk_coord_d, blk_coord_dv, blk_coord_batch] = blk_coord;
+    // in sparse semantics get<1>(blk_coord) IS the Q-token index.
+    // Use this for Q/dO/LSE/sum_OdO TMA partitions instead of iter_index.
+    const int sq_idx = blk_coord_k;  // Q-token index (renamed for clarity)
 
-    pipeline_load_mma_q.producer_acquire(pipeline_load_mma_q_producer_state);
+    // D path: K gather + Q load are wrapped in a 3-chunk loop. Each chunk c
+    // delivers Q_c (cols [c*192,(c+1)*192)) and K_c (same cols, gathered) into
+    // the pipeline's stage. The consumer (MMA) drains 3 stages per K-iter for
+    // S accumulate, then 3 more for dK/dQ. Pipeline kStages=2 cycles slots.
+    static constexpr int kSparseKGatherBytes =
+        4 * TileShapeDQK::value * sizeof(Element) * (TileShapeK::value / 4);
     auto tma_barrier = pipeline_load_mma_q.producer_get_barrier(pipeline_load_mma_q_producer_state);
 
-    pipeline_load_mma_q.producer_expect_transaction(pipeline_load_mma_q_producer_state, kTransactionsBytesLoadK);
+    // ===== Setup phase: S accumulate across 3 d_qk chunks =====
+    CUTLASS_PRAGMA_NO_UNROLL
+    for (int chunk_idx = 0; chunk_idx < 3; ++chunk_idx) {
+      pipeline_load_mma_q.producer_acquire(pipeline_load_mma_q_producer_state);
+      tma_barrier = pipeline_load_mma_q.producer_get_barrier(pipeline_load_mma_q_producer_state);
+      pipeline_load_mma_q.producer_expect_transaction(pipeline_load_mma_q_producer_state, kSparseKGatherBytes);
 
-    // load K
-    if (cute::elect_one_sync()) {
-      cute::copy(
-          mainloop_params.tma_load_k.with(*tma_barrier, mcast_mask),
-          tKgK_mkl(_, blk_coord_k, _0{}, blk_coord_batch),
-          tKsK(_, _0{})
-      );
+      // K gather chunk_idx (cols [chunk_idx*D_QK_PARTIAL, (chunk_idx+1)*D_QK_PARTIAL))
+      if (cute::elect_one_sync()) {
+        using bf16 = Element;
+        static constexpr int B_TOPK_         = decltype(get<1>(TileShape{}))::value;  // 64
+        static constexpr int D_QK_PARTIAL_   = decltype(get<2>(TileShape{}))::value;  // 192
+        static constexpr int kNumRowChunks   = B_TOPK_ / 4;                            // 16
+        const int* gIndices = mainloop_args.ptr_indices
+                            + sq_idx * mainloop_args.topk;
+        bf16* sK_dst_base = reinterpret_cast<bf16*>(shared_tensors.smem_k.begin());
+        // D path: K is 2-staged. Write to slot = producer_state.index().
+        const int sK_slot_setup = pipeline_load_mma_q_producer_state.index();
+        bf16* sK_dst = sK_dst_base + sK_slot_setup * (B_TOPK_ * D_QK_PARTIAL_);
+        static constexpr int kCols  = 64;
+        static constexpr int kNumColIters = D_QK_PARTIAL_ / kCols;  // 3
+        CUTLASS_PRAGMA_UNROLL
+        for (int rc = 0; rc < kNumRowChunks; ++rc) {
+          int4 row_idxs = *reinterpret_cast<const int4*>(
+              gIndices + iter_index * B_TOPK_ + rc * 4);
+          // clamp invalid (negative sentinel OR out-of-range) indices.
+          // Real-data causal masking can emit indices >= K; missing >=K check
+          // here causes TMA gather illegal access at scale (job 869 root cause).
+          if (row_idxs.x < 0 || row_idxs.x >= K) row_idxs.x = 0;
+          if (row_idxs.y < 0 || row_idxs.y >= K) row_idxs.y = 0;
+          if (row_idxs.z < 0 || row_idxs.z >= K) row_idxs.z = 0;
+          if (row_idxs.w < 0 || row_idxs.w >= K) row_idxs.w = 0;
+          CUTLASS_PRAGMA_UNROLL
+          for (int cc = 0; cc < kNumColIters; ++cc) {
+            ku::tma_gather4_cta_group_1_pipe(
+                &mainloop_params.tensor_map_kv,
+                tma_barrier,
+                sK_dst + cc * B_TOPK_ * kCols + rc * 4 * kCols,
+                /*col_idx=*/chunk_idx * D_QK_PARTIAL_ + cc * kCols,
+                row_idxs,
+                static_cast<int64_t>(cute::TMA::CacheHintSm90::EVICT_LAST));
+          }
+        }
+      }
+
+      // load Q chunk_idx (d_qk tile = chunk_idx)
+      if (cute::elect_one_sync()) {
+        cute::copy(
+            mainloop_params.tma_load_q.with(*tma_barrier, mcast_mask),
+            tQgQ_mkl(_, sq_idx, chunk_idx, blk_coord_batch),
+            tQsQ(_, pipeline_load_mma_q_producer_state.index())
+        );
+      }
+
+      ++pipeline_load_mma_q_producer_state;
     }
-
-    // load Q
-    if (cute::elect_one_sync()) {
-      cute::copy(
-          mainloop_params.tma_load_q.with(*tma_barrier, mcast_mask),
-          tQgQ_mkl(_, iter_index, _0{}, blk_coord_batch),
-          tQsQ(_, pipeline_load_mma_q_producer_state.index())
-      );
-    }
-
-    ++pipeline_load_mma_q_producer_state;
 
     pipeline_load_compute_lse.producer_acquire(pipeline_load_compute_lse_producer_state);
 
@@ -541,7 +656,8 @@ struct Sm100FmhaBwdMlaKernelTmaWarpSpecialized {
 
     int thread_idx = threadIdx.x % NumThreadsPerWarp;
     int smem_idx = TileShapeQ{} * pipeline_load_compute_lse_producer_state.index() + thread_idx * kLoadPerThread;
-    int gmem_idx = TileShapeQ{} * iter_index + thread_idx * kLoadPerThread;
+    // sparse: gmem_idx uses sq_idx (fixed Q-token) for LSE addressing.
+    int gmem_idx = TileShapeQ{} * sq_idx + thread_idx * kLoadPerThread;
     auto mLSE = make_tensor(mainloop_args.ptr_lse, make_shape(Q, HB), mainloop_args.stride_lse);
     for (int i = 0; i < kLoadPerThread; i++) {
       cutlass::arch::cp_async_zfill<4>(
@@ -558,33 +674,76 @@ struct Sm100FmhaBwdMlaKernelTmaWarpSpecialized {
     pipeline_load_mma_do.producer_acquire(pipeline_load_mma_do_producer_state);
     tma_barrier = pipeline_load_mma_do.producer_get_barrier(pipeline_load_mma_do_producer_state);
 
-    pipeline_load_mma_do.producer_expect_transaction(pipeline_load_mma_do_producer_state, kTransactionsBytesLoadV);
+    // Option A: V gather4 delivers bytes to pipeline_load_mma_do's mbar
+    // (same as dO TMA). Mma's consumer_wait(load_mma_do) gets dO+V both.
+    // V gather covers D_V_CHUNK cols (= 128 = 2 col-iters of 64 each) per row-chunk,
+    // for B_TOPK rows.
+    static constexpr int kSparseVGatherBytes =
+        4 * TileShapeDVO::value * sizeof(Element) * (TileShapeK::value / 4);
+    pipeline_load_mma_do.producer_expect_transaction(pipeline_load_mma_do_producer_state, kSparseVGatherBytes);
 
-    // load V
+    // load V -- SPARSE gather4 path.
+    // Same row indices as K, but col_idx=0 (V = kv[:, :, :D_V]).
+    // V load uses pipeline_load_mma_do's tma_barrier (different pipeline from K).
     if (cute::elect_one_sync()) {
-      cute::copy(
-          mainloop_params.tma_load_v.with(*tma_barrier, mcast_mask),
-          tVgV_mkl(_, blk_coord_k, _0{}, blk_coord_batch),
-          tVsV(_, _0{})
-      );
+      using bf16 = Element;
+      static constexpr int B_TOPK_       = decltype(get<1>(TileShape{}))::value;  // 64
+      static constexpr int D_V_CHUNK_    = decltype(get<3>(TileShape{}))::value;  // 128
+      static constexpr int kNumRowChunks = B_TOPK_ / 4;                            // 16
+      // sparse: use sq_idx (Q-token index = get<1>(blk_coord)), not blk_coord_q
+      // which is always _0 in our sparse setup -> all CTAs would gather Q-token 0.
+      const int* gIndices = mainloop_args.ptr_indices
+                          + sq_idx * mainloop_args.topk;
+      bf16* sV_dst = reinterpret_cast<bf16*>(shared_tensors.smem_v.begin());
+      // V col loop with col-tile-major SMEM offset (matching SmemLayoutV).
+      // D_V_CHUNK=128, box=64 cols -> 2 col-iters.
+      static constexpr int kCols          = 64;
+      static constexpr int kNumColItersV  = D_V_CHUNK_ / kCols;  // 2
+      CUTLASS_PRAGMA_UNROLL
+      for (int rc = 0; rc < kNumRowChunks; ++rc) {
+        int4 row_idxs = *reinterpret_cast<const int4*>(
+            gIndices + iter_index * B_TOPK_ + rc * 4);
+        // clamp invalid (negative sentinel OR out-of-range) indices.
+        // Real-data causal masking can emit indices >= K; missing >=K check
+        // here causes TMA gather illegal access at scale (job 869 root cause).
+        if (row_idxs.x < 0 || row_idxs.x >= K) row_idxs.x = 0;
+        if (row_idxs.y < 0 || row_idxs.y >= K) row_idxs.y = 0;
+        if (row_idxs.z < 0 || row_idxs.z >= K) row_idxs.z = 0;
+        if (row_idxs.w < 0 || row_idxs.w >= K) row_idxs.w = 0;
+        CUTLASS_PRAGMA_UNROLL
+        for (int cc = 0; cc < kNumColItersV; ++cc) {
+          ku::tma_gather4_cta_group_1_pipe(
+              &mainloop_params.tensor_map_kv,
+              tma_barrier,
+              sV_dst + cc * B_TOPK_ * kCols + rc * 4 * kCols,
+              /*col_idx=*/cc * kCols,
+              row_idxs,
+              static_cast<int64_t>(cute::TMA::CacheHintSm90::EVICT_LAST));
+        }
+      }
     }
 
-    // load dO
+    // load dO chunk 0 -- sparse: sq_idx, d_v tile 0.
     if (cute::elect_one_sync()) {
       cute::copy(
           mainloop_params.tma_load_do.with(*tma_barrier, mcast_mask),
-          tDOgDO_mkl(_, iter_index, _0{}, blk_coord_batch),
+          tDOgDO_mkl(_, sq_idx, _0{}, blk_coord_batch),
           tDOsDO(_, pipeline_load_mma_do_producer_state.index())
       );
     }
 
     ++pipeline_load_mma_do_producer_state;
 
+    // hang-fix: load sum_OdO BEFORE dO chunks 1..3 so Compute
+    // warp can produce dS (which needs sum_OdO) and start consuming dkdv
+    // pipeline. Otherwise: MMA blocks at chunk 2 dkdv_acq (kStages=2 limit),
+    // Load blocks at chunk 3 acquire (waiting MMA release), Compute blocks
+    // at OdO wait (Load hasn't committed sum_OdO yet) -- cyclic deadlock.
     pipeline_load_compute_sum_odo.producer_acquire(pipeline_load_compute_sum_odo_producer_state);
 
-    // load sum_OdO
+    // load sum_OdO -- sparse: sq_idx.
     smem_idx = TileShapeQ{} * pipeline_load_compute_sum_odo_producer_state.index() + thread_idx * kLoadPerThread;
-    gmem_idx = TileShapeQ{} * iter_index + thread_idx * kLoadPerThread;
+    gmem_idx = TileShapeQ{} * sq_idx + thread_idx * kLoadPerThread;
     auto mSumOdO = make_tensor(mainloop_args.ptr_sum_odo, make_shape(Q, HB), mainloop_args.stride_sum_odo);
     for (int i = 0; i < kLoadPerThread; i++) {
       cutlass::arch::cp_async_zfill<4>(
@@ -597,29 +756,137 @@ struct Sm100FmhaBwdMlaKernelTmaWarpSpecialized {
     pipeline_load_compute_sum_odo.producer_commit(pipeline_load_compute_sum_odo_producer_state, cutlass::arch::cpasync_barrier_arrive);
     ++pipeline_load_compute_sum_odo_producer_state;
 
+    // Note: load V + dO chunks 1..3 (D_V multi-chunk).
+    // Each chunk loads V[indices, d_v[chunk*128 : (chunk+1)*128]] + dO[chunk].
+    // V chunks 1..3 enable dP multi-chunk accumulate (dQ correctness).
+    {
+      static constexpr int D_V_NUM_CHUNKS = /*D_V=512 / D_V_CHUNK=128 = */ 4;
+      // NO_UNROLL: prevents PTX size explosion from 4x duplicated TMA gather4
+      // inline asm (each gather is 16 row * 2 col = 32 inline asms; 3 chunks
+      // unrolled = 96 + 96 = 192 inline asms in this block alone).
+      CUTLASS_PRAGMA_NO_UNROLL
+      for (int chunk = 1; chunk < D_V_NUM_CHUNKS; ++chunk) {
+        pipeline_load_mma_do.producer_acquire(pipeline_load_mma_do_producer_state);
+        auto tma_bar_c = pipeline_load_mma_do.producer_get_barrier(pipeline_load_mma_do_producer_state);
+        // Expect V gather bytes (manual, since dO bytes auto-tracked by pipeline).
+        pipeline_load_mma_do.producer_expect_transaction(
+            pipeline_load_mma_do_producer_state, kSparseVGatherBytes);
+        // V gather at chunk's d_v slice.
+        if (cute::elect_one_sync()) {
+          using bf16_pc = Element;
+          static constexpr int B_TOPK_pc       = decltype(get<1>(TileShape{}))::value;
+          static constexpr int D_V_CHUNK_pc    = decltype(get<3>(TileShape{}))::value;
+          static constexpr int kNumRowChunks_pc = B_TOPK_pc / 4;
+          const int* gIndices_pc = mainloop_args.ptr_indices
+                                 + sq_idx * mainloop_args.topk;
+          bf16_pc* sV_dst_pc = reinterpret_cast<bf16_pc*>(shared_tensors.smem_v.begin());
+          static constexpr int kCols_pc        = 64;
+          static constexpr int kNumColItersV_pc = D_V_CHUNK_pc / kCols_pc;
+          CUTLASS_PRAGMA_UNROLL
+          for (int rc = 0; rc < kNumRowChunks_pc; ++rc) {
+            int4 row_idxs_pc = *reinterpret_cast<const int4*>(
+                gIndices_pc + iter_index * B_TOPK_pc + rc * 4);
+            if (row_idxs_pc.x < 0 || row_idxs_pc.x >= K) row_idxs_pc.x = 0;
+            if (row_idxs_pc.y < 0 || row_idxs_pc.y >= K) row_idxs_pc.y = 0;
+            if (row_idxs_pc.z < 0 || row_idxs_pc.z >= K) row_idxs_pc.z = 0;
+            if (row_idxs_pc.w < 0 || row_idxs_pc.w >= K) row_idxs_pc.w = 0;
+            CUTLASS_PRAGMA_UNROLL
+            for (int cc = 0; cc < kNumColItersV_pc; ++cc) {
+              ku::tma_gather4_cta_group_1_pipe(
+                  &mainloop_params.tensor_map_kv,
+                  tma_bar_c,
+                  sV_dst_pc + cc * B_TOPK_pc * kCols_pc + rc * 4 * kCols_pc,
+                  /*col_idx=*/chunk * D_V_CHUNK_pc + cc * kCols_pc,
+                  row_idxs_pc,
+                  static_cast<int64_t>(cute::TMA::CacheHintSm90::EVICT_LAST));
+            }
+          }
+        }
+        // dO gather at chunk's d_v slice (existing).
+        if (cute::elect_one_sync()) {
+          cute::copy(
+              mainloop_params.tma_load_do.with(*tma_bar_c, mcast_mask),
+              tDOgDO_mkl(_, sq_idx, chunk, blk_coord_batch),
+              tDOsDO(_, pipeline_load_mma_do_producer_state.index())
+          );
+        }
+        ++pipeline_load_mma_do_producer_state;
+      }
+    }
+
     iter_count -= 1;
     iter_index += 1;
 
     while (iter_count > 0) {
-      pipeline_load_mma_q.producer_acquire(pipeline_load_mma_q_producer_state);
-      tma_barrier = pipeline_load_mma_q.producer_get_barrier(pipeline_load_mma_q_producer_state);
+      // D path: per K-iter, Load produces 6 Q+K chunks (3 for S phase + 3
+      // reload for dK/dQ phase). Each chunk index in [0,3) cols [c*192,(c+1)*192).
+      // Reload pattern needed because kStages=2 < 3 chunks in flight.
+      static constexpr int kSparseKGatherBytesIter =
+          4 * TileShapeDQK::value * sizeof(Element) * (TileShapeK::value / 4);
 
-      // load Q
-      if (cute::elect_one_sync()) {
-        cute::copy(
-            mainloop_params.tma_load_q.with(*tma_barrier, mcast_mask),
-            tQgQ_mkl(_, iter_index, _0{}, blk_coord_batch),
-            tQsQ(_, pipeline_load_mma_q_producer_state.index())
-        );
+      CUTLASS_PRAGMA_NO_UNROLL
+      for (int phase_idx = 0; phase_idx < 6; ++phase_idx) {
+        const int chunk_idx = phase_idx % 3;
+        // phases 0..2 = S phase (uses CURRENT iter's K_N for S = Q @ K_N^T).
+        // phases 3..5 = dK/dQ reload (uses PREV iter's K_{N-1} to pair with
+        // dS_{N-1} that arrives in dQ/dK MMA). Previously this used iter_index for
+        // both phases -> dQ off-by-one: dS_{N-1} @ K_N (autograd expects K_{N-1}).
+        // Fix: reload phase uses (iter_index - 1) -> matches trailing block convention.
+        const int K_iter_idx = (phase_idx >= 3) ? (iter_index - 1) : iter_index;
+        pipeline_load_mma_q.producer_acquire(pipeline_load_mma_q_producer_state);
+        tma_barrier = pipeline_load_mma_q.producer_get_barrier(pipeline_load_mma_q_producer_state);
+        pipeline_load_mma_q.producer_expect_transaction(pipeline_load_mma_q_producer_state, kSparseKGatherBytesIter);
+
+        if (cute::elect_one_sync()) {
+          using bf16 = Element;
+          static constexpr int B_TOPK_         = decltype(get<1>(TileShape{}))::value;
+          static constexpr int D_QK_PARTIAL_   = decltype(get<2>(TileShape{}))::value;
+          static constexpr int kNumRowChunks   = B_TOPK_ / 4;
+          const int* gIndices_in = mainloop_args.ptr_indices
+                                 + sq_idx * mainloop_args.topk;
+          bf16* sK_dst_in_base = reinterpret_cast<bf16*>(shared_tensors.smem_k.begin());
+          const int sK_slot_in = pipeline_load_mma_q_producer_state.index();
+          bf16* sK_dst_in = sK_dst_in_base + sK_slot_in * (B_TOPK_ * D_QK_PARTIAL_);
+          static constexpr int kCols_in       = 64;
+          static constexpr int kNumColIters_in = D_QK_PARTIAL_ / kCols_in;
+          CUTLASS_PRAGMA_UNROLL
+          for (int rc = 0; rc < kNumRowChunks; ++rc) {
+            int4 row_idxs_in = *reinterpret_cast<const int4*>(
+                gIndices_in + K_iter_idx * B_TOPK_ + rc * 4);
+            if (row_idxs_in.x < 0 || row_idxs_in.x >= K) row_idxs_in.x = 0;
+            if (row_idxs_in.y < 0 || row_idxs_in.y >= K) row_idxs_in.y = 0;
+            if (row_idxs_in.z < 0 || row_idxs_in.z >= K) row_idxs_in.z = 0;
+            if (row_idxs_in.w < 0 || row_idxs_in.w >= K) row_idxs_in.w = 0;
+            CUTLASS_PRAGMA_UNROLL
+            for (int cc = 0; cc < kNumColIters_in; ++cc) {
+              ku::tma_gather4_cta_group_1_pipe(
+                  &mainloop_params.tensor_map_kv,
+                  tma_barrier,
+                  sK_dst_in + cc * B_TOPK_ * kCols_in + rc * 4 * kCols_in,
+                  /*col_idx=*/chunk_idx * D_QK_PARTIAL_ + cc * kCols_in,
+                  row_idxs_in,
+                  static_cast<int64_t>(cute::TMA::CacheHintSm90::EVICT_LAST));
+            }
+          }
+        }
+
+        // load Q chunk_idx
+        if (cute::elect_one_sync()) {
+          cute::copy(
+              mainloop_params.tma_load_q.with(*tma_barrier, mcast_mask),
+              tQgQ_mkl(_, sq_idx, chunk_idx, blk_coord_batch),
+              tQsQ(_, pipeline_load_mma_q_producer_state.index())
+          );
+        }
+
+        ++pipeline_load_mma_q_producer_state;
       }
-
-      ++pipeline_load_mma_q_producer_state;
 
       pipeline_load_compute_lse.producer_acquire(pipeline_load_compute_lse_producer_state);
 
-      // load LSE
+      // load LSE -- sparse: same sq_idx.
       smem_idx = TileShapeQ{} * pipeline_load_compute_lse_producer_state.index() + thread_idx * kLoadPerThread;
-      gmem_idx = TileShapeQ{} * iter_index + thread_idx * kLoadPerThread;
+      gmem_idx = TileShapeQ{} * sq_idx + thread_idx * kLoadPerThread;
       for (int i = 0; i < kLoadPerThread; i++) {
         cutlass::arch::cp_async_zfill<4>(
             shared_tensors.smem_lse.begin() + smem_idx + i,
@@ -634,22 +901,61 @@ struct Sm100FmhaBwdMlaKernelTmaWarpSpecialized {
       pipeline_load_mma_do.producer_acquire(pipeline_load_mma_do_producer_state);
       tma_barrier = pipeline_load_mma_do.producer_get_barrier(pipeline_load_mma_do_producer_state);
 
-      // load dO
+      // the sparse variant sparse: in-loop V re-gather (was missing -- iters >0 reused
+      // stale slot 0 V data from iter 0). V is gathered at indices[iter_index*B_TOPK..]
+      // and d_v chunk 0 (col_idx=0).
+      static constexpr int kSparseVGatherBytesIter =
+          4 * TileShapeDVO::value * sizeof(Element) * (TileShapeK::value / 4);
+      pipeline_load_mma_do.producer_expect_transaction(pipeline_load_mma_do_producer_state, kSparseVGatherBytesIter);
+
+      if (cute::elect_one_sync()) {
+        using bf16 = Element;
+        static constexpr int B_TOPK_VI    = decltype(get<1>(TileShape{}))::value;
+        static constexpr int D_V_CHUNK_VI = decltype(get<3>(TileShape{}))::value;
+        static constexpr int kNumRowChunksVI = B_TOPK_VI / 4;
+        const int* gIndicesVI = mainloop_args.ptr_indices
+                              + sq_idx * mainloop_args.topk;
+        bf16* sV_dst_in = reinterpret_cast<bf16*>(shared_tensors.smem_v.begin());
+        static constexpr int kCols_VI       = 64;
+        static constexpr int kNumColItersVI = D_V_CHUNK_VI / kCols_VI;
+        CUTLASS_PRAGMA_UNROLL
+        for (int rc = 0; rc < kNumRowChunksVI; ++rc) {
+          int4 row_idxs_vi = *reinterpret_cast<const int4*>(
+              gIndicesVI + iter_index * B_TOPK_VI + rc * 4);
+          if (row_idxs_vi.x < 0 || row_idxs_vi.x >= K) row_idxs_vi.x = 0;
+          if (row_idxs_vi.y < 0 || row_idxs_vi.y >= K) row_idxs_vi.y = 0;
+          if (row_idxs_vi.z < 0 || row_idxs_vi.z >= K) row_idxs_vi.z = 0;
+          if (row_idxs_vi.w < 0 || row_idxs_vi.w >= K) row_idxs_vi.w = 0;
+          CUTLASS_PRAGMA_UNROLL
+          for (int cc = 0; cc < kNumColItersVI; ++cc) {
+            ku::tma_gather4_cta_group_1_pipe(
+                &mainloop_params.tensor_map_kv,
+                tma_barrier,
+                sV_dst_in + cc * B_TOPK_VI * kCols_VI + rc * 4 * kCols_VI,
+                /*col_idx=*/cc * kCols_VI,
+                row_idxs_vi,
+                static_cast<int64_t>(cute::TMA::CacheHintSm90::EVICT_LAST));
+          }
+        }
+      }
+
+      // load dO chunk 0 -- sparse: same sq_idx, d_v tile 0.
       if (cute::elect_one_sync()) {
         cute::copy(
             mainloop_params.tma_load_do.with(*tma_barrier, mcast_mask),
-            tDOgDO_mkl(_, iter_index, _0{}, blk_coord_batch),
+            tDOgDO_mkl(_, sq_idx, _0{}, blk_coord_batch),
             tDOsDO(_, pipeline_load_mma_do_producer_state.index())
         );
       }
 
       ++pipeline_load_mma_do_producer_state;
 
+      // hang-fix: load sum_OdO BEFORE dO chunks 1..3 (see pre-loop).
       pipeline_load_compute_sum_odo.producer_acquire(pipeline_load_compute_sum_odo_producer_state);
 
-      // load sum_OdO
+      // load sum_OdO -- sparse: same sq_idx.
       smem_idx = TileShapeQ{} * pipeline_load_compute_sum_odo_producer_state.index() + thread_idx * kLoadPerThread;
-      gmem_idx = TileShapeQ{} * iter_index + thread_idx * kLoadPerThread;
+      gmem_idx = TileShapeQ{} * sq_idx + thread_idx * kLoadPerThread;
       for (int i = 0; i < kLoadPerThread; i++) {
         cutlass::arch::cp_async_zfill<4>(
             shared_tensors.smem_sum_odo.begin() + smem_idx + i,
@@ -661,8 +967,119 @@ struct Sm100FmhaBwdMlaKernelTmaWarpSpecialized {
       pipeline_load_compute_sum_odo.producer_commit(pipeline_load_compute_sum_odo_producer_state, cutlass::arch::cpasync_barrier_arrive);
       ++pipeline_load_compute_sum_odo_producer_state;
 
+      // Note: in-loop V+dO chunks 1..3 for D_V multi-chunk.
+      {
+        static constexpr int D_V_NUM_CHUNKS_IL = /*D_V=512 / D_V_CHUNK=128 = */ 4;
+        CUTLASS_PRAGMA_NO_UNROLL
+        for (int chunk = 1; chunk < D_V_NUM_CHUNKS_IL; ++chunk) {
+          pipeline_load_mma_do.producer_acquire(pipeline_load_mma_do_producer_state);
+          auto tma_bar_il = pipeline_load_mma_do.producer_get_barrier(pipeline_load_mma_do_producer_state);
+          pipeline_load_mma_do.producer_expect_transaction(
+              pipeline_load_mma_do_producer_state, kSparseVGatherBytesIter);
+          // V gather at chunk d_v slice.
+          if (cute::elect_one_sync()) {
+            using bf16_il = Element;
+            static constexpr int B_TOPK_il        = decltype(get<1>(TileShape{}))::value;
+            static constexpr int D_V_CHUNK_il     = decltype(get<3>(TileShape{}))::value;
+            static constexpr int kNumRowChunks_il = B_TOPK_il / 4;
+            const int* gIndices_il = mainloop_args.ptr_indices
+                                   + sq_idx * mainloop_args.topk;
+            bf16_il* sV_dst_il = reinterpret_cast<bf16_il*>(shared_tensors.smem_v.begin());
+            static constexpr int kCols_il        = 64;
+            static constexpr int kNumColItersV_il = D_V_CHUNK_il / kCols_il;
+            CUTLASS_PRAGMA_UNROLL
+            for (int rc = 0; rc < kNumRowChunks_il; ++rc) {
+              int4 row_idxs_il = *reinterpret_cast<const int4*>(
+                  gIndices_il + iter_index * B_TOPK_il + rc * 4);
+              if (row_idxs_il.x < 0 || row_idxs_il.x >= K) row_idxs_il.x = 0;
+              if (row_idxs_il.y < 0 || row_idxs_il.y >= K) row_idxs_il.y = 0;
+              if (row_idxs_il.z < 0 || row_idxs_il.z >= K) row_idxs_il.z = 0;
+              if (row_idxs_il.w < 0 || row_idxs_il.w >= K) row_idxs_il.w = 0;
+              CUTLASS_PRAGMA_UNROLL
+              for (int cc = 0; cc < kNumColItersV_il; ++cc) {
+                ku::tma_gather4_cta_group_1_pipe(
+                    &mainloop_params.tensor_map_kv,
+                    tma_bar_il,
+                    sV_dst_il + cc * B_TOPK_il * kCols_il + rc * 4 * kCols_il,
+                    /*col_idx=*/chunk * D_V_CHUNK_il + cc * kCols_il,
+                    row_idxs_il,
+                    static_cast<int64_t>(cute::TMA::CacheHintSm90::EVICT_LAST));
+              }
+            }
+          }
+          // dO at chunk d_v slice.
+          if (cute::elect_one_sync()) {
+            cute::copy(
+                mainloop_params.tma_load_do.with(*tma_bar_il, mcast_mask),
+                tDOgDO_mkl(_, sq_idx, chunk, blk_coord_batch),
+                tDOsDO(_, pipeline_load_mma_do_producer_state.index())
+            );
+          }
+          ++pipeline_load_mma_do_producer_state;
+        }
+      }
+
       iter_count -= 1;
       iter_index += 1;
+    }
+
+    // D path: trailing 3 chunks of K+Q for MMA's trailing dK/dQ (last K-tile's
+    // 3 d_qk slices). After iter loop, iter_index = N. Trailing uses iter_index-1
+    // for indices to fetch last K-tile's rows.
+    {
+      static constexpr int kSparseKGatherBytesTrail =
+          4 * TileShapeDQK::value * sizeof(Element) * (TileShapeK::value / 4);
+      const int trail_iter_index = iter_index - 1;
+
+      CUTLASS_PRAGMA_NO_UNROLL
+      for (int chunk_idx = 0; chunk_idx < 3; ++chunk_idx) {
+        pipeline_load_mma_q.producer_acquire(pipeline_load_mma_q_producer_state);
+        tma_barrier = pipeline_load_mma_q.producer_get_barrier(pipeline_load_mma_q_producer_state);
+        pipeline_load_mma_q.producer_expect_transaction(pipeline_load_mma_q_producer_state, kSparseKGatherBytesTrail);
+
+        if (cute::elect_one_sync()) {
+          using bf16 = Element;
+          static constexpr int B_TOPK_         = decltype(get<1>(TileShape{}))::value;
+          static constexpr int D_QK_PARTIAL_   = decltype(get<2>(TileShape{}))::value;
+          static constexpr int kNumRowChunks   = B_TOPK_ / 4;
+          const int* gIndices_tr = mainloop_args.ptr_indices
+                                 + sq_idx * mainloop_args.topk;
+          bf16* sK_dst_tr_base = reinterpret_cast<bf16*>(shared_tensors.smem_k.begin());
+          const int sK_slot_tr = pipeline_load_mma_q_producer_state.index();
+          bf16* sK_dst_tr = sK_dst_tr_base + sK_slot_tr * (B_TOPK_ * D_QK_PARTIAL_);
+          static constexpr int kCols_tr       = 64;
+          static constexpr int kNumColIters_tr = D_QK_PARTIAL_ / kCols_tr;
+          CUTLASS_PRAGMA_UNROLL
+          for (int rc = 0; rc < kNumRowChunks; ++rc) {
+            int4 row_idxs_tr = *reinterpret_cast<const int4*>(
+                gIndices_tr + trail_iter_index * B_TOPK_ + rc * 4);
+            if (row_idxs_tr.x < 0 || row_idxs_tr.x >= K) row_idxs_tr.x = 0;
+            if (row_idxs_tr.y < 0 || row_idxs_tr.y >= K) row_idxs_tr.y = 0;
+            if (row_idxs_tr.z < 0 || row_idxs_tr.z >= K) row_idxs_tr.z = 0;
+            if (row_idxs_tr.w < 0 || row_idxs_tr.w >= K) row_idxs_tr.w = 0;
+            CUTLASS_PRAGMA_UNROLL
+            for (int cc = 0; cc < kNumColIters_tr; ++cc) {
+              ku::tma_gather4_cta_group_1_pipe(
+                  &mainloop_params.tensor_map_kv,
+                  tma_barrier,
+                  sK_dst_tr + cc * B_TOPK_ * kCols_tr + rc * 4 * kCols_tr,
+                  /*col_idx=*/chunk_idx * D_QK_PARTIAL_ + cc * kCols_tr,
+                  row_idxs_tr,
+                  static_cast<int64_t>(cute::TMA::CacheHintSm90::EVICT_LAST));
+            }
+          }
+        }
+
+        if (cute::elect_one_sync()) {
+          cute::copy(
+              mainloop_params.tma_load_q.with(*tma_barrier, mcast_mask),
+              tQgQ_mkl(_, sq_idx, chunk_idx, blk_coord_batch),
+              tQsQ(_, pipeline_load_mma_q_producer_state.index())
+          );
+        }
+
+        ++pipeline_load_mma_q_producer_state;
+      }
     }
   }
 
@@ -747,21 +1164,27 @@ struct Sm100FmhaBwdMlaKernelTmaWarpSpecialized {
 
     auto pipeline_load_mma_q_release_state = pipeline_load_mma_q_consumer_state;
 
-    pipeline_load_mma_q.consumer_wait(pipeline_load_mma_q_consumer_state);
     pipeline_mma_compute_s.producer_acquire(pipeline_mma_compute_s_producer_state);
 
-    // S = Q*K
+    // D path setup: S accumulate over 3 d_qk chunks. Zero on chunk 0, One after.
+    // Stage release happens here (within chunk loop) since kStages=2 < 3 chunks.
+    // dK MMA in iter loop must use FRESH stages (reload pattern), not release_state.
     tiled_mma_qk.accumulate_ = UMMA::ScaleOut::Zero;
-    CUTLASS_PRAGMA_UNROLL
-    for (int k_block = 0; k_block < size<2>(tSTrQ); ++k_block) {
-      cute::gemm(tiled_mma_qk,
-                 tSTrQ(_,_,k_block,pipeline_load_mma_q_consumer_state.index()),
-                 tSTrK(_,_,k_block,_0{}),
-                 tSTtST);
-      tiled_mma_qk.accumulate_ = UMMA::ScaleOut::One;
+    CUTLASS_PRAGMA_NO_UNROLL
+    for (int chunk_idx = 0; chunk_idx < 3; ++chunk_idx) {
+      pipeline_load_mma_q.consumer_wait(pipeline_load_mma_q_consumer_state);
+      CUTLASS_PRAGMA_UNROLL
+      for (int k_block = 0; k_block < size<2>(tSTrQ); ++k_block) {
+        cute::gemm(tiled_mma_qk,
+                   tSTrQ(_,_,k_block,pipeline_load_mma_q_consumer_state.index()),
+                   tSTrK(_,_,k_block,pipeline_load_mma_q_consumer_state.index()),
+                   tSTtST);
+        tiled_mma_qk.accumulate_ = UMMA::ScaleOut::One;
+      }
+      pipeline_load_mma_q.consumer_release(pipeline_load_mma_q_consumer_state);
+      ++pipeline_load_mma_q_consumer_state;
+      ++pipeline_load_mma_q_release_state;
     }
-
-    ++pipeline_load_mma_q_consumer_state;
 
     pipeline_mma_compute_s.producer_commit(pipeline_mma_compute_s_producer_state);
     ++pipeline_mma_compute_s_producer_state;
@@ -771,37 +1194,53 @@ struct Sm100FmhaBwdMlaKernelTmaWarpSpecialized {
     pipeline_mma_compute_dp.producer_acquire(pipeline_mma_compute_dp_producer_state);
     pipeline_mma_reduce_dq.producer_acquire(pipeline_mma_reduce_dq_producer_state);
 
-    // dP = dO*V
-    tiled_mma_dov.accumulate_ = UMMA::ScaleOut::Zero;
-    CUTLASS_PRAGMA_UNROLL
-    for (int k_block = 0; k_block < size<2>(tDPTrV); ++k_block) {
-      cute::gemm(tiled_mma_dov,
-                 tDPTrDO(_,_,k_block,pipeline_load_mma_do_consumer_state.index()),
-                 tDPTrV(_,_,k_block,_0{}),
-                 tDPTtDPT);
-      tiled_mma_dov.accumulate_ = UMMA::ScaleOut::One;
-    }
+    pipeline_compute_mma_p.consumer_wait(pipeline_compute_mma_p_consumer_state);
 
+    // Note: V multi-chunk dP fused with dV per chunk.
+    //   dP += dO[c] @ V[c]^T  (Zero on c=0, One after) -> kDP
+    //   dV_c = P^T @ dO[c]    (Zero per chunk)         -> kDV scatter
+    // V[c] is in sV slot 0 (Load overwrites slot 0 each chunk; SMEM offset has
+    // no chunk index). dP commit deferred until after all 4 chunks accumulated.
+    {
+      static constexpr int D_V_NUM_CHUNKS_M = /*D_V=512 / D_V_CHUNK=128 = */ 4;
+      tiled_mma_dov.accumulate_ = UMMA::ScaleOut::Zero;
+      CUTLASS_PRAGMA_NO_UNROLL
+      for (int chunk = 0; chunk < D_V_NUM_CHUNKS_M; ++chunk) {
+        if (chunk > 0) {
+          pipeline_load_mma_do.consumer_wait(pipeline_load_mma_do_consumer_state);
+        }
+        // dP partial chunk c: dO[c] @ V[c]^T -> kDP
+        CUTLASS_PRAGMA_UNROLL
+        for (int k_block = 0; k_block < size<2>(tDPTrV); ++k_block) {
+          cute::gemm(tiled_mma_dov,
+                     tDPTrDO(_,_,k_block,pipeline_load_mma_do_consumer_state.index()),
+                     tDPTrV(_,_,k_block,_0{}),
+                     tDPTtDPT);
+          tiled_mma_dov.accumulate_ = UMMA::ScaleOut::One;
+        }
+
+        // dV chunk c: P^T @ dO[c] -> kDV (Zero per chunk)
+        pipeline_mma_compute_dkdv.producer_acquire(pipeline_mma_compute_dkdv_producer_state);
+        tiled_mma_pdo.accumulate_ = UMMA::ScaleOut::Zero;
+        CUTLASS_PRAGMA_UNROLL
+        for (int k_block = 0; k_block < size<2>(tDVrP); ++k_block) {
+          cute::gemm(tiled_mma_pdo,
+                     tDVrP(_,_,k_block,_0{}),
+                     tDVrDOT(_,_,k_block,pipeline_load_mma_do_consumer_state.index()),
+                     tDVtDV);
+          tiled_mma_pdo.accumulate_ = UMMA::ScaleOut::One;
+        }
+        pipeline_mma_compute_dkdv.producer_commit(pipeline_mma_compute_dkdv_producer_state);
+        ++pipeline_mma_compute_dkdv_producer_state;
+        pipeline_load_mma_do.consumer_release(pipeline_load_mma_do_consumer_state);
+        ++pipeline_load_mma_do_consumer_state;
+      }
+    }
     pipeline_mma_compute_dp.producer_commit(pipeline_mma_compute_dp_producer_state);
     ++pipeline_mma_compute_dp_producer_state;
 
-    pipeline_compute_mma_p.consumer_wait(pipeline_compute_mma_p_consumer_state);
-
-    // dV = P*dO
-    CUTLASS_PRAGMA_UNROLL
-    for (int k_block = 0; k_block < size<2>(tDVrP); ++k_block) {
-      cute::gemm(tiled_mma_pdo,
-                 tDVrP(_,_,k_block,_0{}),
-                 tDVrDOT(_,_,k_block,pipeline_load_mma_do_consumer_state.index()),
-                 tDVtDV);
-      tiled_mma_pdo.accumulate_ = UMMA::ScaleOut::One;
-    }
-
     pipeline_compute_mma_p.consumer_release(pipeline_compute_mma_p_consumer_state);
     ++pipeline_compute_mma_p_consumer_state;
-
-    pipeline_load_mma_do.consumer_release(pipeline_load_mma_do_consumer_state);
-    ++pipeline_load_mma_do_consumer_state;
 
     iter_count -= 1;
 
@@ -809,141 +1248,174 @@ struct Sm100FmhaBwdMlaKernelTmaWarpSpecialized {
     // and dP and dQ overlap
     // so we need to acquire dQ and dP at the same time
     while (iter_count > 0) {
-      pipeline_load_mma_q.consumer_wait(pipeline_load_mma_q_consumer_state);
+      // D path S phase: accumulate S over 3 d_qk chunks. Each chunk consumes
+      // one Q+K stage and releases it. After 3 chunks, S is fully accumulated.
       pipeline_mma_compute_s.producer_acquire(pipeline_mma_compute_s_producer_state);
-
-      // S = Q*K
       tiled_mma_qk.accumulate_ = UMMA::ScaleOut::Zero;
-      CUTLASS_PRAGMA_UNROLL
-      for (int k_block = 0; k_block < size<2>(tSTrQ); ++k_block) {
-        cute::gemm(tiled_mma_qk,
-                   tSTrQ(_,_,k_block,pipeline_load_mma_q_consumer_state.index()),
-                   tSTrK(_,_,k_block,_0{}),
-                   tSTtST);
-        tiled_mma_qk.accumulate_ = UMMA::ScaleOut::One;
+      CUTLASS_PRAGMA_NO_UNROLL
+      for (int chunk_idx = 0; chunk_idx < 3; ++chunk_idx) {
+        pipeline_load_mma_q.consumer_wait(pipeline_load_mma_q_consumer_state);
+        CUTLASS_PRAGMA_UNROLL
+        for (int k_block = 0; k_block < size<2>(tSTrQ); ++k_block) {
+          cute::gemm(tiled_mma_qk,
+                     tSTrQ(_,_,k_block,pipeline_load_mma_q_consumer_state.index()),
+                     tSTrK(_,_,k_block,pipeline_load_mma_q_consumer_state.index()),
+                     tSTtST);
+          tiled_mma_qk.accumulate_ = UMMA::ScaleOut::One;
+        }
+        pipeline_load_mma_q.consumer_release(pipeline_load_mma_q_consumer_state);
+        ++pipeline_load_mma_q_consumer_state;
+        ++pipeline_load_mma_q_release_state;
       }
-
-      ++pipeline_load_mma_q_consumer_state;
 
       pipeline_mma_compute_s.producer_commit(pipeline_mma_compute_s_producer_state);
       ++pipeline_mma_compute_s_producer_state;
 
       pipeline_compute_mma_ds.consumer_wait(pipeline_compute_mma_ds_consumer_state);
 
-      // we need to acquire dP here, because tmem dQ == tmem dP
+      // D path dK/dQ phase: 3 RELOADED Q+K chunks. Per chunk c:
+      //   dQ_c = dS @ K_c (TMEM kDQ, signaled to reduce -> scatter to dq_acc[:, c*192:..])
+      //   dK_c = dS^T @ Q_c (TMEM kDK, signaled to compute -> scatter to dkv[:, c*192:..])
+      // dP and dV pipelines unchanged (dV has its own d_v chunked).
       pipeline_mma_compute_dp.producer_acquire(pipeline_mma_compute_dp_producer_state);
 
-      // dQ = dS*K
+      CUTLASS_PRAGMA_NO_UNROLL
+      for (int chunk_idx = 0; chunk_idx < 3; ++chunk_idx) {
+        pipeline_load_mma_q.consumer_wait(pipeline_load_mma_q_consumer_state);
+
+        // dQ chunk_c (Zero accumulator: TMEM kDQ holds only this chunk's slice)
+        if (chunk_idx > 0) {
+          pipeline_mma_reduce_dq.producer_acquire(pipeline_mma_reduce_dq_producer_state);
+        }
+        tiled_mma_dsk.accumulate_ = UMMA::ScaleOut::Zero;
+        CUTLASS_PRAGMA_UNROLL
+        for (int k_block = 0; k_block < size<2>(tDQrDS); ++k_block) {
+          cute::gemm(tiled_mma_dsk,
+                     tDQrDS(_,_,k_block,pipeline_compute_mma_ds_consumer_state.index()),
+                     tDQrKT(_,_,k_block,pipeline_load_mma_q_consumer_state.index()),
+                     tDQtDQ);
+          tiled_mma_dsk.accumulate_ = UMMA::ScaleOut::One;
+        }
+        pipeline_mma_reduce_dq.producer_commit(pipeline_mma_reduce_dq_producer_state);
+        ++pipeline_mma_reduce_dq_producer_state;
+
+        // dK chunk_c (Zero accumulator: TMEM kDK holds only this chunk's slice)
+        pipeline_mma_compute_dkdv.producer_acquire(pipeline_mma_compute_dkdv_producer_state);
+        tiled_mma_dsq.accumulate_ = UMMA::ScaleOut::Zero;
+        CUTLASS_PRAGMA_UNROLL
+        for (int k_block = 0; k_block < size<2>(tDKrDST); ++k_block) {
+          cute::gemm(tiled_mma_dsq,
+                     tDKrDST(_,_,k_block,pipeline_compute_mma_ds_consumer_state.index()),
+                     tDKrQT(_,_,k_block,pipeline_load_mma_q_consumer_state.index()),
+                     tDKtDK);
+          tiled_mma_dsq.accumulate_ = UMMA::ScaleOut::One;
+        }
+        pipeline_mma_compute_dkdv.producer_commit(pipeline_mma_compute_dkdv_producer_state);
+        ++pipeline_mma_compute_dkdv_producer_state;
+
+        pipeline_load_mma_q.consumer_release(pipeline_load_mma_q_consumer_state);
+        ++pipeline_load_mma_q_consumer_state;
+        ++pipeline_load_mma_q_release_state;
+      }
+
+      pipeline_compute_mma_ds.consumer_release(pipeline_compute_mma_ds_consumer_state);
+      ++pipeline_compute_mma_ds_consumer_state;
+
+      // re-acquire reduce_dq for next iter's first chunk
+      pipeline_mma_reduce_dq.producer_acquire(pipeline_mma_reduce_dq_producer_state);
+
+      pipeline_load_mma_do.consumer_wait(pipeline_load_mma_do_consumer_state);
+
+      pipeline_compute_mma_p.consumer_wait(pipeline_compute_mma_p_consumer_state);
+
+      // Note: V multi-chunk dP fused with dV per chunk (mirrors setup).
+      {
+        static constexpr int D_V_NUM_CHUNKS_MI = /*D_V=512 / D_V_CHUNK=128 = */ 4;
+        tiled_mma_dov.accumulate_ = UMMA::ScaleOut::Zero;
+        CUTLASS_PRAGMA_NO_UNROLL
+        for (int chunk = 0; chunk < D_V_NUM_CHUNKS_MI; ++chunk) {
+          if (chunk > 0) {
+            pipeline_load_mma_do.consumer_wait(pipeline_load_mma_do_consumer_state);
+          }
+          // dP partial chunk c
+          CUTLASS_PRAGMA_UNROLL
+          for (int k_block = 0; k_block < size<2>(tDPTrV); ++k_block) {
+            cute::gemm(tiled_mma_dov,
+                       tDPTrDO(_,_,k_block,pipeline_load_mma_do_consumer_state.index()),
+                       tDPTrV(_,_,k_block,_0{}),
+                       tDPTtDPT);
+            tiled_mma_dov.accumulate_ = UMMA::ScaleOut::One;
+          }
+          // dV chunk c
+          pipeline_mma_compute_dkdv.producer_acquire(pipeline_mma_compute_dkdv_producer_state);
+          tiled_mma_pdo.accumulate_ = UMMA::ScaleOut::Zero;
+          CUTLASS_PRAGMA_UNROLL
+          for (int k_block = 0; k_block < size<2>(tDVrP); ++k_block) {
+            cute::gemm(tiled_mma_pdo,
+                       tDVrP(_,_,k_block,_0{}),
+                       tDVrDOT(_,_,k_block,pipeline_load_mma_do_consumer_state.index()),
+                       tDVtDV);
+            tiled_mma_pdo.accumulate_ = UMMA::ScaleOut::One;
+          }
+          pipeline_mma_compute_dkdv.producer_commit(pipeline_mma_compute_dkdv_producer_state);
+          ++pipeline_mma_compute_dkdv_producer_state;
+          pipeline_load_mma_do.consumer_release(pipeline_load_mma_do_consumer_state);
+          ++pipeline_load_mma_do_consumer_state;
+        }
+      }
+      pipeline_mma_compute_dp.producer_commit(pipeline_mma_compute_dp_producer_state);
+      ++pipeline_mma_compute_dp_producer_state;
+
+      pipeline_compute_mma_p.consumer_release(pipeline_compute_mma_p_consumer_state);
+      ++pipeline_compute_mma_p_consumer_state;
+
+      iter_count -= 1;
+    }
+
+    // D path trailing: dK + dQ for LAST K-tile across 3 d_qk chunks.
+    // Load produced 3 trailing chunks (chunks 0,1,2) post-loop. Each chunk:
+    //   dQ_c = dS_last @ K_c -> reduce scatter to dQ_acc[:, c*192:(c+1)*192]
+    //   dK_c = dS_last^T @ Q_c -> compute scatter to dKV[:, c*192:(c+1)*192]
+    pipeline_compute_mma_ds.consumer_wait(pipeline_compute_mma_ds_consumer_state);
+
+    CUTLASS_PRAGMA_NO_UNROLL
+    for (int chunk_idx = 0; chunk_idx < 3; ++chunk_idx) {
+      pipeline_load_mma_q.consumer_wait(pipeline_load_mma_q_consumer_state);
+
+      // dQ chunk_c: re-acquire for chunks > 0 (chunk 0 used the end-of-loop acquire).
+      if (chunk_idx > 0) {
+        pipeline_mma_reduce_dq.producer_acquire(pipeline_mma_reduce_dq_producer_state);
+      }
       tiled_mma_dsk.accumulate_ = UMMA::ScaleOut::Zero;
       CUTLASS_PRAGMA_UNROLL
       for (int k_block = 0; k_block < size<2>(tDQrDS); ++k_block) {
         cute::gemm(tiled_mma_dsk,
                    tDQrDS(_,_,k_block,pipeline_compute_mma_ds_consumer_state.index()),
-                   tDQrKT(_,_,k_block,_0{}),
+                   tDQrKT(_,_,k_block,pipeline_load_mma_q_consumer_state.index()),
                    tDQtDQ);
         tiled_mma_dsk.accumulate_ = UMMA::ScaleOut::One;
       }
-
       pipeline_mma_reduce_dq.producer_commit(pipeline_mma_reduce_dq_producer_state);
       ++pipeline_mma_reduce_dq_producer_state;
 
-      // dK = dS*Q
+      // dK chunk_c
+      pipeline_mma_compute_dkdv.producer_acquire(pipeline_mma_compute_dkdv_producer_state);
+      tiled_mma_dsq.accumulate_ = UMMA::ScaleOut::Zero;
       CUTLASS_PRAGMA_UNROLL
       for (int k_block = 0; k_block < size<2>(tDKrDST); ++k_block) {
         cute::gemm(tiled_mma_dsq,
                    tDKrDST(_,_,k_block,pipeline_compute_mma_ds_consumer_state.index()),
-                   tDKrQT(_,_,k_block,pipeline_load_mma_q_release_state.index()),
+                   tDKrQT(_,_,k_block,pipeline_load_mma_q_consumer_state.index()),
                    tDKtDK);
         tiled_mma_dsq.accumulate_ = UMMA::ScaleOut::One;
       }
+      pipeline_mma_compute_dkdv.producer_commit(pipeline_mma_compute_dkdv_producer_state);
+      ++pipeline_mma_compute_dkdv_producer_state;
 
-      pipeline_load_mma_q.consumer_release(pipeline_load_mma_q_release_state);
+      pipeline_load_mma_q.consumer_release(pipeline_load_mma_q_consumer_state);
+      ++pipeline_load_mma_q_consumer_state;
       ++pipeline_load_mma_q_release_state;
-
-      pipeline_compute_mma_ds.consumer_release(pipeline_compute_mma_ds_consumer_state);
-      ++pipeline_compute_mma_ds_consumer_state;
-
-      // we grab dq here, because in tmem dq == dp
-      pipeline_mma_reduce_dq.producer_acquire(pipeline_mma_reduce_dq_producer_state);
-
-      pipeline_load_mma_do.consumer_wait(pipeline_load_mma_do_consumer_state);
-
-      // dP = dO*V
-      tiled_mma_dov.accumulate_ = UMMA::ScaleOut::Zero;
-      CUTLASS_PRAGMA_UNROLL
-      for (int k_block = 0; k_block < size<2>(tDPTrV); ++k_block) {
-        cute::gemm(tiled_mma_dov,
-                   tDPTrDO(_,_,k_block,pipeline_load_mma_do_consumer_state.index()),
-                   tDPTrV(_,_,k_block,_0{}),
-                   tDPTtDPT);
-        tiled_mma_dov.accumulate_ = UMMA::ScaleOut::One;
-      }
-
-      pipeline_mma_compute_dp.producer_commit(pipeline_mma_compute_dp_producer_state);
-      ++pipeline_mma_compute_dp_producer_state;
-
-      pipeline_compute_mma_p.consumer_wait(pipeline_compute_mma_p_consumer_state);
-
-      // dV = P*dO
-      CUTLASS_PRAGMA_UNROLL
-      for (int k_block = 0; k_block < size<2>(tDVrP); ++k_block) {
-        cute::gemm(tiled_mma_pdo,
-                   tDVrP(_,_,k_block,_0{}),
-                   tDVrDOT(_,_,k_block,pipeline_load_mma_do_consumer_state.index()),
-                   tDVtDV);
-        tiled_mma_pdo.accumulate_ = UMMA::ScaleOut::One;
-      }
-
-      pipeline_compute_mma_p.consumer_release(pipeline_compute_mma_p_consumer_state);
-      ++pipeline_compute_mma_p_consumer_state;
-
-      pipeline_load_mma_do.consumer_release(pipeline_load_mma_do_consumer_state);
-      ++pipeline_load_mma_do_consumer_state;
-
-      iter_count -= 1;
     }
-
-    // signal to the epilogue that dV is ready
-    pipeline_mma_compute_dkdv.producer_acquire(pipeline_mma_compute_dkdv_producer_state);
-    pipeline_mma_compute_dkdv.producer_commit(pipeline_mma_compute_dkdv_producer_state);
-    ++pipeline_mma_compute_dkdv_producer_state;
-
-    pipeline_mma_compute_dkdv.producer_acquire(pipeline_mma_compute_dkdv_producer_state);
-
-    pipeline_compute_mma_ds.consumer_wait(pipeline_compute_mma_ds_consumer_state);
-
-    // dK = dS*Q
-    CUTLASS_PRAGMA_UNROLL
-    for (int k_block = 0; k_block < size<2>(tDKrDST); ++k_block) {
-      cute::gemm(tiled_mma_dsq,
-                 tDKrDST(_,_,k_block,pipeline_compute_mma_ds_consumer_state.index()),
-                 tDKrQT(_,_,k_block,pipeline_load_mma_q_release_state.index()),
-                 tDKtDK);
-      tiled_mma_dsq.accumulate_ = UMMA::ScaleOut::One;
-    }
-
-    // signal to epilgue that dK is ready
-    pipeline_mma_compute_dkdv.producer_commit(pipeline_mma_compute_dkdv_producer_state);
-    ++pipeline_mma_compute_dkdv_producer_state;
-
-    // we've already acquired mma_reduce_dq in the loop
-
-    // dQ = dS*K
-    tiled_mma_dsk.accumulate_ = UMMA::ScaleOut::Zero;
-    CUTLASS_PRAGMA_UNROLL
-    for (int k_block = 0; k_block < size<2>(tDQrDS); ++k_block) {
-      cute::gemm(tiled_mma_dsk,
-                 tDQrDS(_,_,k_block,pipeline_compute_mma_ds_consumer_state.index()),
-                 tDQrKT(_,_,k_block,_0{}),
-                 tDQtDQ);
-      tiled_mma_dsk.accumulate_ = UMMA::ScaleOut::One;
-    }
-
-    pipeline_mma_reduce_dq.producer_commit(pipeline_mma_reduce_dq_producer_state);
-    ++pipeline_mma_reduce_dq_producer_state;
-
-    pipeline_load_mma_q.consumer_release(pipeline_load_mma_q_release_state);
-    ++pipeline_load_mma_q_release_state;
 
     pipeline_compute_mma_ds.consumer_release(pipeline_compute_mma_ds_consumer_state);
     ++pipeline_compute_mma_ds_consumer_state;
@@ -1093,21 +1565,13 @@ struct Sm100FmhaBwdMlaKernelTmaWarpSpecialized {
     Tensor tTR_rDV = make_tensor<ElementAcc>(shape(tTR_cDV));
     Tensor tTR_tDV = split_wg(thread_t2r_dv.partition_S(tDVtDV));
 
-    pipeline_mma_compute_dkdv.consumer_wait(pipeline_mma_compute_dkdv_consumer_state);
-
-    // load tDVtDV
-    cute::copy(tiled_t2r_dv, tTR_tDV, tTR_rDV);
-
-    // store tDVgDV
-    store(tTR_gDV, tTR_rDV, tTR_cDV, select<1,3>(problem_shape));
-
-    cutlass::arch::fence_view_async_tmem_load();
-    pipeline_mma_compute_dkdv.consumer_release(pipeline_mma_compute_dkdv_consumer_state);
-    ++pipeline_mma_compute_dkdv_consumer_state;
+    // dV consumer_wait/release removed -- dV is now consumed per-iter
+    // inside compute()'s while loop (scatter via atomicAdd to indices[k_pos]).
+    // Only the trailing dK signal from MMA's after-loop block remains.
 
     pipeline_mma_compute_dkdv.consumer_wait(pipeline_mma_compute_dkdv_consumer_state);
 
-    // load tDKtDK
+    // load tDKtDK (TMEM -> regs).
     cute::copy(tiled_t2r_dk, tTR_tDK, tTR_rDK);
 
     CUTLASS_PRAGMA_UNROLL
@@ -1115,8 +1579,8 @@ struct Sm100FmhaBwdMlaKernelTmaWarpSpecialized {
       tTR_rDK(i) = mainloop_args.softmax_scale * tTR_rDK(i);
     }
 
-    // store tDKgDK
-    store(tTR_gDK, tTR_rDK, tTR_cDK, select<1,2>(problem_shape));
+    // dKV dense store DISABLED -- isolate dQ.
+    // store(tTR_gDK, tTR_rDK, tTR_cDK, select<1,2>(problem_shape));
 
     cutlass::arch::fence_view_async_tmem_load();
     pipeline_mma_compute_dkdv.consumer_release(pipeline_mma_compute_dkdv_consumer_state);
@@ -1214,7 +1678,12 @@ struct Sm100FmhaBwdMlaKernelTmaWarpSpecialized {
     Tensor sLSE = make_tensor(make_smem_ptr(shared_tensors.smem_lse.begin()), SmemLayoutLSE{});
     Tensor sSumOdO = make_tensor(make_smem_ptr(shared_tensors.smem_sum_odo.begin()), SmemLayoutSumOdO{});
 
-    bool is_residual_k = get<1>(blk_coord) * TileShapeK{} + TileShapeK{} >= get<1>(problem_shape);
+    // sparse semantics -- indices[] already encodes causality, so
+    // no Q-vs-K triangular masking. The `is_residual_k` check (originally
+    // "are we at the right edge of the K dim?") doesn't apply either since
+    // K is gather-by-indices. Force both masks off; the validity mask for
+    // indices == -1 will be applied separately in the softmax block.
+    bool is_residual_k = false;
     int last_iter = iter_count - 1 + iter_index;
 
     CUTLASS_PRAGMA_NO_UNROLL
@@ -1234,32 +1703,11 @@ struct Sm100FmhaBwdMlaKernelTmaWarpSpecialized {
         }
       };
 
+      // sparse path skips all dense causal/residual masking.
       bool leading_causal_masking = false;
-      if constexpr (std::is_base_of_v<cutlass::fmha::collective::CausalMask<true>, Mask>) {
-        leading_causal_masking = warp_uniform(iter_index == get<1>(blk_coord));
-      } else if constexpr (std::is_base_of_v<cutlass::fmha::collective::CausalMask<false>, Mask>) {
-        int offset = get<1>(problem_shape) - get<0>(problem_shape);
-        int kv_left = get<1>(blk_coord) * TileShapeK{};
-        int kv_right = kv_left + TileShapeK{} - 1;
-        int q_left = iter_index * TileShapeQ{} + offset;
-        int q_right = q_left + TileShapeQ{} - 1;
-
-        leading_causal_masking = warp_uniform(!((q_left > kv_right) || (q_right < kv_left)));
-      }
       bool trailing_residual_masking = false;
-      if constexpr (std::is_base_of_v<cutlass::fmha::collective::ResidualMaskForBackward, Mask>) {
-        trailing_residual_masking = warp_uniform((iter_index == last_iter) || is_residual_k);
-      }
 
-      // SWA safe-baseline: causal `leading_causal_masking` only flags tiles on the
-      // diagonal band; the sliding-window LOWER edge sits on interior tiles where
-      // q is far above k (q_left > kv_right), which causal leaves unmasked. When a
-      // window is active we therefore force apply_mask on EVERY iterated tile so
-      // out-of-window (q - k >= W) keys are zeroed. Identical predicate to the
-      // forward (CausalMask<false>) keeps dP/dS/dQ/dK/dV gated consistently.
-      bool swa_active = warp_uniform(mainloop_args.window_size > 0);
-
-      dispatch_bool(leading_causal_masking || trailing_residual_masking || swa_active, [&](auto is_masked_tile) {
+      dispatch_bool(leading_causal_masking || trailing_residual_masking, [&](auto is_masked_tile) {
 
         // compute P = softmax(S, LSE)
         cute::copy(tiled_t2r, tTR_tST, tTR_rST);
@@ -1268,13 +1716,23 @@ struct Sm100FmhaBwdMlaKernelTmaWarpSpecialized {
           Mask{}.apply_mask(tTR_rST, [&](int i) {
             auto c_transpose = tTR_cST(i);
             return make_coord(get<0>(c_transpose) + iter_index * TileShapeQ{}, get<1>(c_transpose) + get<1>(blk_coord) * TileShapeK{});
-          }, problem_shape, mainloop_args.window_size);
+          }, problem_shape);
         }
 
         ElementAcc log2_e = static_cast<ElementAcc>(M_LOG2E);
         float2 softmax_scale_log2_e;
         softmax_scale_log2_e.x = mainloop_args.softmax_scale * log2_e;
         softmax_scale_log2_e.y = mainloop_args.softmax_scale * log2_e;
+
+        // sparse invalid-k mask. Per-element check whether indices[k]
+        // is valid; if not, force P=0 so the slot contributes nothing to dV/dK
+        // and dQ. K=K[0] (we set indices[invalid]=0 in Load) yields valid score
+        // otherwise, breaking dQ magnitude.
+        const int sq_idx_c = get<1>(blk_coord);
+        const int K_ps = get<1>(problem_shape);
+        const int* gIndices_compute =
+            mainloop_args.ptr_indices + sq_idx_c * mainloop_args.topk;
+        const int k_tile_base = iter_index * int(TileShapeK{});
 
         CUTLASS_PRAGMA_UNROLL
         for (int i = 0; i < size(tTR_rST); i += 2) {
@@ -1283,11 +1741,22 @@ struct Sm100FmhaBwdMlaKernelTmaWarpSpecialized {
           float2 out;
           acc.x = tTR_rST(i);
           acc.y = tTR_rST(i + 1);
-          lse.x = sLSE(get<0>(tTR_cST(i)), pipeline_load_compute_lse_consumer_state.index());
-          lse.y = sLSE(get<0>(tTR_cST(i+1)), pipeline_load_compute_lse_consumer_state.index());
+          // Fix: caller's LSE is positive (base-2 log-sum-exp normalizer).
+          // Softmax: P = exp2(S * scale * log2(e) - LSE_base2). Negate LSE so
+          // FMA = scale*acc + (-LSE) computes the correct subtraction.
+          lse.x = -sLSE(get<0>(tTR_cST(i)), pipeline_load_compute_lse_consumer_state.index());
+          lse.y = -sLSE(get<0>(tTR_cST(i+1)), pipeline_load_compute_lse_consumer_state.index());
           cute::fma(out, softmax_scale_log2_e, acc, lse);
           tTR_rST(i) = ::exp2f(out.x);
           tTR_rST(i+1) = ::exp2f(out.y);
+
+          // Apply invalid-k mask. k_local = get<1>(tTR_cST(i)) in [0, TileShapeK).
+          int k_local_x = get<1>(tTR_cST(i));
+          int k_local_y = get<1>(tTR_cST(i+1));
+          int kidx_x = gIndices_compute[k_tile_base + k_local_x];
+          int kidx_y = gIndices_compute[k_tile_base + k_local_y];
+          if (kidx_x < 0 || kidx_x >= K_ps) tTR_rST(i) = 0.0f;
+          if (kidx_y < 0 || kidx_y >= K_ps) tTR_rST(i+1) = 0.0f;
         }
 
         auto tRT_rST = quantize(tTR_rST);
@@ -1322,6 +1791,132 @@ struct Sm100FmhaBwdMlaKernelTmaWarpSpecialized {
       // release LSE
       pipeline_load_compute_lse.consumer_release(pipeline_load_compute_lse_consumer_state);
       ++pipeline_load_compute_lse_consumer_state;
+
+      // reorder: scatter dK + dV BEFORE wait dP/OdO. With
+      // pipeline_mma_compute_dkdv kStages=1, MMA chunk c+1 producer_acquire
+      // BLOCKS until compute releases chunk c. If compute were at wait dP
+      // (which fires only after MMA's full dP+dV phase including 4 dV chunk
+      // commits), MMA dK chunk 1 acquire would deadlock. Moving scatter here
+      // gives strict serial: MMA c commit -> compute c read+scatter+release
+      // -> MMA c+1 acquire unblocks. Eliminates TMEM kDK/kDV race.
+
+      // dK scatter (3 chunks, iter_index > 0 only -- setup phase has no dK).
+      if (iter_index > 0) {
+        CUTLASS_PRAGMA_NO_UNROLL
+        for (int chunk_idx = 0; chunk_idx < 3; ++chunk_idx) {
+          pipeline_mma_compute_dkdv.consumer_wait(pipeline_mma_compute_dkdv_consumer_state);
+
+          auto load_op_dk_m11 = SM100_TMEM_LOAD_32dp32b16x{};
+          auto tDKtDK_scatter_m11 = partition_fragment_C(
+              TiledMmaDSQ{}, select<0,1>(TileShapeDSQ{}))(make_coord(_,_),_0{},_0{});
+          tDKtDK_scatter_m11.data() = TmemAllocation::kDK;
+
+          Tensor cDK_full_m11 = domain_offset(
+              make_coord(get<1>(blk_coord) * TileShapeK{}, _0{}),
+              make_identity_tensor(take<0,2>(TileShapeDSQ{}))
+          );
+
+          auto tiled_t2r_dk_m11 = make_tmem_copy(load_op_dk_m11, tDKtDK_scatter_m11);
+          auto thread_t2r_dk_m11 = tiled_t2r_dk_m11.get_slice(dp_idx);
+
+          Tensor tTR_cDK_p2_m11 = thread_t2r_dk_m11.partition_D(cDK_full_m11);
+          Tensor tTR_cDK_dk_m11 = split_wg(tTR_cDK_p2_m11);
+          Tensor tTR_rDK_dk_m11 = make_tensor<ElementAcc>(shape(tTR_cDK_dk_m11));
+          Tensor tTR_tDK_dk_m11 = split_wg(thread_t2r_dk_m11.partition_S(tDKtDK_scatter_m11));
+          cute::copy(tiled_t2r_dk_m11, tTR_tDK_dk_m11, tTR_rDK_dk_m11);
+
+          const int K_total_dk_m11 = get<1>(problem_shape);
+          const int sq_idx_dk_m11 = get<1>(blk_coord);
+          const int* gIndices_dk_m11 =
+              mainloop_args.ptr_indices + sq_idx_dk_m11 * mainloop_args.topk;
+          const int k_tile_base_dk_m11 = (iter_index - 1) * int(TileShapeK{});
+          const int sq_block_base_dk_m11 = sq_idx_dk_m11 * int(TileShapeK{});
+          const int row_stride_dk_m11 = (int)get<0>(epilogue_args.stride_dk);
+          ElementAcc* ptr_dkv_acc_dk_m11 = epilogue_args.ptr_dkv_acc;
+          const int cta_d_offset_m11 = chunk_idx * int(TileShapeDQK{});
+          const float softmax_scale_dk_m11 = mainloop_args.softmax_scale;
+
+          CUTLASS_PRAGMA_UNROLL
+          for (int i = 0; i < size(tTR_rDK_dk_m11); i++) {
+            auto c = tTR_cDK_dk_m11(i);
+            int k_dense = get<0>(c);
+            int d_local = get<1>(c);
+            int k_local = k_dense - sq_block_base_dk_m11;
+            if (k_local < 0 || k_local >= int(TileShapeK{})) continue;
+            if (d_local < 0 || d_local >= int(TileShapeDQK{})) continue;
+            int kidx = gIndices_dk_m11[k_tile_base_dk_m11 + k_local];
+            if (kidx < 0 || kidx >= K_total_dk_m11) continue;
+            const size_t _off_dk = (size_t)kidx * row_stride_dk_m11
+                                  + cta_d_offset_m11 + d_local;
+            if (_off_dk >= (size_t)K_total_dk_m11 * row_stride_dk_m11) continue;
+            float v = tTR_rDK_dk_m11(i) * softmax_scale_dk_m11;
+            atomicAdd(&ptr_dkv_acc_dk_m11[_off_dk], v);
+          }
+
+          cutlass::arch::fence_view_async_tmem_load();
+          pipeline_mma_compute_dkdv.consumer_release(pipeline_mma_compute_dkdv_consumer_state);
+          ++pipeline_mma_compute_dkdv_consumer_state;
+        }
+      }
+
+      // dV scatter (4 chunks, D_V_CHUNK=128 each).
+      {
+        static constexpr int D_V_NUM_CHUNKS_M11 = /*D_V=512 / D_V_CHUNK=128 = */ 4;
+        CUTLASS_PRAGMA_NO_UNROLL
+        for (int chunk = 0; chunk < D_V_NUM_CHUNKS_M11; ++chunk) {
+          pipeline_mma_compute_dkdv.consumer_wait(pipeline_mma_compute_dkdv_consumer_state);
+
+          auto load_op_dv_m11 = SM100_TMEM_LOAD_32dp32b16x{};
+          auto tDVtDV_scatter_m11 = partition_fragment_C(
+              TiledMmaPDO{}, select<0,1>(TileShapePDO{}))(make_coord(_,_),_0{},_0{});
+          tDVtDV_scatter_m11.data() = TmemAllocation::kDV;
+
+          Tensor cDV_full_m11 = domain_offset(
+              make_coord(get<1>(blk_coord) * TileShapeK{}, _0{}),
+              make_identity_tensor(take<0,2>(TileShapePDO{}))
+          );
+
+          auto tiled_t2r_dv_m11 = make_tmem_copy(load_op_dv_m11, tDVtDV_scatter_m11);
+          auto thread_t2r_dv_m11 = tiled_t2r_dv_m11.get_slice(dp_idx);
+
+          Tensor tTR_cDV_p_m11 = thread_t2r_dv_m11.partition_D(cDV_full_m11);
+          Tensor tTR_cDV_m11   = split_wg(tTR_cDV_p_m11);
+          Tensor tTR_rDV_m11   = make_tensor<ElementAcc>(shape(tTR_cDV_m11));
+          Tensor tTR_tDV_m11   = split_wg(thread_t2r_dv_m11.partition_S(tDVtDV_scatter_m11));
+          cute::copy(tiled_t2r_dv_m11, tTR_tDV_m11, tTR_rDV_m11);
+
+          const int K_total_dv_m11 = get<1>(problem_shape);
+          const int sq_idx_dv_m11 = get<1>(blk_coord);
+          const int* gIndices_dv_m11 =
+              mainloop_args.ptr_indices + sq_idx_dv_m11 * mainloop_args.topk;
+          const int k_tile_base_dv_m11 = iter_index * int(TileShapeK{});
+          const int sq_block_base_dv_m11  = sq_idx_dv_m11 * int(TileShapeK{});
+          const int row_stride_dv_m11 = (int)get<0>(epilogue_args.stride_dv);
+          ElementAcc* ptr_dkv_acc_dv_m11 = epilogue_args.ptr_dkv_acc;
+          const int chunk_d_offset_m11 = chunk * int(TileShapeDVO{});
+
+          CUTLASS_PRAGMA_UNROLL
+          for (int i = 0; i < size(tTR_rDV_m11); i++) {
+            auto cc = tTR_cDV_m11(i);
+            int k_dense = get<0>(cc);
+            int d_local = get<1>(cc);
+            int k_local = k_dense - sq_block_base_dv_m11;
+            if (k_local < 0 || k_local >= int(TileShapeK{})) continue;
+            if (d_local < 0 || d_local >= int(TileShapeDVO{})) continue;
+            int kidx = gIndices_dv_m11[k_tile_base_dv_m11 + k_local];
+            if (kidx < 0 || kidx >= K_total_dv_m11) continue;
+            const size_t _off_dv = (size_t)kidx * row_stride_dv_m11
+                                  + chunk_d_offset_m11 + d_local;
+            if (_off_dv >= (size_t)K_total_dv_m11 * row_stride_dv_m11) continue;
+            float v = tTR_rDV_m11(i);
+            atomicAdd(&ptr_dkv_acc_dv_m11[_off_dv], v);
+          }
+
+          cutlass::arch::fence_view_async_tmem_load();
+          pipeline_mma_compute_dkdv.consumer_release(pipeline_mma_compute_dkdv_consumer_state);
+          ++pipeline_mma_compute_dkdv_consumer_state;
+        }
+      }
 
       // wait for OdO
       pipeline_load_compute_sum_odo.consumer_wait(pipeline_load_compute_sum_odo_consumer_state);
@@ -1384,14 +1979,70 @@ struct Sm100FmhaBwdMlaKernelTmaWarpSpecialized {
       pipeline_load_compute_sum_odo.consumer_release(pipeline_load_compute_sum_odo_consumer_state);
       ++pipeline_load_compute_sum_odo_consumer_state;
 
+      // dK + dV scatter MOVED to before "wait for OdO" above.
+      // The previous location had TMEM kDK/kDV race because compute warp was
+      // blocked at wait dP while MMA raced ahead overwriting TMEM.
+
       iter_count -= 1;
       iter_index += 1;
     }
 
-    epilogue(
-        blk_coord, blk_offset, problem_shape, mainloop_args, epilogue_args,
-        pipeline_mma_compute_dkdv, pipeline_mma_compute_dkdv_consumer_state
-    );
+    // D path trailing: dK for LAST K-tile across 3 d_qk chunks. Each chunk
+    // scatters to dKV[:, chunk_idx*192:(chunk_idx+1)*192].
+    CUTLASS_PRAGMA_NO_UNROLL
+    for (int chunk_idx = 0; chunk_idx < 3; ++chunk_idx) {
+      pipeline_mma_compute_dkdv.consumer_wait(pipeline_mma_compute_dkdv_consumer_state);
+
+      auto load_op_dk_trail = SM100_TMEM_LOAD_32dp32b16x{};
+      auto tDKtDK_trail = partition_fragment_C(
+          TiledMmaDSQ{}, select<0,1>(TileShapeDSQ{}))(make_coord(_,_),_0{},_0{});
+      tDKtDK_trail.data() = TmemAllocation::kDK;
+
+      Tensor cDK_trail = domain_offset(
+          make_coord(get<1>(blk_coord) * TileShapeK{}, _0{}),
+          make_identity_tensor(take<0,2>(TileShapeDSQ{}))
+      );
+
+      auto tiled_t2r_trail = make_tmem_copy(load_op_dk_trail, tDKtDK_trail);
+      auto thread_t2r_trail = tiled_t2r_trail.get_slice(dp_idx);
+
+      Tensor tTR_cDK_tr = split_wg(thread_t2r_trail.partition_D(cDK_trail));
+      Tensor tTR_rDK_tr = make_tensor<ElementAcc>(shape(tTR_cDK_tr));
+      Tensor tTR_tDK_tr = split_wg(thread_t2r_trail.partition_S(tDKtDK_trail));
+      cute::copy(tiled_t2r_trail, tTR_tDK_tr, tTR_rDK_tr);
+
+      const int K_total_tr = get<1>(problem_shape);
+      const int sq_idx_tr = get<1>(blk_coord);
+      const int* gIndices_tr =
+          mainloop_args.ptr_indices + sq_idx_tr * mainloop_args.topk;
+      const int k_tile_base_tr = (iter_index - 1) * int(TileShapeK{});
+      const int sq_block_base_tr = sq_idx_tr * int(TileShapeK{});
+      const int row_stride_dk_tr = (int)get<0>(epilogue_args.stride_dk);
+      ElementAcc* ptr_dkv_acc_tr = epilogue_args.ptr_dkv_acc;
+      const int cta_d_offset_tr = chunk_idx * int(TileShapeDQK{});
+      const float softmax_scale_tr = mainloop_args.softmax_scale;
+
+      CUTLASS_PRAGMA_UNROLL
+      for (int i = 0; i < size(tTR_rDK_tr); i++) {
+        auto c = tTR_cDK_tr(i);
+        int k_dense = get<0>(c);
+        int d_local = get<1>(c);
+        int k_local = k_dense - sq_block_base_tr;
+        if (k_local < 0 || k_local >= int(TileShapeK{})) continue;
+        if (d_local < 0 || d_local >= int(TileShapeDQK{})) continue;
+        int kidx = gIndices_tr[k_tile_base_tr + k_local];
+        if (kidx < 0 || kidx >= K_total_tr) continue;
+        const size_t _off_dk_tr = (size_t)kidx * row_stride_dk_tr
+                                 + cta_d_offset_tr + d_local;
+        if (_off_dk_tr >= (size_t)K_total_tr * row_stride_dk_tr) continue;
+        float v = tTR_rDK_tr(i) * softmax_scale_tr;
+        atomicAdd(&ptr_dkv_acc_tr[_off_dk_tr], v);
+      }
+
+      cutlass::arch::fence_view_async_tmem_load();
+      pipeline_mma_compute_dkdv.consumer_release(pipeline_mma_compute_dkdv_consumer_state);
+      ++pipeline_mma_compute_dkdv_consumer_state;
+    }
   }
 
   template<class BlkCoord, class ProblemShape_>
@@ -1413,6 +2064,9 @@ struct Sm100FmhaBwdMlaKernelTmaWarpSpecialized {
     auto [Q, K, D, D_VO, HB] = problem_shape;
 
     auto [blk_coord_q, blk_coord_k, blk_coord_d, blk_coord_dv, blk_coord_batch] = blk_coord;
+    // sparse semantics -- get<1>(blk_coord) is the Q-token index.
+    // All K-tile iters within this CTA reduce-add dQ into the same Q-token row.
+    const int sq_idx = blk_coord_k;
 
     // must match TileShapeDQ
     auto load_op = SM100_TMEM_LOAD_16dp32b16x{};
@@ -1421,8 +2075,11 @@ struct Sm100FmhaBwdMlaKernelTmaWarpSpecialized {
     tDQtDQ.data() = TmemAllocation::kDQ;
 
     Tensor mDQ = mainloop_params.tma_red_dq.get_tma_tensor(make_shape(Q, D, HB));
-    auto gDQ = local_tile(mDQ, TileShapeQK{}, make_coord(_,_,_), Step<_1, X, _1>{})
-        (_, _, _, _0{}, blk_coord_batch);
+    // D path: KEEP num_D_tiles dim (3 tiles of 192 cols each). Previous code
+    // sliced to _0{} which only exposed cols [0, 192) -- chunks 1,2 wrote OOB.
+    auto gDQ_outer = local_tile(mDQ, TileShapeQK{}, make_coord(_,_,_), Step<_1, X, _1>{})
+        (_, _, _, _, blk_coord_batch);
+    // gDQ_outer shape: (TileShapeQ=64, TileShapeDQK=192, num_Q_tiles, num_D_tiles=3)
 
     Tensor cDQ = make_identity_tensor(take<0,2>(TileShapeDSK{}));
 
@@ -1433,7 +2090,6 @@ struct Sm100FmhaBwdMlaKernelTmaWarpSpecialized {
     auto thread_t2r = tiled_t2r.get_slice(thread_idx);
 
     Tensor tTR_cDQ   = thread_t2r.partition_D(cDQ);
-    Tensor tTR_gDQ   = thread_t2r.partition_D(gDQ);
     Tensor tTR_sDQ   = thread_t2r.partition_D(sDQ);
     Tensor tTR_tDQ = thread_t2r.partition_S(tDQtDQ);
 
@@ -1441,49 +2097,62 @@ struct Sm100FmhaBwdMlaKernelTmaWarpSpecialized {
 
     Tensor tDQsDQ = block_tma.partition_S(sDQ);
     Tensor tDQcDQ = block_tma.partition_S(cDQ);
-    Tensor tDQgDQ = block_tma.partition_D(gDQ);
 
     int lane_predicate = (threadIdx.x % (kNumReduceWarps * NumThreadsPerWarp)) == 0;
 
+    // D path: loop N iters consuming 3 dQ per iter (3N total).
+    // MMA produces: 3(N-1) iter loop + 3 trailing = 3N. Balanced.
     while (iter_count > 0) {
-      pipeline_mma_reduce_dq.consumer_wait(pipeline_mma_reduce_dq_consumer_state);
+      // D path: per K-iter, consume 3 dQ chunks (chunks 0..2). Each chunk
+      // scatters to dQ_acc[:, chunk_idx*192:(chunk_idx+1)*192].
+      CUTLASS_PRAGMA_NO_UNROLL
+      for (int chunk_idx = 0; chunk_idx < 3; ++chunk_idx) {
+        pipeline_mma_reduce_dq.consumer_wait(pipeline_mma_reduce_dq_consumer_state);
 
-      Tensor tTR_rDQ = make_tensor<ElementAcc>(shape(tTR_cDQ));
+        Tensor tTR_rDQ = make_tensor<ElementAcc>(shape(tTR_cDQ));
 
-      // load dQ from tmem to rmem
-      cute::copy(tiled_t2r, tTR_tDQ, tTR_rDQ);
+        // load dQ from tmem to rmem
+        cute::copy(tiled_t2r, tTR_tDQ, tTR_rDQ);
 
-      cutlass::arch::fence_view_async_tmem_load();
-      pipeline_mma_reduce_dq.consumer_release(pipeline_mma_reduce_dq_consumer_state);
-      ++pipeline_mma_reduce_dq_consumer_state;
+        cutlass::arch::fence_view_async_tmem_load();
+        pipeline_mma_reduce_dq.consumer_release(pipeline_mma_reduce_dq_consumer_state);
+        ++pipeline_mma_reduce_dq_consumer_state;
 
-      // we don't have enough smem to dump it all to smem, so we do it in stages
-      CUTLASS_PRAGMA_UNROLL
-      for (int i = 0; i < size<2>(tTR_cDQ); i++) {
-        if (lane_predicate) {
-          pipeline_reduce_tma_store.producer_acquire(pipeline_reduce_tma_store_producer_state);
+        // D path: select chunk_idx's d_qk tile (cols [chunk_idx*192, (chunk_idx+1)*192)).
+        // partition_D over this tile gives 6 partitions of TileShapeDQ=32 cols each.
+        auto gDQ_chunk = gDQ_outer(_, _, _, chunk_idx);
+        Tensor tDQgDQ = block_tma.partition_D(gDQ_chunk);
+
+        // we don't have enough smem to dump it all to smem, so we do it in stages
+        CUTLASS_PRAGMA_UNROLL
+        for (int i = 0; i < size<2>(tTR_cDQ); i++) {
+          if (lane_predicate) {
+            pipeline_reduce_tma_store.producer_acquire(pipeline_reduce_tma_store_producer_state);
+          }
+          // wait in all threads for the acquire to complete
+          cutlass::arch::NamedBarrier(
+              kNumReduceWarps * NumThreadsPerWarp,
+              cutlass::arch::ReservedNamedBarriers::TransposeBarrier
+          ).arrive_and_wait();
+
+          cute::copy(tTR_rDQ(_, _, i), tTR_sDQ(_, _, _0{}, pipeline_reduce_tma_store_producer_state.index()));
+
+          // wait for the stores to all be visible to the TMA
+          cutlass::arch::fence_view_async_shared();
+          cutlass::arch::NamedBarrier(
+              kNumReduceWarps * NumThreadsPerWarp,
+              cutlass::arch::ReservedNamedBarriers::TransposeBarrier
+          ).arrive_and_wait();
+          if (lane_predicate) {
+            // i indexes into the 6 partitions of chunk's d_qk tile.
+            copy(mainloop_params.tma_red_dq,
+                 tDQsDQ(_,_,_0{}, pipeline_reduce_tma_store_producer_state.index()),
+                 tDQgDQ(_,_, i, sq_idx));
+            pipeline_reduce_tma_store.producer_commit(pipeline_reduce_tma_store_producer_state);
+          }
+
+          ++pipeline_reduce_tma_store_producer_state;
         }
-        // wait in all threads for the acquire to complete
-        cutlass::arch::NamedBarrier(
-            kNumReduceWarps * NumThreadsPerWarp,
-            cutlass::arch::ReservedNamedBarriers::TransposeBarrier
-        ).arrive_and_wait();
-
-        cute::copy(tTR_rDQ(_, _, i), tTR_sDQ(_, _, _0{}, pipeline_reduce_tma_store_producer_state.index()));
-
-        // wait for the stores to all be visible to the TMA
-        cutlass::arch::fence_view_async_shared();
-        cutlass::arch::NamedBarrier(
-            kNumReduceWarps * NumThreadsPerWarp,
-            cutlass::arch::ReservedNamedBarriers::TransposeBarrier
-        ).arrive_and_wait();
-        if (lane_predicate) {
-          // launch tma store
-          copy(mainloop_params.tma_red_dq, tDQsDQ(_,_,_0{}, pipeline_reduce_tma_store_producer_state.index()), tDQgDQ(_,_,i,iter_index));
-          pipeline_reduce_tma_store.producer_commit(pipeline_reduce_tma_store_producer_state);
-        }
-
-        ++pipeline_reduce_tma_store_producer_state;
       }
 
       iter_count -= 1;
@@ -1498,12 +2167,19 @@ struct Sm100FmhaBwdMlaKernelTmaWarpSpecialized {
     auto role = warp_idx_to_role(warp_idx);
     uint32_t lane_predicate = cute::elect_one_sync();
 
-    if (role == WarpRole::Load && lane_predicate) {
-      prefetch_tma_descriptor(params.mainloop_params.tma_load_q.get_tma_descriptor());
-      prefetch_tma_descriptor(params.mainloop_params.tma_load_k.get_tma_descriptor());
-      prefetch_tma_descriptor(params.mainloop_params.tma_load_v.get_tma_descriptor());
-      prefetch_tma_descriptor(params.mainloop_params.tma_load_do.get_tma_descriptor());
-    }
+    // prefetch_tma_descriptor was the source of illegal access for
+    // our sparse setup (binary search confirmed via build 614 vs 612).
+    // The dense TMA descriptors (tma_load_q/k/v/do) are constructed but the
+    // sparse path doesn't actually use them for K/V (gather4 path); even Q/dO
+    // use direct TMA load via the descriptor object, not via the prefetched
+    // L2 cache hint. Skipping prefetch is purely a perf cost (cold descriptor
+    // fetch on first use) -- correctness unaffected.
+    // if (role == WarpRole::Load && lane_predicate) {
+    //   prefetch_tma_descriptor(params.mainloop_params.tma_load_q.get_tma_descriptor());
+    //   prefetch_tma_descriptor(params.mainloop_params.tma_load_k.get_tma_descriptor());
+    //   prefetch_tma_descriptor(params.mainloop_params.tma_load_v.get_tma_descriptor());
+    //   prefetch_tma_descriptor(params.mainloop_params.tma_load_do.get_tma_descriptor());
+    // }
 
     SharedStorage& shared_storage = *reinterpret_cast<SharedStorage*>(smem);
 
@@ -1691,23 +2367,36 @@ struct Sm100FmhaBwdMlaKernelTmaWarpSpecialized {
 
     pipeline_init_wait(size(ClusterShape{}));
 
-    auto blk_coord = make_coord(_0{}, blockIdx.x, _0{}, _0{}, make_coord(blockIdx.y, blockIdx.z));
+    // sparse iteration topology.
+    //
+    // Dense MLA bwd: grid = (s_kv/TileShapeK, H, B) -- each CTA owns a fixed
+    // K-block and iterates over Q-blocks. iter_index there is the Q-block.
+    //
+    // D path: grid = (s_q, 1, 1) -- one CTA per Q-token, no cluster.
+    // Each CTA processes ALL 3 d_qk chunks sequentially (loops in Load/MMA).
+    //
+    // Re-purposed blk_coord fields:
+    //   get<0>(blk_coord) -- always 0 (single Q-token per CTA; B_H=64 covers H)
+    //   get<1>(blk_coord) -- Q-token index (was K-block index in dense)
+    //   get<4>(blk_coord) -- (H_idx=0, B_idx=0)  (DSA: B=1, H baked into B_H)
+    //
+    // iter_index = K-tile index (0..ceil(topk/B_TOPK)-1). iter_start = 0
+    // (sparse indices already encode causality; no extra Q-vs-K mask needed).
+    const int sq_idx_in_cluster = blockIdx.x;
+    auto blk_coord = make_coord(_0{}, sq_idx_in_cluster, _0{}, _0{},
+                                make_coord(blockIdx.y, blockIdx.z));
     auto [problem_shape, blk_offset] = apply_variable_length_offset(
         params.problem_shape,
         blk_coord
     );
-    int iter_count = ceil_div(get<0>(problem_shape), TileShapeQ{});
+    // iter_count = number of K-tiles per Q-token = ceil_div(topk, B_TOPK).
+    int iter_count = (params.mainloop.topk + int(TileShapeK{}) - 1) / int(TileShapeK{});
     int iter_start = 0;
-    if constexpr (std::is_base_of_v<cutlass::fmha::collective::CausalMask<true>, Mask>) {
-      iter_start = (get<1>(blk_coord) * TileShapeK{}) / TileShapeQ{};
-    } else if constexpr (std::is_base_of_v<cutlass::fmha::collective::CausalMask<false>, Mask>) {
-      int offset = get<1>(problem_shape) - get<0>(problem_shape);
-      iter_start = max(0, (int(get<1>(blk_coord) * TileShapeK{}) - offset) / (int)TileShapeQ{});
-    }
-    if (get<1>(blk_coord) * TileShapeK{} >= get<1>(problem_shape)) {
+
+    // Q-token bounds check: skip if Q-token is outside [0, s_q).
+    if (sq_idx_in_cluster >= get<0>(problem_shape)) {
       return;
     }
-    iter_count -= iter_start;
 
     if (iter_count <= 0) {
       epilogue_clear(

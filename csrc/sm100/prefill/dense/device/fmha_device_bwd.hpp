@@ -90,6 +90,15 @@ public:
 
     ElementAccumulator softmax_scale;
 
+    // SWA: causal sliding-window width (<=0 disables). Must equal the forward
+    // window. Forwarded into the bwd kernel's MainloopArguments.window_size.
+    int window_size = -1;
+
+    // gpt-oss attention sink: per-head [h_q] logit (sink_bias) + its output gradient
+    // (ptr_d_sink, [h_q], zeroed). Folded into the sum_OdO pass (zero extra cost). MLA only.
+    const ElementAccumulator* sink_bias = nullptr;
+    ElementAccumulator* ptr_d_sink = nullptr;
+
     cutlass::KernelHardwareInfo hw_info;
   };
 
@@ -146,7 +155,8 @@ private:
       sum_odo, stride_sum_OdO,
       args.ptr_LSE, args.stride_LSE,
       scaled_lse, stride_scaled_lse,
-      -1.0f, -log2_e
+      -1.0f, -log2_e,
+      args.sink_bias, args.ptr_d_sink   // attention-sink fold-in (nullptr disables)
     };
   }
 
@@ -184,7 +194,8 @@ private:
         scaled_lse, stride_scaled_lse,
         sum_OdO, stride_sum_OdO,
         dQ_acc, stride_dQ,
-        args.softmax_scale },
+        args.softmax_scale,
+        args.window_size },
       { args.ptr_dK, args.stride_dK,
         args.ptr_dV, args.stride_dV },
       args.hw_info

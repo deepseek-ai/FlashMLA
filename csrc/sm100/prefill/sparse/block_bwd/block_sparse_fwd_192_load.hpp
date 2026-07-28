@@ -36,8 +36,8 @@
 #include "cute/tensor.hpp"
 #include "cute/layout.hpp"
 
-#include "../collective/fmha_common.hpp"
-#include "../collective/fmha_fusion.hpp"
+#include "../../dense/collective/fmha_common.hpp"
+#include "../../dense/collective/fmha_fusion.hpp"
 
 namespace cutlass::fmha::collective {
 
@@ -60,7 +60,7 @@ template<
   class TileShape,
   class OrderLoadEpilogue = cute::false_type
 >
-struct Sm100MlaFwdLoadTmaWarpspecialized {
+struct Sm100BlockSparseFwdLoadTmaWarpspecialized {
 
   using TileShapeQK = typename CollectiveMmaQK::TileShape;
   using TileShapePV = typename CollectiveMmaPV::TileShape;
@@ -78,6 +78,10 @@ struct Sm100MlaFwdLoadTmaWarpspecialized {
     StrideK dK;
     const Element* ptr_V;
     StrideV dV;
+    // block-sparse: per-q-block selected K-block ids [num_q_blocks, topk], -1 padded.
+    // nullptr => dense (the original contiguous K-tile iteration).
+    const int* ptr_q2k = nullptr;
+    int topk = 0;
   };
 
   using TMA_Q = typename CollectiveMmaQK::Params::TMA_A;
@@ -89,6 +93,8 @@ struct Sm100MlaFwdLoadTmaWarpspecialized {
     TMA_K tma_load_k;
     TMA_V tma_load_v;
     int window_size = -1;   // SWA: forwarded from the mainloop to skip leading K/V tiles
+    const int* ptr_q2k = nullptr;  // block-sparse: [num_q_blocks, topk] selected K-block ids
+    int topk = 0;
   };
 
   template<class ProblemShape>
@@ -144,7 +150,9 @@ struct Sm100MlaFwdLoadTmaWarpspecialized {
         params_qk.tma_load_a,
         params_qk.tma_load_b,
         params_pv.tma_load_b,
-        window_size
+        window_size,
+        args.ptr_q2k,
+        args.topk
     };
   }
 
@@ -176,6 +184,22 @@ struct Sm100MlaFwdLoadTmaWarpspecialized {
     // lockstep with mma/softmax/correction which subtract the same start.
     int swa_trip_start = Mask{}.get_trip_start(blk_coord_in, TileShape{}, problem_shape, params.window_size);
     int mask_tile_count = Mask{}.get_trip_count(blk_coord_in, TileShape{}, problem_shape, params.window_size) - swa_trip_start;
+
+    // block-sparse: iterate ONLY this q-block's selected K-blocks (q2k), not the
+    // contiguous causal range. q_block = CTA's Q-tile index (TileShape Q = q_block_size);
+    // q2k_base[it] (it in [0,num_sel)) = global K-tile id of the it-th selected block.
+    const bool block_sparse = (params.ptr_q2k != nullptr);
+    const int* q2k_base = block_sparse ? (params.ptr_q2k + get<0>(blk_coord_in) * params.topk) : nullptr;
+    if (block_sparse) {
+      int n = 0;
+      for (int i = 0; i < params.topk; ++i) { if (q2k_base[i] >= 0) ++n; else break; }
+      mask_tile_count = n;
+    }
+    const int num_sel = mask_tile_count;
+    auto sel = [&](int it) {
+      if (!block_sparse) return swa_trip_start + it;
+      return q2k_base[it < num_sel ? it : (num_sel > 0 ? num_sel - 1 : 0)];
+    };
 
     using X = Underscore;
 
@@ -268,7 +292,8 @@ struct Sm100MlaFwdLoadTmaWarpspecialized {
     ++pipeline_q_producer_state;
 
     // K1
-    int k_index = swa_trip_start;   // SWA: first in-window K/V tile (0 if no window)
+    int iter = 0;
+    int k_index = sel(iter);   // first selected K-tile (block-sparse) or swa_trip_start (dense)
     pipeline_kv.producer_acquire(pipeline_kv_producer_state);
     if (lane_predicate) {
       auto tma_barrier = pipeline_kv.producer_get_barrier(pipeline_kv_producer_state);
@@ -296,7 +321,8 @@ struct Sm100MlaFwdLoadTmaWarpspecialized {
       copy(params.tma_load_v.with(*tma_barrier, 0), tVgV(_, k_index), tVsV(_, pipeline_kv_producer_state.index() / 2));
     }
     ++pipeline_kv_producer_state;
-    k_index += 1;
+    iter += 1;
+    k_index = sel(iter);
 
     // loop:
     mask_tile_count -= 1;
@@ -319,13 +345,14 @@ struct Sm100MlaFwdLoadTmaWarpspecialized {
         auto tma_barrier = pipeline_kv.producer_get_barrier(pipeline_kv_producer_state);
         copy(params.tma_load_v.with(*tma_barrier, 0), tVgV(_, k_index), tVsV(_, pipeline_kv_producer_state.index() / 2));
 
-        // prefetch ki+1
+        // prefetch ki+1 (next selected block)
         if(mask_tile_count > 1) {
-          cute::prefetch(params.tma_load_k, tKgK(_, k_index + 1));
+          cute::prefetch(params.tma_load_k, tKgK(_, sel(iter + 1)));
         }
       }
       ++pipeline_kv_producer_state;
-      k_index += 1;
+      iter += 1;
+      k_index = sel(iter);
     }
   }
 };

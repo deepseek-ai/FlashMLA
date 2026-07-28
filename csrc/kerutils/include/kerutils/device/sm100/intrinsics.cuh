@@ -33,6 +33,47 @@ void tma_gather4_prefetch(const void* desc_ptr, int col_idx, int4 row_idxs, int6
     );
 }
 
+// tma gather4 with cta_group::1 -- single-CTA gather (no peer-CTA pairing).
+// Use this when the cluster shape is not a multiple of 2 (e.g. 3-CTA cluster),
+// where cta_group::2 PTX would be invalid and could trigger illegal memory
+// access on the odd-numbered CTA. The barrier signal still lives in this
+// CTA's SMEM; each CTA arrives/waits independently.
+CUTE_DEVICE void tma_gather4_cta_group_1(const void* desc_ptr, transac_bar_t &mbar_ptr, void* smem_ptr, int col_idx, int4 row_idxs, int64_t cache_hint) {
+    uint32_t smem_addr = cute::cast_smem_ptr_to_uint(smem_ptr);
+    uint32_t mbar_addr = cute::cast_smem_ptr_to_uint(&mbar_ptr);
+    asm volatile(
+        "cp.async.bulk.tensor.2d.shared::cta.global.tile::gather4.mbarrier::complete_tx::bytes.cta_group::1.L2::cache_hint [%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;\n"
+        :
+        : "r"(smem_addr), "l"(desc_ptr), "r"(col_idx),
+          "r"(row_idxs.x), "r"(row_idxs.y), "r"(row_idxs.z), "r"(row_idxs.w),
+          "r"(mbar_addr), "l"(cache_hint)
+        : "memory"
+    );
+}
+
+// Same gather4 PTX but takes a raw mbar SMEM pointer (uint64_t*) -- matches the
+// CUTLASS pipeline's producer_get_barrier() return type. Use this from kernels
+// that already drive the gather completion via a CUTLASS PipelineTmaUmmaAsync
+// barrier instead of a custom transac_bar_t. The sparse bwd uses this so the
+// dense-MLA-bwd-derived pipeline infra stays untouched.
+//
+// NOTE: this variant drops the `cta_group::N` qualifier entirely. Default PTX
+// semantics is single-CTA. Sparse FWD uses cta_group::2 (cluster<2>); an earlier
+// variant used an explicit cta_group::1 (SM100 support for that qualifier with
+// gather4 is unverified). With no qualifier we get plain single-CTA gather.
+CUTE_DEVICE void tma_gather4_cta_group_1_pipe(const void* desc_ptr, uint64_t* mbar_ptr, void* smem_ptr, int col_idx, int4 row_idxs, int64_t cache_hint) {
+    uint32_t smem_addr = cute::cast_smem_ptr_to_uint(smem_ptr);
+    uint32_t mbar_addr = cute::cast_smem_ptr_to_uint(mbar_ptr);
+    asm volatile(
+        "cp.async.bulk.tensor.2d.shared::cta.global.tile::gather4.mbarrier::complete_tx::bytes.L2::cache_hint [%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;\n"
+        :
+        : "r"(smem_addr), "l"(desc_ptr), "r"(col_idx),
+          "r"(row_idxs.x), "r"(row_idxs.y), "r"(row_idxs.z), "r"(row_idxs.w),
+          "r"(mbar_addr), "l"(cache_hint)
+        : "memory"
+    );
+}
+
 // tma gather4 with cta_group::2, allowing for synchronization across CTAs within a pair of CTAs (https://docs.nvidia.com/cuda/parallel-thread-execution/#data-movement-and-conversion-instructions-cp-async-bulk-tensor)
 template<bool USE_CTA0_MBAR = false>
 CUTE_DEVICE void tma_gather4_cta_group_2(const void* desc_ptr, transac_bar_t &mbar_ptr, void* smem_ptr, int col_idx, int4 row_idxs, int64_t cache_hint) {
