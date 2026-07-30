@@ -11,6 +11,7 @@
 #include "params.h"
 #include "utils.h"
 #include "sm100/helpers.h"
+#include "sm100/prefill/sparse/common_subroutine.h"
 
 #include "config.h"
 
@@ -71,10 +72,22 @@ KernelTemplate<D_QK>::sparse_attn_fwd_kernel_devfunc(const SparseAttnFwdParams &
     const int s_q_idx = blockIdx.x / 2;
     const int warp_idx = cutlass::canonical_warp_idx_sync();
     const int lane_idx = threadIdx.x % 32;
-    const int topk_length = params.topk_length != nullptr ? __ldg(params.topk_length + s_q_idx) : params.topk;
-    const int num_k_blocks = max(cute::ceil_div(topk_length, (int)B_TOPK), 1);  // num_k_blocks always >= 1
     const int warpgroup_idx = __shfl_sync(0xffffffff, threadIdx.x / 128, 0);
     const int idx_in_warpgroup = threadIdx.x % 128;
+
+    int* gIndices = params.indices + s_q_idx*params.stride_indices_s_q; // [topk]
+
+    // When topk_length is not provided, derive an equivalent value from the position of the
+    // last valid index in the row, so that trailing k-blocks that contain no valid index are
+    // skipped just like an explicitly-passed topk_length would do (they would otherwise still
+    // run both GEMMs and the softmax pass despite contributing nothing to the output).
+    // The scan's first-round loads are issued here so that they are in flight while the
+    // prologue runs; the result is consumed after the __syncthreads() below. Both CTAs of the
+    // cluster derive the same value from the same read-only data.
+    int4 topk_scan_chunks[TOPK_SCAN_CHUNKS_PER_LANE];
+    if (params.topk_length == nullptr) {
+        issue_topk_length_scan(gIndices, params.topk, topk_scan_chunks);
+    }
 
     // Prefetch TMA descriptors
     if (threadIdx.x == 0) {
@@ -87,8 +100,6 @@ KernelTemplate<D_QK>::sparse_attn_fwd_kernel_devfunc(const SparseAttnFwdParams &
     extern __shared__ char wksp_buf[];
     SharedMemoryPlan &plan = *reinterpret_cast<SharedMemoryPlan*>(wksp_buf);
     Tensor sQ_full = make_tensor(make_smem_ptr(plan.u.q_full.data()), SmemLayoutQTiles<D_Q/64>{});
-
-    int* gIndices = params.indices + s_q_idx*params.stride_indices_s_q; // [topk]
 
     // Allocate tmem tensors
     TiledMMA tiled_mma_P_tQ = TiledMMA_P_tQ{};
@@ -146,6 +157,11 @@ KernelTemplate<D_QK>::sparse_attn_fwd_kernel_devfunc(const SparseAttnFwdParams &
     }
 
     __syncthreads();    // Wait for TMEM allocation
+
+    const int topk_length = params.topk_length != nullptr ?
+        __ldg(params.topk_length + s_q_idx) :
+        get_effective_topk_length(gIndices, params.topk, params.s_kv, topk_scan_chunks);
+    const int num_k_blocks = max(cute::ceil_div(topk_length, (int)B_TOPK), 1);  // num_k_blocks always >= 1
 
     if (warpgroup_idx == 0) {
         cutlass::arch::warpgroup_reg_alloc<144>();
