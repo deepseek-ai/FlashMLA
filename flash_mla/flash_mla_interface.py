@@ -346,6 +346,9 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             is_varlen=is_varlen,
         )
         ctx.save_for_backward(q, k, v, out, lse, cu_seqlens_qo, cu_seqlens_kv)
+        # Backward uses LSE to compute gradients for `out`, but gradients with
+        # respect to the auxiliary LSE output itself are not implemented.
+        ctx.mark_non_differentiable(lse)
         ctx.max_seqlen_qo = max_seqlen_qo
         ctx.max_seqlen_kv = max_seqlen_kv
         ctx.causal = causal
