@@ -138,10 +138,12 @@ def flash_mla_with_kvcache(
     if softmax_scale is None:
         softmax_scale = q.shape[-1] ** (-0.5)
 
+    new_config = None
     if not sched_meta.have_initialized:
-        # Initialize the tile scheduler metadata during the first invocation.
-        sched_meta.have_initialized = True
-        sched_meta.config = FlashMLASchedMeta.Config(
+        # Commit this configuration only after the backend successfully creates
+        # the scheduler metadata. Otherwise a failed first call would leave the
+        # object initialized with no metadata and reject a corrected retry.
+        new_config = FlashMLASchedMeta.Config(
             b=q.shape[0],
             s_q=q.shape[1],
             h_q=q.shape[2],
@@ -181,6 +183,9 @@ def flash_mla_with_kvcache(
     )
     sched_meta.tile_scheduler_metadata = new_tile_scheduler_metadata
     sched_meta.num_splits = new_num_splits
+    if new_config is not None:
+        sched_meta.config = new_config
+        sched_meta.have_initialized = True
     return (out, lse)
 
 
