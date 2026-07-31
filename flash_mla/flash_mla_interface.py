@@ -5,6 +5,13 @@ import torch
 
 import flash_mla.cuda as flash_mla_cuda
 
+
+def _check_argument(condition: bool, message: str, error_type=ValueError) -> None:
+    """Validate public API inputs even when Python assertions are disabled."""
+    if not condition:
+        raise error_type(message)
+
+
 @dataclasses.dataclass
 class FlashMLASchedMeta:
     """
@@ -103,8 +110,12 @@ def flash_mla_with_kvcache(
     """
     sched_meta = tile_scheduler_metadata
     indices_in_kvcache = indices
-    assert isinstance(sched_meta, FlashMLASchedMeta), "tile_scheduler_metadata must be of type FlashMLASchedMeta"
-    assert num_splits is None, "num_splits must be None"
+    _check_argument(
+        isinstance(sched_meta, FlashMLASchedMeta),
+        "tile_scheduler_metadata must be of type FlashMLASchedMeta",
+        TypeError,
+    )
+    _check_argument(num_splits is None, "num_splits must be None")
 
     topk = indices_in_kvcache.shape[-1] if indices_in_kvcache is not None else None
     extra_k_page_block_size = extra_k_cache.shape[1] if extra_k_cache is not None else None
@@ -112,11 +123,20 @@ def flash_mla_with_kvcache(
     if softmax_scale is None:
         softmax_scale = q.shape[-1] ** (-0.5)
 
+    if topk is not None:
+        _check_argument(not causal, "causal must be False when sparse attention is enabled")
+        _check_argument(is_fp8_kvcache, "is_fp8_kvcache must be True when sparse attention is enabled")
+    else:
+        _check_argument(
+            indices_in_kvcache is None and attn_sink is None and extra_k_cache is None and extra_indices_in_kvcache is None and topk_length is None and extra_topk_length is None,
+            "indices_in_kvcache, attn_sink, extra_k_cache, extra_indices_in_kvcache, topk_length and extra_topk_length must be None when dense attention is used.",
+        )
+        _check_argument(
+            block_table is not None and cache_seqlens is not None,
+            "block_table and cache_seqlens must be provided when dense attention is used.",
+        )
+
     if not sched_meta.have_initialized:
-        # Sanity check. We only perform sanity check during the first invocation to save CPU time.
-        if indices_in_kvcache is not None:
-            assert not causal, "causal must be False when indices_in_kvcache is not None (i.e. sparse attention is enabled)"
-            
         # Initialize the tile scheduler metadata during the first invocation.
         sched_meta.have_initialized = True
         sched_meta.config = FlashMLASchedMeta.Config(
@@ -136,22 +156,20 @@ def flash_mla_with_kvcache(
     else:
         # Check whether the input arguments are consistent with sched_meta
         helper_msg = " Your input arguments are inconsistent with sched_meta. Please make sure the input arguments are consistent across different invocations of flash_mla_with_kvcache on the same sched_meta."
-        assert sched_meta.config is not None
-        assert sched_meta.config.b == q.shape[0], "sched_meta.config.b must be equal to batch_size." + helper_msg
-        assert sched_meta.config.s_q == q.shape[1], "sched_meta.config.s_q must be equal to seq_len_q." + helper_msg
-        assert sched_meta.config.h_q == q.shape[2], "sched_meta.config.h_q must be equal to num_heads_q." + helper_msg
-        assert sched_meta.config.page_block_size == k_cache.shape[1], "sched_meta.config.page_block_size must be equal to page_block_size." + helper_msg
-        assert sched_meta.config.h_k == k_cache.shape[2], "sched_meta.config.h_k must be equal to num_heads_k." + helper_msg
-        assert sched_meta.config.causal == causal, "sched_meta.config.causal must be equal to causal." + helper_msg
-        assert sched_meta.config.is_fp8_kvcache == is_fp8_kvcache, "sched_meta.config.is_fp8_kvcache must be equal to is_fp8_kvcache." + helper_msg
-        assert sched_meta.config.topk == topk, "sched_meta.config.topk must be equal to the last dim of indices_in_kvcache." + helper_msg
-        assert sched_meta.config.extra_page_block_size == extra_k_page_block_size, "sched_meta.config.extra_page_block_size must be equal to the page_block_size of extra_k_cache." + helper_msg
-        assert sched_meta.config.extra_topk == extra_topk, "sched_meta.config.extra_topk must be equal to the last dim of extra_indices_in_kvcache." + helper_msg
+        _check_argument(sched_meta.config is not None, "initialized sched_meta has no config", RuntimeError)
+        _check_argument(sched_meta.config.b == q.shape[0], "sched_meta.config.b must be equal to batch_size." + helper_msg)
+        _check_argument(sched_meta.config.s_q == q.shape[1], "sched_meta.config.s_q must be equal to seq_len_q." + helper_msg)
+        _check_argument(sched_meta.config.h_q == q.shape[2], "sched_meta.config.h_q must be equal to num_heads_q." + helper_msg)
+        _check_argument(sched_meta.config.page_block_size == k_cache.shape[1], "sched_meta.config.page_block_size must be equal to page_block_size." + helper_msg)
+        _check_argument(sched_meta.config.h_k == k_cache.shape[2], "sched_meta.config.h_k must be equal to num_heads_k." + helper_msg)
+        _check_argument(sched_meta.config.causal == causal, "sched_meta.config.causal must be equal to causal." + helper_msg)
+        _check_argument(sched_meta.config.is_fp8_kvcache == is_fp8_kvcache, "sched_meta.config.is_fp8_kvcache must be equal to is_fp8_kvcache." + helper_msg)
+        _check_argument(sched_meta.config.topk == topk, "sched_meta.config.topk must be equal to the last dim of indices_in_kvcache." + helper_msg)
+        _check_argument(sched_meta.config.extra_page_block_size == extra_k_page_block_size, "sched_meta.config.extra_page_block_size must be equal to the page_block_size of extra_k_cache." + helper_msg)
+        _check_argument(sched_meta.config.extra_topk == extra_topk, "sched_meta.config.extra_topk must be equal to the last dim of extra_indices_in_kvcache." + helper_msg)
 
     if topk is not None:
         # Sparse attention
-        assert not causal, "causal must be False when sparse attention is enabled"
-        assert is_fp8_kvcache, "is_fp8_kvcache must be True when sparse attention is enabled"
         out, lse, new_tile_scheduler_metadata, new_num_splits = flash_mla_cuda.sparse_decode_fwd(
             q, k_cache, indices_in_kvcache, topk_length, attn_sink,
             sched_meta.tile_scheduler_metadata, sched_meta.num_splits,
@@ -160,8 +178,6 @@ def flash_mla_with_kvcache(
         )
     else:
         # Dense attention
-        assert indices_in_kvcache is None and attn_sink is None and extra_k_cache is None and extra_indices_in_kvcache is None and topk_length is None and extra_topk_length is None, "indices_in_kvcache, attn_sink, extra_k_cache, extra_indices_in_kvcache, topk_length and extra_topk_length must be None when dense attention is used."
-        assert block_table is not None and cache_seqlens is not None, "block_table and cache_seqlens must be provided when dense attention is used."
         out, lse, new_tile_scheduler_metadata, new_num_splits = flash_mla_cuda.dense_decode_fwd(
             q, k_cache, head_dim_v,
             cache_seqlens, block_table,
@@ -383,8 +399,8 @@ def flash_attn_varlen_func(
     deterministic: bool = False,
     is_varlen: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    assert dropout_p == 0.0
-    assert not deterministic
+    _check_argument(dropout_p == 0.0, "dropout_p must be 0.0")
+    _check_argument(not deterministic, "deterministic must be False")
     return FlashAttnVarlenFunc.apply(
         q, k, v,
         cu_seqlens_qo, cu_seqlens_kv, max_seqlen_qo, max_seqlen_kv,
@@ -403,8 +419,8 @@ def flash_attn_varlen_qkvpacked_func(
     deterministic: bool = False,
     is_varlen: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    assert dropout_p == 0.0
-    assert not deterministic
+    _check_argument(dropout_p == 0.0, "dropout_p must be 0.0")
+    _check_argument(not deterministic, "deterministic must be False")
     return FlashAttnVarlenFunc.apply(
         qkv[:, :, :head_dim_qk], qkv[:, :, head_dim_qk:head_dim_qk * 2], qkv[:, :, head_dim_qk * 2:],
         cu_seqlens, cu_seqlens, max_seqlen, max_seqlen,
@@ -426,8 +442,8 @@ def flash_attn_varlen_kvpacked_func(
     deterministic: bool = False,
     is_varlen: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    assert dropout_p == 0.0
-    assert not deterministic
+    _check_argument(dropout_p == 0.0, "dropout_p must be 0.0")
+    _check_argument(not deterministic, "deterministic must be False")
     return FlashAttnVarlenFunc.apply(
         q, kv[:, :, :head_dim_qk], kv[:, :, head_dim_qk:],
         cu_seqlens_qo, cu_seqlens_kv, max_seqlen_qo, max_seqlen_kv,
