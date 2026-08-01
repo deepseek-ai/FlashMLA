@@ -12,9 +12,12 @@
 #include "kernel/fmha_tile_scheduler.hpp"
 #include "kernel/sm100_fmha_fwd_kernel_tma_warpspecialized.hpp"
 
-#include <torch/library.h>
-#include <c10/cuda/CUDAGuard.h>
-#include <c10/cuda/CUDAStream.h>
+#include <torch/csrc/stable/accelerator.h>
+#include <torch/csrc/inductor/aoti_torch/c/shim.h>
+#include <torch/headeronly/util/Exception.h>
+#include <cuda_runtime.h>
+
+#include <kerutils/supplemental/cuda_stream.h>
 
 using namespace cute;
 using namespace cutlass::fmha::collective;
@@ -220,10 +223,10 @@ struct FwdRunner {
   }
 
   template <class Options>
-  void run(const Options &options, const cutlass::KernelHardwareInfo &hw_info, at::Tensor q,
-           at::Tensor k, at::Tensor v, at::Tensor o, at::Tensor lse, float scale_softmax,
-           at::Tensor workspace, at::Tensor cumulative_seqlen_q,
-           at::Tensor cumulative_seqlen_kv, int max_seqlen_q, int max_seqlen_kv) {
+  void run(const Options &options, const cutlass::KernelHardwareInfo &hw_info, torch::stable::Tensor q,
+           torch::stable::Tensor k, torch::stable::Tensor v, torch::stable::Tensor o, torch::stable::Tensor lse, float scale_softmax,
+           torch::stable::Tensor workspace, torch::stable::Tensor cumulative_seqlen_q,
+           torch::stable::Tensor cumulative_seqlen_kv, int max_seqlen_q, int max_seqlen_kv) {
 
     int total_seqlen_q = q.size(0);
     int total_seqlen_kv = k.size(0);
@@ -244,11 +247,11 @@ struct FwdRunner {
     int v_stride0 = v.stride(0), v_stride1 = v.stride(1), v_stride2 = v.stride(2);
     int o_stride0 = o.stride(0), o_stride1 = o.stride(1), o_stride2 = o.stride(2);
     int lse_stride0 = lse.stride(0), lse_stride1 = lse.stride(1);
-    TORCH_CHECK(q_stride2 == 1);
-    TORCH_CHECK(k_stride2 == 1);
-    TORCH_CHECK(v_stride2 == 1);
-    TORCH_CHECK(o_stride2 == 1);
-    TORCH_CHECK(lse_stride0 == 1);
+    STD_TORCH_CHECK(q_stride2 == 1);
+    STD_TORCH_CHECK(k_stride2 == 1);
+    STD_TORCH_CHECK(v_stride2 == 1);
+    STD_TORCH_CHECK(o_stride2 == 1);
+    STD_TORCH_CHECK(lse_stride0 == 1);
 
     stride_Q = make_stride(q_stride0, _1{}, make_stride(make_stride(q_stride1, H_Q * q_stride1), SQ * q_stride0));
     stride_O = make_stride(o_stride0, _1{}, make_stride(make_stride(o_stride1, H_Q * o_stride1), SQ * o_stride0));
@@ -279,18 +282,18 @@ struct FwdRunner {
 
     CUTLASS_CHECK(op.can_implement(arguments));
     CUTLASS_CHECK(op.initialize(arguments, nullptr));
-    CUTLASS_CHECK(op.run(at::cuda::getCurrentCUDAStream()));
+    CUTLASS_CHECK(op.run(kerutils::get_current_cuda_stream(q)));
   }
 };
 
 template <class DTypeIn, class DTypeOut, bool kIsVarlen, bool kIsMla, class ActiveMask,
           class... KernelOptions>
-void run_fmha_fwd(at::Tensor workspace, at::Tensor q, at::Tensor k, at::Tensor v,
-                  at::Tensor cumulative_seqlen_q, at::Tensor cumulative_seqlen_kv, at::Tensor o,
-                  at::Tensor lse, float scale_softmax, int max_seqlen_q, int max_seqlen_kv) {
+void run_fmha_fwd(torch::stable::Tensor workspace, torch::stable::Tensor q, torch::stable::Tensor k, torch::stable::Tensor v,
+                  torch::stable::Tensor cumulative_seqlen_q, torch::stable::Tensor cumulative_seqlen_kv, torch::stable::Tensor o,
+                  torch::stable::Tensor lse, float scale_softmax, int max_seqlen_q, int max_seqlen_kv) {
 
-  const at::cuda::CUDAGuard device_guard{(char)q.get_device()};
-  const int device_id = q.get_device();
+  const torch::stable::accelerator::DeviceGuard device_guard(q.get_device_index());
+  const int device_id = q.get_device_index();
 
   cutlass::KernelHardwareInfo hw_info;
   hw_info.device_id = device_id;

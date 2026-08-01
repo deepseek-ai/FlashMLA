@@ -1,5 +1,31 @@
 # FlashMLA
 
+This fork is a LibTorch and CPython ABI stable version of the original FlashMLA. This means that you can build one wheel that suffices across Python 3.10+ and torch 2.10+ at runtime with a `pip install`. You can build and install it directly from GitHub; the cutlass submodule will be fetched automatically during the build:
+
+```zsh
+pip install -v --no-build-isolation "git+https://github.com/janeyx99/FlashMLA-ABI-Stable.git"
+```
+
+**Build prerequisites**
+- PyTorch **2.11+**
+    - Example command for cuda 13.0: `pip install torch==2.11.0 --index-url https://download.pytorch.org/whl/cu130`
+    - Note that the build time requirement is intentionally 2.11 to access nicer UX features for the stable ABI. However at runtime, the wheel will work with torch 2.10+.
+    - `--no-build-isolation` is required so the build can import your existing torch. 
+- A CUDA toolkit with `nvcc` **12.9+** for the SM100 (Blackwell) kernels. With `nvcc` 12.8 you must disable SM100: prefix the command with `FLASH_MLA_DISABLE_SM100=1`. 
+
+### Install from a local clone
+
+```zsh
+git clone https://github.com/janeyx99/FlashMLA-ABI-Stable.git
+cd FlashMLA-ABI-Stable
+git submodule update --init --recursive
+pip install -v --no-build-isolation .
+```
+
+Below is the original README with all the deets -- credits to the original authors from DeepSeek.
+
+
+
 ## Introduction
 
 FlashMLA is DeepSeek's library of optimized attention kernels, powering the [DeepSeek-V3](https://github.com/deepseek-ai/DeepSeek-V3) and [DeepSeek-V3.2-Exp](https://github.com/deepseek-ai/DeepSeek-V3.2-Exp) models. This repository contains the following implementations:

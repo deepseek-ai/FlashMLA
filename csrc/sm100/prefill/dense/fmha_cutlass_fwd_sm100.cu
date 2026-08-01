@@ -1,7 +1,8 @@
 #include "interface.h"
 
-#include <c10/cuda/CUDAGuard.h>
-#include <c10/cuda/CUDAStream.h>
+#include <torch/csrc/stable/accelerator.h>
+#include <torch/headeronly/core/ScalarType.h>
+#include <torch/headeronly/util/Exception.h>
 #include <cuda_bf16.h>
 
 #include "common/mask.cuh"
@@ -12,9 +13,9 @@
 template <class Mask, class Varlen, class Element, class ElementOut, class Mla>
 void call_run_fmha_fwd([[maybe_unused]] Mask mask, [[maybe_unused]] Varlen is_varlen,
                        [[maybe_unused]] Element in, [[maybe_unused]] ElementOut out,
-                       [[maybe_unused]] Mla mla, at::Tensor workspace_buffer, at::Tensor q,
-                       at::Tensor k, at::Tensor v, at::Tensor cumulative_seqlen_q,
-                       at::Tensor cumulative_seqlen_kv, at::Tensor o, at::Tensor lse,
+                       [[maybe_unused]] Mla mla, torch::stable::Tensor workspace_buffer, torch::stable::Tensor q,
+                       torch::stable::Tensor k, torch::stable::Tensor v, torch::stable::Tensor cumulative_seqlen_q,
+                       torch::stable::Tensor cumulative_seqlen_kv, torch::stable::Tensor o, torch::stable::Tensor lse,
                        float softmax_scale, int max_seqlen_q, int max_seqlen_kv) {
   static constexpr bool IsVarlen = std::is_same_v<Varlen, true_type>;
   static constexpr bool IsMla = std::is_same_v<Mla, true_type>;
@@ -28,21 +29,21 @@ void call_run_fmha_fwd([[maybe_unused]] Mask mask, [[maybe_unused]] Varlen is_va
       softmax_scale, max_seqlen_q, max_seqlen_kv);
 }
 
-void FMHACutlassSM100FwdRun(at::Tensor workspace_buffer, at::Tensor q, at::Tensor k,
-                            at::Tensor v, at::Tensor cumulative_seqlen_q,
-                            at::Tensor cumulative_seqlen_kv, at::Tensor o, at::Tensor lse,
-                            int mask_mode_code, float sm_scale, int max_seqlen_q,
-                            int max_seqlen_kv, bool is_varlen) {
-  const c10::cuda::OptionalCUDAGuard device_guard(q.device());
-  CHECK(q.scalar_type() == k.scalar_type());
+void FMHACutlassSM100FwdRun(torch::stable::Tensor workspace_buffer, torch::stable::Tensor q, torch::stable::Tensor k,
+                            torch::stable::Tensor v, torch::stable::Tensor cumulative_seqlen_q,
+                            torch::stable::Tensor cumulative_seqlen_kv, torch::stable::Tensor o, torch::stable::Tensor lse,
+                            int64_t mask_mode_code, double sm_scale, int64_t max_seqlen_q,
+                            int64_t max_seqlen_kv, bool is_varlen) {
+  const torch::stable::accelerator::DeviceGuard device_guard(q.get_device_index());
+  STD_TORCH_CHECK(q.scalar_type() == k.scalar_type());
   auto scalar_type_in = q.scalar_type();
   auto scalar_type_out = o.scalar_type();
   int head_dim_qk = q.size(-1);
   int head_dim_vo = v.size(-1);
   MaskMode mask_mode = static_cast<MaskMode>(mask_mode_code);
 
-  if (scalar_type_in == at::ScalarType::BFloat16 &&
-      scalar_type_out == at::ScalarType::BFloat16) {
+  if (scalar_type_in == torch::headeronly::ScalarType::BFloat16 &&
+      scalar_type_out == torch::headeronly::ScalarType::BFloat16) {
     using Element = cutlass::bfloat16_t;
     using ElementOut = cutlass::bfloat16_t;
 

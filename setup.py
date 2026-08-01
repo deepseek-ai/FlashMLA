@@ -17,7 +17,13 @@ def is_flag_set(flag: str) -> bool:
     return os.getenv(flag, "FALSE").lower() in ["true", "1", "y", "yes"]
 
 def get_features_args():
-    features_args = []
+    # ABI-stable flags (always on): TORCH_TARGET_VERSION pins the minimum runtime
+    # PyTorch version and bans unstable ATen/c10/torch headers at compile time;
+    # USE_CUDA exposes aoti_torch_get_current_cuda_stream from the shim.
+    features_args = [
+        "-DTORCH_TARGET_VERSION=0x020a000000000000",  # PyTorch >= 2.10 at runtime
+        "-DUSE_CUDA",
+    ]
     if is_flag_set("FLASH_MLA_DISABLE_FP16"):
         features_args.append("-DFLASH_MLA_DISABLE_FP16")
     return features_args
@@ -130,6 +136,9 @@ ext_modules.append(
             Path(this_dir) / "csrc" / "cutlass" / "include",
             Path(this_dir) / "csrc" / "cutlass" / "tools" / "util" / "include",
         ],
+        # Build against CPython's Limited API (abi3) so one wheel works across
+        # multiple CPython versions, which is possible now that pybind11 is gone
+        py_limited_api=True,
     )
 )
 
@@ -148,4 +157,5 @@ setup(
     packages=find_packages(include=['flash_mla']),
     ext_modules=ext_modules,
     cmdclass={"build_ext": BuildExtension},
+    options={"bdist_wheel": {"py_limited_api": "cp310"}},
 )

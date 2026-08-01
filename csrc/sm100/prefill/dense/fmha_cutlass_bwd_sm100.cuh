@@ -49,8 +49,12 @@
 #include "collective/fmha_fusion.hpp"
 #include "device/fmha_device_bwd.hpp"
 
-#include <c10/cuda/CUDAGuard.h>
-#include <c10/cuda/CUDAStream.h>
+#include <torch/csrc/stable/accelerator.h>
+#include <torch/csrc/inductor/aoti_torch/c/shim.h>
+#include <torch/headeronly/util/Exception.h>
+#include <cuda_runtime.h>
+
+#include <kerutils/supplemental/cuda_stream.h>
 
 using namespace cute;
 using namespace cutlass::fmha::kernel;
@@ -93,13 +97,13 @@ struct BwdRunner {
   using StrideDV = TensorStride;                              // Seq DVO (H B)
   using StrideDO = TensorStride;
 
-  static void run(at::Tensor workspace_buffer, at::Tensor d_o, at::Tensor q, at::Tensor k,
-                  at::Tensor v, at::Tensor o, at::Tensor lse,
-                  at::Tensor cumulative_seqlen_q, at::Tensor cumulative_seqlen_kv,
-                  at::Tensor dq, at::Tensor dk, at::Tensor dv,
+  static void run(torch::stable::Tensor workspace_buffer, torch::stable::Tensor d_o, torch::stable::Tensor q, torch::stable::Tensor k,
+                  torch::stable::Tensor v, torch::stable::Tensor o, torch::stable::Tensor lse,
+                  torch::stable::Tensor cumulative_seqlen_q, torch::stable::Tensor cumulative_seqlen_kv,
+                  torch::stable::Tensor dq, torch::stable::Tensor dk, torch::stable::Tensor dv,
                   float softmax_scale, int max_seqlen_q, int max_seqlen_kv) {
-    const at::cuda::CUDAGuard device_guard{(char)q.get_device()};
-    const int device_id = q.get_device();
+    const torch::stable::accelerator::DeviceGuard device_guard(q.get_device_index());
+    const int device_id = q.get_device_index();
 
     cutlass::KernelHardwareInfo hw_info;
     hw_info.device_id =device_id;
@@ -142,15 +146,15 @@ struct BwdRunner {
     int dk_stride0 = dk.stride(0), dk_stride1 = dk.stride(1), dk_stride2 = dk.stride(2);
     int dv_stride0 = dv.stride(0), dv_stride1 = dv.stride(1), dv_stride2 = dv.stride(2);
     int do_stride0 = d_o.stride(0), do_stride1 = d_o.stride(1), do_stride2 = d_o.stride(2);
-    TORCH_CHECK(q_stride2 == 1);
-    TORCH_CHECK(k_stride2 == 1);
-    TORCH_CHECK(v_stride2 == 1);
-    TORCH_CHECK(o_stride2 == 1);
-    TORCH_CHECK(lse_stride0 == 1);
-    TORCH_CHECK(dq_stride2 == 1);
-    TORCH_CHECK(dk_stride2 == 1);
-    TORCH_CHECK(dv_stride2 == 1);
-    TORCH_CHECK(do_stride2 == 1);
+    STD_TORCH_CHECK(q_stride2 == 1);
+    STD_TORCH_CHECK(k_stride2 == 1);
+    STD_TORCH_CHECK(v_stride2 == 1);
+    STD_TORCH_CHECK(o_stride2 == 1);
+    STD_TORCH_CHECK(lse_stride0 == 1);
+    STD_TORCH_CHECK(dq_stride2 == 1);
+    STD_TORCH_CHECK(dk_stride2 == 1);
+    STD_TORCH_CHECK(dv_stride2 == 1);
+    STD_TORCH_CHECK(do_stride2 == 1);
 
     StrideQ stride_Q = make_stride(q_stride0, _1{}, make_stride(q_stride1, B == 1 ? 0 : q_stride0*Q));
     StrideK stride_K = make_stride(k_stride0, _1{}, make_stride(k_stride1, B == 1 ? 0 : k_stride0*K));
@@ -184,17 +188,17 @@ struct BwdRunner {
 
     CUTLASS_CHECK(op.can_implement(arguments));
     CUTLASS_CHECK(op.initialize(arguments, workspace_ptr));
-    CUTLASS_CHECK(op.run(at::cuda::getCurrentCUDAStream()));
+    CUTLASS_CHECK(op.run(kerutils::get_current_cuda_stream(q)));
   }
 
 };
 
 
 template <typename DType, bool kIsVarlen, bool kIsMla, typename TileShape, typename Mask>
-void run_fmha_bwd(at::Tensor workspace_buffer, at::Tensor d_o, at::Tensor q, at::Tensor k,
-                  at::Tensor v, at::Tensor o, at::Tensor lse,
-                  at::Tensor cumulative_seqlen_q, at::Tensor cumulative_seqlen_kv,
-                  at::Tensor dq, at::Tensor dk, at::Tensor dv,
+void run_fmha_bwd(torch::stable::Tensor workspace_buffer, torch::stable::Tensor d_o, torch::stable::Tensor q, torch::stable::Tensor k,
+                  torch::stable::Tensor v, torch::stable::Tensor o, torch::stable::Tensor lse,
+                  torch::stable::Tensor cumulative_seqlen_q, torch::stable::Tensor cumulative_seqlen_kv,
+                  torch::stable::Tensor dq, torch::stable::Tensor dk, torch::stable::Tensor dv,
                   float softmax_scale, int max_seqlen_q, int total_seqlen_kv) {
   BwdRunner<DType, kIsVarlen, kIsMla, TileShape, Mask>::run(workspace_buffer, d_o, q, k, v, o, lse,
                                                      cumulative_seqlen_q, cumulative_seqlen_kv,

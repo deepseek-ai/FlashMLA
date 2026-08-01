@@ -3,7 +3,9 @@ import dataclasses
 
 import torch
 
-import flash_mla.cuda as flash_mla_cuda
+# torch.ops.flash_mla is the op namespace registered by the _C extension (loaded in
+# __init__.py). Alias it to the old pybind module name so the call sites below are unchanged.
+flash_mla_cuda = torch.ops.flash_mla
 
 @dataclasses.dataclass
 class FlashMLASchedMeta:
