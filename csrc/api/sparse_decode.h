@@ -197,6 +197,14 @@ sparse_attn_decode_interface(
 ) {
     using bf16 = cutlass::bfloat16_t;
 
+    // Set the active CUDA device to match the input tensor BEFORE probing hardware
+    // properties via Arch() or dispatching to an SM-specific impl. Arch() reads the
+    // *current* device's properties, so without this guard the dispatcher can pick
+    // the wrong kernel (e.g. SM90 impl while q lives on an SM100 device) and
+    // num_sm_parts is computed from the wrong SM count. See issue #158.
+    TORCH_CHECK(q.is_cuda(), "q must be a CUDA tensor");
+    at::cuda::CUDAGuard device_guard{(char)q.get_device()};
+
     // Check the architecture
     Arch arch = Arch();
 
@@ -309,7 +317,6 @@ sparse_attn_decode_interface(
     KU_CHECK_SHAPE(extra_indices, b, s_q, extra_topk);
     KU_CHECK_SHAPE(extra_topk_length, b);
 
-    at::cuda::CUDAGuard device_guard{(char)q.get_device()};
     auto opts = q.options();
 
     at::Tensor out = torch::empty({b, s_q, h_q, d_v}, opts);

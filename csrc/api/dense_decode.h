@@ -22,6 +22,13 @@ dense_attn_decode_interface(
     std::optional<at::Tensor> &tile_scheduler_metadata,   // num_sm_parts x (DecodingSchedMetaSize/4)
     std::optional<at::Tensor> &num_splits                 // batch_size + 1
 ) {
+    // Set the active CUDA device to match the input tensor BEFORE probing hardware
+    // properties via Arch(). Arch() reads at::cuda::getCurrentDeviceProperties() and
+    // will return the wrong SM count / capability if the current device differs from
+    // the tensor's device (multi-GPU / heterogeneous setups). See issue #158.
+    TORCH_CHECK(q.is_cuda(), "q must be a CUDA tensor");
+    at::cuda::CUDAGuard device_guard{(char)q.get_device()};
+
     // Check arch
     Arch arch = Arch();
     if (!arch.is_sm90a()) {
@@ -83,8 +90,6 @@ dense_attn_decode_interface(
     KU_CHECK_SHAPE(block_table, batch_size, max_num_blocks_per_seq);
     KU_CHECK_SHAPE(tile_scheduler_metadata, num_sm_parts, DecodingSchedMetaSize/sizeof(int));
     KU_CHECK_SHAPE(num_splits, batch_size+1);
-
-    at::cuda::CUDAGuard device_guard{(char)q.get_device()};
 
     auto opts = q.options();
     at::Tensor out = torch::empty({batch_size, num_heads, q_seq_per_hk, head_size_v}, opts);

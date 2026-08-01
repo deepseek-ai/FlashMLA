@@ -108,7 +108,14 @@ static std::vector<at::Tensor> sparse_attn_prefill_interface(
     const std::optional<at::Tensor> &topk_length
 ) {
     using bf16 = cutlass::bfloat16_t;
-    
+
+    // Set the active CUDA device to match the input tensor BEFORE probing hardware
+    // properties via Arch(). Without this guard, arch.num_sms and the SM90a/SM100f
+    // dispatch reflect whatever device happens to be current, not q's device. See
+    // issue #158.
+    TORCH_CHECK(q.is_cuda(), "q must be a CUDA tensor");
+    at::cuda::CUDAGuard device_guard{(char)q.get_device()};
+
     Arch arch = Arch();
     bool is_sm90a = arch.is_sm90a();
     bool is_sm100f = arch.is_sm100f();
@@ -156,7 +163,6 @@ static std::vector<at::Tensor> sparse_attn_prefill_interface(
     KU_CHECK_LAST_DIM_CONTIGUOUS(topk_length);
     
     // Allocate results and buffers
-    at::cuda::CUDAGuard device_guard{(char)q.get_device()};
     auto opts = q.options();
     
     at::Tensor out = torch::empty({s_q, h_q, d_v}, opts);
