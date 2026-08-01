@@ -675,9 +675,9 @@ KernelTemplate<MODEL_TYPE>
                 auto process_one_block = [&](int block_idx, auto is_extra_block_t) {
                     static constexpr bool IS_EXTRA_BLOCK = std::is_same_v<decltype(is_extra_block_t), IsExtraBlock>;
                     int cur_block_size = IS_EXTRA_BLOCK ? params.extra_page_block_size : params.page_block_size;
-                    int64_t cur_k_block_stride = IS_EXTRA_BLOCK ? params.stride_extra_kv_block : params.stride_kv_block;
+                    [[maybe_unused]] int64_t cur_k_block_stride = IS_EXTRA_BLOCK ? params.stride_extra_kv_block : params.stride_kv_block;
                     [[maybe_unused]] int cur_k_row_stride = IS_EXTRA_BLOCK ? params.stride_extra_kv_row : params.stride_kv_row;
-                    uint8_t* cur_k_scales_ptr = IS_EXTRA_BLOCK ? extra_k_scales_ptr : k_scales_ptr;
+                    [[maybe_unused]] uint8_t* cur_k_scales_ptr = IS_EXTRA_BLOCK ? extra_k_scales_ptr : k_scales_ptr;
                     int cur_tma_coords_step_per_block = IS_EXTRA_BLOCK ? tma_coords_step_per_extra_block : tma_coords_step_per_block;
 
                     int abs_pos, my_indices[2];
@@ -691,25 +691,23 @@ KernelTemplate<MODEL_TYPE>
                     plan.bar_valid_coord_scale_free[rs.index_buf_idx].wait(rs.index_bar_phase^1);
 
                     int tma_coords[2];
-                    e8m0 scales[2*NUM_SCALES_EACH_TOKEN];
+                    [[maybe_unused]] e8m0 scales[2*NUM_SCALES_EACH_TOKEN];
                     char valid_mask = 0;
                     CUTE_UNROLL
                     for (int i = 0; i < 2; ++i) {
-                        int block_idx, idx_in_block;
-                        block_idx = (unsigned int)my_indices[i] / cur_block_size;
-                        idx_in_block = (unsigned int)my_indices[i] % cur_block_size;
-                        bool is_token_valid = my_indices[i] != -1 && (abs_pos+i < (IS_EXTRA_BLOCK?args.extra_topk_length:args.topk_length));
+                        int block_idx = 0, idx_in_block = 0;
+                        int max_token_idx = (IS_EXTRA_BLOCK ? params.extra_num_blocks : params.num_blocks) * cur_block_size;
+                        bool is_token_valid =
+                            my_indices[i] >= 0 &&
+                            my_indices[i] < max_token_idx &&
+                            (abs_pos+i < (IS_EXTRA_BLOCK?args.extra_topk_length:args.topk_length));
+                        if (is_token_valid) {
+                            block_idx = my_indices[i] / cur_block_size;
+                            idx_in_block = my_indices[i] % cur_block_size;
+                        }
                         valid_mask |= is_token_valid << i;
                         tma_coords[i] = is_token_valid ? block_idx*cur_tma_coords_step_per_block + idx_in_block*tma_coords_step_per_token : -1; // If the token is invalid because it topk position exceeds topk_length, we must manually fill tma_coords with -1 to avoid copying-in NaN.
-                        if constexpr (MODEL_TYPE == ModelType::V32) {
-                            int64_t offset = is_token_valid ? block_idx*cur_k_block_stride + idx_in_block*cur_k_row_stride : 0;
-                            float4 cur_scale_fp32 = __ldg((float4*)(cur_k_scales_ptr + offset));
-                            e8m0 res[4];
-                            *(__nv_fp8x2_storage_t*)(res+0) = __nv_cvt_float2_to_e8m0x2(float2{cur_scale_fp32.x, cur_scale_fp32.y}, __NV_NOSAT, cudaRoundZero);
-                            *(__nv_fp8x2_storage_t*)(res+2) = __nv_cvt_float2_to_e8m0x2(float2{cur_scale_fp32.z, cur_scale_fp32.w}, __NV_NOSAT, cudaRoundZero);
-                            if (!is_token_valid) *(uint32_t*)res = (uint32_t)0;
-                            *(uint32_t*)(scales+i*NUM_SCALES_EACH_TOKEN) = *(uint32_t*)(res);
-                        } else {
+                        if constexpr (MODEL_TYPE != ModelType::V32) {
                             int64_t offset = block_idx*cur_k_block_stride + idx_in_block*8; // Each token has 7 scale factors with an extra 1B padding
                             uint64_t scalesx8 = is_token_valid ? __ldg((uint64_t*)(cur_k_scales_ptr + offset)) : 0;
                             *(uint64_t*)(scales+i*NUM_SCALES_EACH_TOKEN) = scalesx8;
@@ -718,9 +716,7 @@ KernelTemplate<MODEL_TYPE>
                     valid_mask <<= lane_idx%4*2;
                     valid_mask |= __shfl_xor_sync(0xFFFFFFFF, valid_mask, 0x1);
                     valid_mask |= __shfl_xor_sync(0xFFFFFFFF, valid_mask, 0x2);
-                    if constexpr (MODEL_TYPE == ModelType::V32) {
-                        *(uint64_t*)(plan.scales[rs.index_buf_idx] + lane_idx*2) = *(uint64_t*)scales;
-                    } else {
+                    if constexpr (MODEL_TYPE != ModelType::V32) {
                         *(__int128_t*)(plan.scales[rs.index_buf_idx] + lane_idx*2) = *(__int128_t*)scales;
                     }
                     *(int2*)(plan.tma_coord[rs.index_buf_idx] + lane_idx*2) = *(int2*)tma_coords;
@@ -783,10 +779,29 @@ KernelTemplate<MODEL_TYPE>
                     for (int local_row_idx = 0; local_row_idx < ROWS_PER_GROUP; ++local_row_idx) {
                         int row_idx = local_row_idx*NUM_GROUPS + group_idx;
                         bf16 scales[4];
-                        e8m0 scales_e8m0[4];
-                        *(uint32_t*)scales_e8m0 = *(uint32_t*)plan.scales[rs.index_buf_idx][row_idx];
-                        *(__nv_bfloat162_raw*)(scales+0) = __nv_cvt_e8m0x2_to_bf162raw(*(unsigned short*)(scales_e8m0+0));
-                        *(__nv_bfloat162_raw*)(scales+2) = __nv_cvt_e8m0x2_to_bf162raw(*(unsigned short*)(scales_e8m0+2));
+                        int tma_coord = plan.tma_coord[rs.index_buf_idx][row_idx];
+                        float4 cur_scale_fp32 = float4{0.0f, 0.0f, 0.0f, 0.0f};
+                        if (idx_in_group == 0 && tma_coord >= 0) {
+                            uint8_t* cur_k_scales_ptr =
+                                block_idx >= args.num_orig_kv_blocks ?
+                                (uint8_t*)params.extra_kv + D_NOPE :
+                                (uint8_t*)params.kv + D_NOPE;
+                            cur_scale_fp32 = __ldg((float4*)(cur_k_scales_ptr + (int64_t)tma_coord*TMA_K_STRIDE));
+                        }
+                        uint32_t scale01 = 0, scale23 = 0;
+                        if (idx_in_group == 0) {
+                            scales[0] = (bf16)cur_scale_fp32.x;
+                            scales[1] = (bf16)cur_scale_fp32.y;
+                            scales[2] = (bf16)cur_scale_fp32.z;
+                            scales[3] = (bf16)cur_scale_fp32.w;
+                            scale01 = *(uint32_t*)(scales + 0);
+                            scale23 = *(uint32_t*)(scales + 2);
+                        }
+                        int group_leader_lane = lane_idx - idx_in_group;
+                        scale01 = __shfl_sync(0xFFFFFFFF, scale01, group_leader_lane);
+                        scale23 = __shfl_sync(0xFFFFFFFF, scale23, group_leader_lane);
+                        *(uint32_t*)(scales + 0) = scale01;
+                        *(uint32_t*)(scales + 2) = scale23;
 
                         uint64_t cur_data_fp8x8 = get_raw_fp8(local_row_idx, 0);
                         CUTE_UNROLL
