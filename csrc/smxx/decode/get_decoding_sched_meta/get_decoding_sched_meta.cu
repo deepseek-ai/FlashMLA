@@ -4,9 +4,28 @@
 #include <cutlass/fast_math.h>
 #include <kerutils/kerutils.cuh>
 
-#include "utils.h"
+#include "flashmla_utils.h"
 
 namespace smxx::decode {
+
+__device__ __forceinline__ int get_effective_seq_len(
+    const GetDecodeSchedMetaParams& params,
+    int req_idx,
+    int block_size_n) {
+    if (params.topk == -1) {
+        return params.seqlens_k_ptr[req_idx];
+    }
+
+    int cur_s_k = params.topk_length ? params.topk_length[req_idx] : params.topk;
+    if (cur_s_k == 0) {
+        cur_s_k = 1;
+    }
+    if (params.extra_topk != -1) {
+        cur_s_k = ((cur_s_k + block_size_n - 1) / block_size_n) * block_size_n;
+        cur_s_k += params.extra_topk_length ? params.extra_topk_length[req_idx] : params.extra_topk;
+    }
+    return cur_s_k;
+}
 
 __global__ void __launch_bounds__(32, 1, 1)
 get_mla_metadata_kernel(__grid_constant__ const GetDecodeSchedMetaParams params) {
@@ -106,10 +125,110 @@ get_mla_metadata_kernel(__grid_constant__ const GetDecodeSchedMetaParams params)
     }
 }
 
+// Fallback path when dynamic shared memory requirement exceeds HW limit.
+__global__ void __launch_bounds__(32, 1, 1)
+get_mla_metadata_kernel_low_smem(__grid_constant__ const GetDecodeSchedMetaParams params) {
+    if (threadIdx.x != 0) {
+        return;
+    }
+
+    int batch_size = params.b;
+    int block_size_n = params.block_size_n;
+    int fixed_overhead_num_blocks = params.fixed_overhead_num_blocks;
+    int num_sm_parts = params.num_sm_parts;
+
+    int total_num_blocks = 0;
+    for (int req_idx = 0; req_idx < batch_size; ++req_idx) {
+        int cur_s_k = get_effective_seq_len(params, req_idx, block_size_n);
+        int last_token_idx = max(cur_s_k - 1, 0);
+        int num_blocks = last_token_idx / block_size_n + 1;
+        total_num_blocks += num_blocks + fixed_overhead_num_blocks;
+    }
+
+    int payload = cutlass::ceil_div(total_num_blocks, num_sm_parts) + fixed_overhead_num_blocks;
+    int now_req_idx = 0;
+    int now_block = 0;
+    int now_n_split_idx = 0;
+    int cum_num_splits = 0;
+    params.num_splits_ptr[0] = 0;
+
+    for (int part = 0; part < num_sm_parts; ++part) {
+        DecodingSchedMeta cur_meta;
+        cur_meta.begin_req_idx = now_req_idx;
+        cur_meta.begin_block_idx = now_block;
+        cur_meta.begin_split_idx = now_n_split_idx;
+        cur_meta.is_first_req_splitted = (now_block != 0);
+
+        int remain_payload = payload;
+        while (now_req_idx < batch_size) {
+            int cur_s_k = get_effective_seq_len(params, now_req_idx, block_size_n);
+            int last_token_idx = max(cur_s_k - 1, 0);
+            int num_blocks = last_token_idx / block_size_n + 1;
+            int now_remain_blocks = num_blocks - now_block;
+
+            if (remain_payload >= now_remain_blocks + fixed_overhead_num_blocks) {
+                cum_num_splits += now_n_split_idx + 1;
+                params.num_splits_ptr[now_req_idx + 1] = cum_num_splits;
+                remain_payload -= now_remain_blocks + fixed_overhead_num_blocks;
+                ++now_req_idx;
+                now_block = 0;
+                now_n_split_idx = 0;
+            } else {
+                if (remain_payload - fixed_overhead_num_blocks > 0) {
+                    now_block += remain_payload - fixed_overhead_num_blocks;
+                    ++now_n_split_idx;
+                    remain_payload = 0;
+                }
+                break;
+            }
+        }
+
+        cur_meta.end_req_idx = now_block > 0 ? now_req_idx : now_req_idx - 1;
+        cur_meta.end_block_idx = now_block;
+        if (now_block > 0) {
+            int cur_s_k = get_effective_seq_len(params, cur_meta.end_req_idx, block_size_n);
+            int cur_last_block_idx = max(cur_s_k - 1, 0) / block_size_n;
+            cur_meta.is_last_req_splitted = cur_meta.end_block_idx != cur_last_block_idx + 1 && cur_s_k != 0;
+        } else {
+            int prev_s_k = get_effective_seq_len(params, cur_meta.end_req_idx, block_size_n);
+            int prev_last_block_idx = max(prev_s_k - 1, 0) / block_size_n;
+            cur_meta.end_block_idx = prev_s_k == 0 ? 0 : prev_last_block_idx + 1;
+            cur_meta.is_last_req_splitted = false;
+        }
+        if (cur_meta.begin_req_idx == cur_meta.end_req_idx) {
+            cur_meta.is_first_req_splitted = cur_meta.is_last_req_splitted =
+                cur_meta.is_first_req_splitted || cur_meta.is_last_req_splitted;
+        }
+        params.tile_scheduler_metadata_ptr[part] = cur_meta;
+    }
+
+    FLASH_DEVICE_ASSERT(now_req_idx == batch_size && now_block == 0 && now_n_split_idx == 0);
+}
+
 void run_get_decoding_sched_meta_kernel(GetDecodeSchedMetaParams &params) {
     int smem_size = sizeof(int) * (params.b*5+1);
-    CHECK_CUDA(cudaFuncSetAttribute(get_mla_metadata_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
-    get_mla_metadata_kernel<<<1, 32, smem_size, params.stream>>>(params);
+    int max_smem = 0;
+    int dev = 0;
+    CHECK_CUDA(cudaGetDevice(&dev));
+    CHECK_CUDA(cudaDeviceGetAttribute(
+        &max_smem, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev));
+
+    if (smem_size <= max_smem) {
+        CHECK_CUDA(cudaFuncSetAttribute(
+            get_mla_metadata_kernel,
+            cudaFuncAttributeMaxDynamicSharedMemorySize,
+            smem_size));
+        get_mla_metadata_kernel<<<1, 32, smem_size, params.stream>>>(params);
+    } else {
+        printf("[WARNING] batch_size=%d requires %dB shared memory (max=%dB), using low-smem fallback kernel.\n",
+               params.b, smem_size, max_smem);
+        fflush(stdout);
+        CHECK_CUDA(cudaFuncSetAttribute(
+            get_mla_metadata_kernel_low_smem,
+            cudaFuncAttributeMaxDynamicSharedMemorySize,
+            0));
+        get_mla_metadata_kernel_low_smem<<<1, 32, 0, params.stream>>>(params);
+    }
     CHECK_CUDA_KERNEL_LAUNCH();
 }
 

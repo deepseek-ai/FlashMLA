@@ -1,6 +1,6 @@
 #include <cutlass/cutlass.h>
 
-#include "utils.h"
+#include "flashmla_utils.h"
 
 #include "params.h"
 #include "config.h"

@@ -15,7 +15,11 @@ namespace sm90::fwd {
 
 using namespace cute;
 
-template<int D_QK, bool HAVE_TOPK_LENGTH>
+template<
+    int D_QK,
+    bool HAVE_TOPK_LENGTH,
+    bool ENABLE_ODD_TAIL_SKIP
+>
 class KernelTemplate {
 public:
 

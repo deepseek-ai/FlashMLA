@@ -2,7 +2,7 @@
 
 #include "config.h"
 
-#include "utils.h"
+#include "flashmla_utils.h"
 #include "../../helpers.h"
 
 namespace sm90::fwd {
@@ -39,9 +39,9 @@ void tma_bulk_reduce_add(void const* src_ptr, void* dst_ptr, int32_t store_bytes
                      : "memory");
 }
 
-template<int D_QK, bool HAVE_TOPK_LENGTH>
+template<int D_QK, bool HAVE_TOPK_LENGTH, bool ENABLE_ODD_TAIL_SKIP>
 template<typename TMAParams>
-__device__ void KernelTemplate<D_QK, HAVE_TOPK_LENGTH>::devfunc(const SparseAttnFwdParams &params, const TMAParams &tma_params) {
+__device__ void KernelTemplate<D_QK, HAVE_TOPK_LENGTH, ENABLE_ODD_TAIL_SKIP>::devfunc(const SparseAttnFwdParams &params, const TMAParams &tma_params) {
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 900)) || (defined(__CLION_IDE__) || defined(__VSCODE_IDE__))
     const int q_h_idx = blockIdx.x % (params.h_q/B_H);
     const int s_q_idx = blockIdx.x / (params.h_q/B_H);
@@ -305,6 +305,10 @@ __device__ void KernelTemplate<D_QK, HAVE_TOPK_LENGTH>::devfunc(const SparseAttn
             
             CUTE_NO_UNROLL
             for (int block_idx = 0; block_idx < num_topk_blocks; block_idx += 2) {
+                bool has_peer_block = true;
+                if constexpr (ENABLE_ODD_TAIL_SKIP) {
+                    has_peer_block = block_idx + 1 < num_topk_blocks;
+                }
                 Tensor sV0l = make_tensor(make_smem_ptr(plan.k[0].data()), SmemLayoutKTilesTransposed<4>{});
                 Tensor sV1l = make_tensor(make_smem_ptr(plan.k[1].data()), SmemLayoutKTilesTransposed<4>{});
 
@@ -329,6 +333,14 @@ __device__ void KernelTemplate<D_QK, HAVE_TOPK_LENGTH>::devfunc(const SparseAttn
                 // Mark V0L as free
                 warpgroup_wait<0>();
                 plan.bar_k0_free[0].arrive();
+
+                if (!has_peer_block) {
+                    save_rS_to_sS(rS, sS0, idx_in_warpgroup);
+                    fence_view_async_shared();
+                    NamedBarrier::arrive(256, NamedBarriers::wg0_s0_ready);
+                    cur_bar_wait_phase ^= 1;
+                    continue;
+                }
 
                 // Wait for new sM, scale rS, save, inform WG1
                 NamedBarrier::arrive_and_wait(256, NamedBarriers::wg1_bunch_0_ready);
@@ -396,8 +408,42 @@ __device__ void KernelTemplate<D_QK, HAVE_TOPK_LENGTH>::devfunc(const SparseAttn
             
             CUTE_NO_UNROLL
             for (int block_idx = 0; block_idx < num_topk_blocks; block_idx += 2) {
+                bool has_peer_block = true;
+                if constexpr (ENABLE_ODD_TAIL_SKIP) {
+                    has_peer_block = block_idx + 1 < num_topk_blocks;
+                }
                 Tensor sV0r = make_tensor(make_smem_ptr(plan.k[0].data()+64*256), SmemLayoutKTilesTransposed<4>{});
                 Tensor sV1r = make_tensor(make_smem_ptr(plan.k[1].data()+64*256), SmemLayoutKTilesTransposed<4>{});
+
+                if (!has_peer_block) {
+                    NamedBarrier::arrive_and_wait(256, NamedBarriers::wg0_bunch_0_ready);
+                    float new_rM[2], scale_factors[2];
+                    *(float2*)new_rM = plan.sM[idx_in_warpgroup/4];
+                    CUTE_UNROLL
+                    for (int row = 0; row < 2; ++row) {
+                        scale_factors[row] = exp2f(rM[row] - new_rM[row]);
+                        rM[row] = new_rM[row];
+                        rL[row] *= scale_factors[row];
+                    }
+                    CUTE_UNROLL
+                    for (int row = 0; row < 2; ++row) {
+                        CUTE_UNROLL
+                        for (int i = row*2; i < size(rO); i += 4) {
+                            rO(i) *= scale_factors[row];
+                            rO(i+1) *= scale_factors[row];
+                        }
+                    }
+
+                    NamedBarrier::arrive_and_wait(256, NamedBarriers::wg0_s0_ready);
+                    gemm_ss(false, TiledMMA_PV_RemoteP{}, sS0, sV0r, rO, idx_in_warpgroup);
+                    warpgroup_commit_batch();
+
+                    warpgroup_wait<0>();
+                    plan.bar_k0_free[1].arrive();
+
+                    cur_bar_wait_phase ^= 1;
+                    continue;
+                }
 
                 // Issue rP1 = sQ @ sK1, and wait
                 pipelined_wait_and_qkt_gemm();
@@ -475,23 +521,38 @@ __device__ void KernelTemplate<D_QK, HAVE_TOPK_LENGTH>::devfunc(const SparseAttn
         int64_t token_indices[2][NUM_ROWS_PER_GROUP];
         bool is_token_valid[2][NUM_ROWS_PER_GROUP];
         auto load_token_indices = [&](int block_idx) {
+            [[maybe_unused]] int src_lane = (idx_in_warpgroup & 31) & ~(GROUP_SIZE - 1);
             CUTE_UNROLL
             for (int buf_idx = 0; buf_idx < 2; ++buf_idx) {
                 CUTE_UNROLL
                 for (int local_row = 0; local_row < NUM_ROWS_PER_GROUP; ++local_row) {
                     int offs = (block_idx+buf_idx)*B_TOPK + local_row*NUM_GROUPS + group_idx;
-                    int t = __ldg(gIndices + offs);
-                    token_indices[buf_idx][local_row] = t*(int64_t)params.stride_kv_s_kv;   // We mult it with params.stride_kv_s_kv here since it's faster
+                    int t;
+                    if constexpr (ENABLE_ODD_TAIL_SKIP) {
+                        t = -1;
+                        if (idx_in_group == 0) {
+                            t = __ldg(gIndices + offs);
+                        }
+                        t = __shfl_sync(0xffffffff, t, src_lane);
+                    } else {
+                        t = __ldg(gIndices + offs);
+                    }
                     bool is_cur_token_valid = t >= 0 && t < params.s_kv;
                     if constexpr (HAVE_TOPK_LENGTH) {
                         is_cur_token_valid &= offs < topk_length;
                     }
+                    token_indices[buf_idx][local_row] = t*(int64_t)params.stride_kv_s_kv;   // We mult it with params.stride_kv_s_kv here since it's faster
                     is_token_valid[buf_idx][local_row] = is_cur_token_valid;
                 }
             }
         };
         
-        int64_t cache_policy = createpolicy_evict_last();
+        int64_t cache_policy;
+        if constexpr (ENABLE_ODD_TAIL_SKIP) {
+            cache_policy = createpolicy_evict_first();
+        } else {
+            cache_policy = createpolicy_evict_last();
+        }
         auto copy_tiles = [&](int block_idx, int buf_idx, int tile_start, int tile_end) {
             // Copy some K/V tiles from global memory to shared memory
             // A tile has a shape of 64 (B_TOPK) x 64
@@ -520,42 +581,55 @@ __device__ void KernelTemplate<D_QK, HAVE_TOPK_LENGTH>::devfunc(const SparseAttn
 
         CUTE_NO_UNROLL
         for (int block_idx = 0; block_idx < num_topk_blocks; block_idx += 2) {
-            load_token_indices(block_idx);
+                bool has_peer_block = true;
+                if constexpr (ENABLE_ODD_TAIL_SKIP) {
+                    has_peer_block = block_idx + 1 < num_topk_blocks;
+                }
+                load_token_indices(block_idx);
 
-            // V0L
-            plan.bar_k0_free[0].wait(cur_bar_wait_phase);
-            copy_tiles(block_idx+0, 0, 0, 4);
-            commit_to_mbar(plan.bar_k0_ready[0]);
+                // V0L
+                plan.bar_k0_free[0].wait(cur_bar_wait_phase);
+                copy_tiles(block_idx+0, 0, 0, 4);
+                commit_to_mbar(plan.bar_k0_ready[0]);
 
-            // V1R
-            plan.bar_k1_free[1].wait(cur_bar_wait_phase);
-            copy_tiles(block_idx+1, 1, 4, D_K/64);
-            commit_to_mbar(plan.bar_k1_ready[1]);
-            
-            // V0R
-            plan.bar_k0_free[1].wait(cur_bar_wait_phase);
-            copy_tiles(block_idx+0, 0, 4, D_K/64);
-            commit_to_mbar(plan.bar_k0_ready[1]);
+                if (has_peer_block) {
+                    // V1R
+                    plan.bar_k1_free[1].wait(cur_bar_wait_phase);
+                    copy_tiles(block_idx+1, 1, 4, D_K/64);
+                    commit_to_mbar(plan.bar_k1_ready[1]);
+                }
 
-            // V1L
-            plan.bar_k1_free[0].wait(cur_bar_wait_phase);
-            copy_tiles(block_idx+1, 1, 0, 4);
-            commit_to_mbar(plan.bar_k1_ready[0]);
+                // V0R
+                plan.bar_k0_free[1].wait(cur_bar_wait_phase);
+                copy_tiles(block_idx+0, 0, 4, D_K/64);
+                commit_to_mbar(plan.bar_k0_ready[1]);
 
-            // Valid mask
-            // NOTE: V1R's finish implies maskings of the last round have finished
-            if (idx_in_group == 0) {
-                CUTE_UNROLL
-                for (int buf_idx = 0; buf_idx < 2; ++buf_idx)
+                if (has_peer_block) {
+                    // V1L
+                    plan.bar_k1_free[0].wait(cur_bar_wait_phase);
+                    copy_tiles(block_idx+1, 1, 0, 4);
+                    commit_to_mbar(plan.bar_k1_ready[0]);
+                }
+
+                // Valid mask
+                // NOTE: V1R's finish implies maskings of the last round have finished
+                if (idx_in_group == 0) {
                     CUTE_UNROLL
-                    for (int local_row = 0; local_row < NUM_ROWS_PER_GROUP; ++local_row)
-                        plan.is_kv_valid[buf_idx][local_row*NUM_GROUPS+group_idx] = is_token_valid[buf_idx][local_row];
-                plan.bar_is_kv_valid_ready.arrive();
-            }
+                    for (int local_row = 0; local_row < NUM_ROWS_PER_GROUP; ++local_row) {
+                        plan.is_kv_valid[0][local_row*NUM_GROUPS+group_idx] = is_token_valid[0][local_row];
+                    }
+                    if (has_peer_block) {
+                        CUTE_UNROLL
+                        for (int local_row = 0; local_row < NUM_ROWS_PER_GROUP; ++local_row) {
+                            plan.is_kv_valid[1][local_row*NUM_GROUPS+group_idx] = is_token_valid[1][local_row];
+                        }
+                    }
+                    plan.bar_is_kv_valid_ready.arrive();
+                }
 
-            cur_bar_wait_phase ^= 1;
+                cur_bar_wait_phase ^= 1;
+            }
         }
-    }
 
 
 #else
@@ -571,8 +645,8 @@ sparse_attn_fwd_kernel(__grid_constant__ const SparseAttnFwdParams params, __gri
     Kernel::devfunc(params, tma_params);
 }
 
-template<int D_QK, bool HAVE_TOPK_LENGTH>
-void KernelTemplate<D_QK, HAVE_TOPK_LENGTH>::run(const SparseAttnFwdParams &params) {
+template<int D_QK, bool HAVE_TOPK_LENGTH, bool ENABLE_ODD_TAIL_SKIP>
+void KernelTemplate<D_QK, HAVE_TOPK_LENGTH, ENABLE_ODD_TAIL_SKIP>::run(const SparseAttnFwdParams &params) {
     KU_ASSERT(params.h_kv == 1);
     KU_ASSERT(params.topk % (2*B_TOPK) == 0);   // To save some boundry checkings
     KU_ASSERT(params.topk > 0);
@@ -620,7 +694,7 @@ void KernelTemplate<D_QK, HAVE_TOPK_LENGTH>::run(const SparseAttnFwdParams &para
         shape_Q, tma_Q,
         tensor_map_O
     };
-    auto kernel = &sparse_attn_fwd_kernel<KernelTemplate<D_QK, HAVE_TOPK_LENGTH>, decltype(tma_params)>;
+    auto kernel = &sparse_attn_fwd_kernel<KernelTemplate<D_QK, HAVE_TOPK_LENGTH, ENABLE_ODD_TAIL_SKIP>, decltype(tma_params)>;
 
     constexpr size_t smem_size = sizeof(SharedMemoryPlan);
     KU_CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
@@ -640,7 +714,14 @@ void KernelTemplate<D_QK, HAVE_TOPK_LENGTH>::run(const SparseAttnFwdParams &para
 
 template<int D_QK, bool HAVE_TOPK_LENGTH>
 void run_fwd_phase1_kernel(const SparseAttnFwdParams& params) {
-    KernelTemplate<D_QK, HAVE_TOPK_LENGTH>::run(params);
+    // In the merged DSV4 layout, topk == 128 is the pure SWA case.
+    // Keep SWA on the original path. C128/C4 use the odd-tail-capable path;
+    // within that path, the peer block is still checked per query.
+    if (params.topk == 128) {
+        KernelTemplate<D_QK, HAVE_TOPK_LENGTH, false>::run(params);
+    } else {
+        KernelTemplate<D_QK, HAVE_TOPK_LENGTH, true>::run(params);
+    }
 }
 
 }

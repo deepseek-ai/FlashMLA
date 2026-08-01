@@ -8,7 +8,7 @@
 #include <cutlass/arch/arch.h>
 
 #include "params.h"
-#include "utils.h"
+#include "flashmla_utils.h"
 #include "sm100/prefill/sparse/common_subroutine.h"
 #include "sm100/helpers.h"
 

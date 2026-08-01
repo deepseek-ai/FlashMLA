@@ -1,6 +1,6 @@
 #pragma once
 
-#include <torch/extension.h>
+#include <torch/all.h>
 #include "cutlass/numeric_types.h"
 #include "helper.h"
 

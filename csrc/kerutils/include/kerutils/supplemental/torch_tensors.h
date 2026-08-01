@@ -2,7 +2,7 @@
 
 #include <functional>
 
-#include <torch/python.h>
+#include <torch/all.h>
 
 #include "kerutils/common/common.h"
 

@@ -10,7 +10,7 @@
 #include <kerutils/kerutils.cuh>
 
 #include "params.h"
-#include "utils.h"
+#include "flashmla_utils.h"
 #include "sm100/helpers.h"
 #include "sm100/prefill/sparse/common_subroutine.h"
 #include "config.h"

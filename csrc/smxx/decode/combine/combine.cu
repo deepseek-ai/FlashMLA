@@ -9,7 +9,7 @@
 #include <kerutils/kerutils.cuh>
 
 #include "params.h"
-#include "utils.h"
+#include "flashmla_utils.h"
 
 using namespace cute;
 

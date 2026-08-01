@@ -1,5 +1,26 @@
 # FlashMLA
 
+## SGLang Maintenance Rules
+
+- `main` tracks upstream updates and should stay clean.
+- `rebase` is the active SGL integration branch and can be force-updated during rebases.
+- `sgl` is the promoted stable branch for SGLang consumption.
+- Always pin SGLang to an immutable commit SHA (or release tag), not a branch name.
+- Only `upstream-*` tags are required for this workflow.
+
+### Rebase Workflow (Every Cycle)
+
+1. Update upstream on `main`.
+2. Tag `main` snapshot as `upstream-<MMDD>` (example: `upstream-0217`).
+3. Rebase and fix SGL compatibility on `rebase` (this branch may be force-pushed).
+4. Run validation on `rebase` and finalize the stable commit SHA.
+5. Promote `sgl` to the validated `rebase` commit (prefer fast-forward).
+6. In SGLang, pin `GIT_TAG` to the promoted immutable SHA/tag.
+
+### Required Tags
+
+- `upstream-*`: records the upstream baseline on `main` before SGL rebase work.
+
 ## Introduction
 
 FlashMLA is DeepSeek's library of optimized attention kernels, powering the [DeepSeek-V3](https://github.com/deepseek-ai/DeepSeek-V3) and [DeepSeek-V3.2-Exp](https://github.com/deepseek-ai/DeepSeek-V3.2-Exp) models. This repository contains the following implementations:

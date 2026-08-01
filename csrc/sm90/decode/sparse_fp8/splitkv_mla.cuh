@@ -11,7 +11,7 @@
 
 #include <kerutils/kerutils.cuh>
 
-#include "utils.h"
+#include "flashmla_utils.h"
 #include "components/dequant.h"
 #include "components/helpers.h"
 #include "config.h"

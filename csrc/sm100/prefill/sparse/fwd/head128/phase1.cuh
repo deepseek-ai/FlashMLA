@@ -9,7 +9,7 @@
 #include <cutlass/cuda_host_adapter.hpp>
 
 #include "params.h"
-#include "utils.h"
+#include "flashmla_utils.h"
 #include "sm100/helpers.h"
 
 #include "config.h"

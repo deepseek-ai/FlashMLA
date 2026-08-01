@@ -3,6 +3,7 @@
 #include "kernel.h"
 
 #include <cuda_fp8.h>
+#include <type_traits>
 #include <cutlass/barrier.h>
 #include <cute/tensor.hpp>
 
@@ -38,6 +39,7 @@ static constexpr int D_ROPE = 64;
 static constexpr int QUANT_TILE_SIZE = MODEL_TYPE == ModelType::V32 ? 128 : 64;
 static constexpr bool V_HAVE_ROPE = MODEL_TYPE == ModelType::V32 ? false : true;
 static constexpr int NUM_SCALES_EACH_TOKEN = MODEL_TYPE == ModelType::V32 ? 4 : 8;    // Padding is included
+using scale_t = std::conditional_t<MODEL_TYPE == ModelType::V32, bf16, e8m0>;
 static constexpr int TMA_K_STRIDE = MODEL_TYPE == ModelType::V32 ? D_NOPE+2*D_ROPE+4*(D_NOPE/QUANT_TILE_SIZE) : D_NOPE+2*D_ROPE;   // Stride of K's tensormap. This stride must 1) be a factor of the actual stride between tokens 2) large enough to cover the entire KV cache. Since TMA copy's coordinate can only be 32bit signed integers, this number must >= 128, perferrably >= 256. So we set this to 656 for V32 and 576 for MODEL1. Extra padding may be necessary for KV blocks.
 static_assert(D_NOPE + D_ROPE == D_Q);
 static_assert(V_HAVE_ROPE ? (D_NOPE + D_ROPE == D_V) : (D_NOPE == D_V));
@@ -45,7 +47,7 @@ static_assert(V_HAVE_ROPE ? (D_NOPE + D_ROPE == D_V) : (D_NOPE == D_V));
 static constexpr int B_H = 64;
 static constexpr int B_TOPK = 64;
 static constexpr int NUM_BUFS = 2;
-static constexpr int NUM_INDEX_BUFS = 4;    // Number of buffers for indices (tma_coords) & is_token_valid & scales
+static constexpr int NUM_INDEX_BUFS = MODEL_TYPE == ModelType::V32 ? 2 : 4;    // Number of buffers for indices (tma_coords) & is_token_valid & scales
 static constexpr int NUM_THREADS = 128*3;  // 128 exp + 1/32 utcmma + 1/32 raw KV producer + 1/32 rope producer + 32 index+scale+valid_mask producer + 128 dequant
 static constexpr float MAX_INIT_VAL = -1e30f;  // To avoid (-inf) - (-inf) = NaN
 
@@ -182,7 +184,7 @@ struct SharedMemoryPlan {
     CUTE_ALIGNAS(16) float rowwise_max_buf[128];
     char is_token_valid[NUM_INDEX_BUFS][B_TOPK/8];
     int tma_coord[NUM_INDEX_BUFS][B_TOPK];
-    e8m0 scales[NUM_INDEX_BUFS][B_TOPK][NUM_SCALES_EACH_TOKEN];
+    scale_t scales[NUM_INDEX_BUFS][B_TOPK][NUM_SCALES_EACH_TOKEN];
     array_aligned<uint32_t, 1> tmem_start_addr;
     transac_bar_t bar_last_store_done;
     transac_bar_t bar_q_tma, bar_q_utccp;
