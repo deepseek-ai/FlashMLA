@@ -1,0 +1,97 @@
+--- a/deep_gemm/include/deep_gemm/impls/sm100_fp8_fp4_gemm_1d1d.cuh
++++ b/deep_gemm/include/deep_gemm/impls/sm100_fp8_fp4_gemm_1d1d.cuh
+@@ -29,15 +29,16 @@
+           bool kSwapAB, bool kEnsureZeroPadding,
+           GemmType kGemmType, bool kWithAccumulation,
+           typename a_dtype_t, typename b_dtype_t, typename cd_dtype_t,
+-          typename epilogue_type_t>
+-CUTLASS_GLOBAL void __launch_bounds__(kNumNonEpilogueThreads + kNumEpilogueThreads, 1)
+-sm100_fp8_fp4_gemm_1d1d_impl(int* grouped_layout,
++          typename epilogue_type_t, bool kWaitTMAStoresAtEnd = false>
++CUTLASS_DEVICE void
++sm100_fp8_fp4_gemm_1d1d_body(int* grouped_layout,
+                              uint32_t shape_m, uint32_t shape_n, uint32_t shape_k,
+-                             const __grid_constant__ cute::TmaDescriptor tensor_map_a,
+-                             const __grid_constant__ cute::TmaDescriptor tensor_map_b,
+-                             const __grid_constant__ cute::TmaDescriptor tensor_map_sfa,
+-                             const __grid_constant__ cute::TmaDescriptor tensor_map_sfb,
+-                             const __grid_constant__ cute::TmaDescriptor tensor_map_cd) {
++                             const cute::TmaDescriptor& tensor_map_a,
++                             const cute::TmaDescriptor& tensor_map_b,
++                             const cute::TmaDescriptor& tensor_map_sfa,
++                             const cute::TmaDescriptor& tensor_map_sfb,
++                             const cute::TmaDescriptor& tensor_map_cd,
++                             uint32_t logical_cta_idx) {
+ #if (defined(__CUDA_ARCH__) and (__CUDA_ARCH__ >= 1000)) or defined(__CLION_IDE__)
+     using Barrier = cutlass::arch::ClusterTransactionBarrier;
+     using Allocator = cute::conditional_t<kNumMulticast == 1, cute::TMEM::Allocator1Sm, cute::TMEM::Allocator2Sm>;
+@@ -190,7 +191,7 @@
+     // Block scheduler
+     uint32_t m_block_idx, n_block_idx;
+     auto scheduler = sched::Scheduler<kGemmType, BLOCK_M, BLOCK_N, kNumGroups, kNumMulticast, kIsMulticastOnA, kNumSMs, kEnsureZeroPadding, kKAlignment, kGranKA * 4>(
+-        shape_m, shape_n, shape_k, grouped_layout);
++        shape_m, shape_n, shape_k, grouped_layout, logical_cta_idx);
+
+     // Pipeline and TMA phases
+     uint32_t stage_idx = 0, phase = 0;
+@@ -518,6 +519,11 @@
+                  tensor_map_cd);
+             }
+         }
++        if constexpr (kWaitTMAStoresAtEnd) {
++            if (epilogue_warp_idx == 0 and cute::elect_one_sync())
++                cute::tma_store_wait<0>();
++            __syncwarp();
++        }
+     }
+
+     // TODO: Remove redundant synchronization
+@@ -528,11 +534,47 @@
+         Allocator().free(0, kNumTmemCols);
+
+ #else
+-    if (blockIdx.x == 0 and threadIdx.x == 0)
++    if (logical_cta_idx == 0 and threadIdx.x == 0)
+         DG_DEVICE_ASSERT(false and "This kernel only support sm_100f");
+ #endif
+ }
+
++template <cute::UMMA::Major kMajorA, cute::UMMA::Major kMajorB,
++          uint32_t kGranKA, uint32_t kGranKB, uint32_t kKAlignment,
++          uint32_t SHAPE_M, uint32_t SHAPE_N, uint32_t SHAPE_K,
++          uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K,
++          uint32_t kNumGroups,
++          uint32_t kSwizzleAMode, uint32_t kSwizzleBMode,
++          uint32_t kSwizzleCDMode, uint32_t kNumStages,
++          uint32_t kNumNonEpilogueThreads, uint32_t kNumEpilogueThreads,
++          uint32_t kNumMulticast, bool kIsMulticastOnA,
++          uint32_t kNumSMs, bool kSwapAB, bool kEnsureZeroPadding,
++          GemmType kGemmType, bool kWithAccumulation,
++          typename a_dtype_t, typename b_dtype_t, typename cd_dtype_t,
++          typename epilogue_type_t>
++CUTLASS_GLOBAL void __launch_bounds__(
++        kNumNonEpilogueThreads + kNumEpilogueThreads, 1)
++sm100_fp8_fp4_gemm_1d1d_impl(
++        int* grouped_layout,
++        uint32_t shape_m, uint32_t shape_n, uint32_t shape_k,
++        const __grid_constant__ cute::TmaDescriptor tensor_map_a,
++        const __grid_constant__ cute::TmaDescriptor tensor_map_b,
++        const __grid_constant__ cute::TmaDescriptor tensor_map_sfa,
++        const __grid_constant__ cute::TmaDescriptor tensor_map_sfb,
++        const __grid_constant__ cute::TmaDescriptor tensor_map_cd) {
++    sm100_fp8_fp4_gemm_1d1d_body<
++        kMajorA, kMajorB, kGranKA, kGranKB, kKAlignment,
++        SHAPE_M, SHAPE_N, SHAPE_K, BLOCK_M, BLOCK_N, BLOCK_K,
++        kNumGroups, kSwizzleAMode, kSwizzleBMode, kSwizzleCDMode,
++        kNumStages, kNumNonEpilogueThreads, kNumEpilogueThreads,
++        kNumMulticast, kIsMulticastOnA, kNumSMs, kSwapAB,
++        kEnsureZeroPadding, kGemmType, kWithAccumulation,
++        a_dtype_t, b_dtype_t, cd_dtype_t, epilogue_type_t, false>(
++            grouped_layout, shape_m, shape_n, shape_k,
++            tensor_map_a, tensor_map_b, tensor_map_sfa, tensor_map_sfb,
++            tensor_map_cd, static_cast<uint32_t>(blockIdx.x));
++}
++
+ };  // namespace deep_gemm
+
+ #pragma clang diagnostic pop

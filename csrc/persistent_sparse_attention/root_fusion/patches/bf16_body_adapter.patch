@@ -1,0 +1,217 @@
+--- a/deep_gemm/include/deep_gemm/impls/sm100_bf16_gemm.cuh
++++ b/deep_gemm/include/deep_gemm/impls/sm100_bf16_gemm.cuh
+@@ -3,6 +3,7 @@
+ #pragma clang diagnostic ignored "-Wunknown-attributes"
+
+ #include <cutlass/arch/barrier.h>
++#include <cutlass/arch/reg_reconfig.h>
+
+ #include <deep_gemm/comm/barrier.cuh>
+ #include <deep_gemm/scheduler/gemm.cuh>
+@@ -11,6 +12,7 @@
+ #include <deep_gemm/common/utils.cuh>
+ #include <deep_gemm/epilogue/sm100_store_cd.cuh>
+ #include <deep_gemm/epilogue/sm100_store_cd_swap_ab.cuh>
++#include <deep_gemm/epilogue/sm100_csa_prefill_c0_c4.cuh>
+ #include <deep_gemm/epilogue/transform.cuh>
+ #include <deep_gemm/mma/sm100.cuh>
+ #include <deep_gemm/ptx/tcgen05.cuh>
+@@ -30,13 +32,19 @@
+           uint32_t kKAlignment,
+           bool kSwapAB, bool kEnsureZeroPadding,
+           GemmType kGemmType, bool kWithAccumulation, typename cd_dtype_t,
+-          uint64_t kTensorCoreUtilControl>
+-CUTLASS_GLOBAL void __launch_bounds__(kNumNonEpilogueThreads + kNumEpilogueThreads, 1)
+-sm100_bf16_gemm_impl(int* grouped_layout,
++          uint64_t kTensorCoreUtilControl,
++          bool kCSAFusedC0C4 = false,
++          bool kCSAInlineStreamingC4 = kCSAFusedC0C4,
++          bool kCSAStoreDenseC0 = true>
++CUTLASS_DEVICE void
++sm100_bf16_gemm_body(int* grouped_layout,
+                      uint32_t shape_m, uint32_t shape_n, uint32_t shape_k,
+-                     const __grid_constant__ cute::TmaDescriptor tensor_map_a,
+-                     const __grid_constant__ cute::TmaDescriptor tensor_map_b,
+-                     const __grid_constant__ cute::TmaDescriptor tensor_map_cd) {
++                     const cute::TmaDescriptor& tensor_map_a,
++                     const cute::TmaDescriptor& tensor_map_b,
++                     const cute::TmaDescriptor& tensor_map_cd,
++                     uint32_t cta_idx,
++                     const epilogue::CSAPrefillC0C4Params* csa_params =
++                         nullptr) {
+ #if (defined(__CUDA_ARCH__) and (__CUDA_ARCH__ >= 1000)) or defined(__CLION_IDE__)
+     // Enlarge `BLOCK_K` for some cases
+     // NOTES: this is for reducing the `umma_arrive()` overhead
+@@ -54,6 +62,24 @@
+
+     // C/D type: BF16 and FP32 are supported, with or without accumulation
+     DG_STATIC_ASSERT(cute::is_same_v<cd_dtype_t, float> or cute::is_same_v<cd_dtype_t, cutlass::bfloat16_t>, "Invalid C/D data dtype");
++    if constexpr (kCSAFusedC0C4) {
++        DG_STATIC_ASSERT(kGemmType == GemmType::Normal,
++                         "CSA C0-C4 only supports normal GEMM");
++        DG_STATIC_ASSERT(not kSwapAB,
++                         "CSA C0-C4 requires a non-swap layout");
++        DG_STATIC_ASSERT(not kWithAccumulation,
++                         "CSA C0-C4 does not support C accumulation");
++        DG_STATIC_ASSERT(cute::is_same_v<cd_dtype_t, float>,
++                         "CSA C0-C4 requires FP32 C0 output");
++        DG_STATIC_ASSERT(SHAPE_M == 8192 and SHAPE_N == 512 and
++                             SHAPE_K == 7168,
++                         "CSA C0-C4 requires the prefill root shape");
++        DG_STATIC_ASSERT(kNumNonEpilogueThreads == 384 and
++                             kNumEpilogueThreads == 128,
++                         "CSA C0-C4 requires a 512-thread CTA");
++        DG_STATIC_ASSERT(BLOCK_N == 64 or BLOCK_N == 128,
++                         "CSA C0-C4 requires 64/128-channel N tiles");
++    }
+
+     // MMA Configs
+     constexpr uint32_t LAYOUT_AD_M = 128;
+@@ -171,6 +197,24 @@
+     }
+     kNumMulticast > 1 ? comm::cluster_sync_with_relaxed_arrive() : __syncthreads();
+
++    // Ray-style warpgroup specialization. Warps 0..3 retain the lightweight
++    // producer/control roles, warps 4..11 execute C4, and warps 12..15 own
++    // the C0 epilogue. The complete 2-CTA cluster uses the same role map.
++    if constexpr (kCSAFusedC0C4) {
++        constexpr uint32_t kNumProducerRegisters = 40;
++        constexpr uint32_t kNumConsumerRegisters = 128;
++        constexpr uint32_t kNumEpilogueRegisters = 128;
++        if (warp_idx < 4)
++            cutlass::arch::warpgroup_reg_dealloc<
++                kNumProducerRegisters>();
++        else if (warp_idx < 12)
++            cutlass::arch::warpgroup_reg_alloc<
++                kNumConsumerRegisters>();
++        else
++            cutlass::arch::warpgroup_reg_alloc<
++                kNumEpilogueRegisters>();
++    }
++
+     // Wait for primary kernel completion
+     cudaGridDependencySynchronize();
+
+@@ -178,7 +222,7 @@
+     uint32_t m_block_idx, n_block_idx;
+     // NOTES: BF16 has no SF, so `kSFKSpan` is unused here; pass `kKAlignment` explicitly to avoid relying on the default.
+     auto scheduler = sched::Scheduler<kGemmType, BLOCK_M, BLOCK_N, kNumGroups, kNumMulticast, kIsMulticastOnA, kNumSMs, kEnsureZeroPadding, kKAlignment, kKAlignment>(
+-        shape_m, shape_n, shape_k, grouped_layout);
++        shape_m, shape_n, shape_k, grouped_layout, cta_idx);
+
+     // Pipeline and TMA phases
+     uint32_t stage_idx = 0, phase = 0, tensor_core_phase = 0;
+@@ -395,6 +439,20 @@
+             const auto accum_phase_idx = (iter_idx / kNumEpilogueStages) & 1;
+             tmem_empty_barriers[iter_idx % kNumEpilogueStages]->wait(accum_phase_idx);
+         }
++    } else if (kCSAFusedC0C4 and warp_idx >= 4 and warp_idx < 12) {
++        if constexpr (kCSAInlineStreamingC4) {
++            DG_DEVICE_ASSERT(csa_params != nullptr);
++            if (csa_params->profile_mode >= 3 and
++                csa_params->row_ready != nullptr) {
++                constexpr uint32_t kNumConsumerThreads = 256;
++                constexpr uint32_t kNumC1Tiles = SHAPE_N / BLOCK_N;
++                const auto consumer_thread_idx =
++                    (warp_idx - 4) * 32 + lane_idx;
++                epilogue::sm100_csa_c4_consumer<
++                    kNumConsumerThreads, kNumC1Tiles, kNumSMs>(
++                        shape_m, cta_idx, consumer_thread_idx, *csa_params);
++            }
++        }
+     } else if (warp_idx >= kNumNonEpilogueThreads / 32 and warp_idx < (kNumNonEpilogueThreads + kNumUMMAStoreThreads) / 32) {
+         // Epilogue warp groups
+         const auto epilogue_warp_idx = warp_idx - (kNumNonEpilogueThreads / 32);
+@@ -422,7 +480,40 @@
+                 (not is_m_grouped_contiguous(kGemmType)), sched::IndexType::MN>(shape_m, BLOCK_M, m_block_idx);
+             const auto base_n_idx = n_block_idx * BLOCK_N;
+
+-            if constexpr (kSwapAB) {
++            if constexpr (kCSAFusedC0C4) {
++                DG_DEVICE_ASSERT(csa_params != nullptr);
++                if (csa_params->profile_mode >= 2)
++                    epilogue::sm100_store_csa_state_tile<
++                        BLOCK_M, BLOCK_N, STORE_BLOCK_M, STORE_BLOCK_N,
++                        kNumUMMAStoreThreads>(
++                            smem_cd, tmem_base_addr,
++                            base_m_idx, base_n_idx, shape_m,
++                            epilogue_warp_idx, lane_idx, *csa_params);
++
++                if constexpr (kCSAStoreDenseC0) {
++                    // Compatibility route: keep the complete dense C0 tensor
++                    // observable even though the paged-state C4 consumer
++                    // reads the direct state stores published above.
++                    epilogue::sm100_store_cd<
++                        BLOCK_M, BLOCK_N, STORE_BLOCK_M, STORE_BLOCK_N,
++                        kSwizzleCDMode, kNumTMAStoreStages,
++                        kNumUMMAStoreThreads, kGemmType, kWithAccumulation,
++                        cd_dtype_t, epilogue::transform::EpilogueIdentity>(
++                            smem_cd, tma_stage_idx, tmem_base_addr,
++                            base_m_idx, base_n_idx,
++                            scheduler.current_group_idx,
++                            epilogue_warp_idx, lane_idx,
++                            tmem_empty_barriers[accum_stage_idx],
++                            tensor_map_cd);
++                } else {
++                    // The dense epilogue normally releases this accumulator
++                    // stage after its final TMEM read. The state-only route
++                    // must preserve that producer/consumer handoff after the
++                    // custom paged-state read or the MMA producer deadlocks.
++                    ptx::tcgen05_before_thread_sync();
++                    tmem_empty_barriers[accum_stage_idx]->arrive(0u);
++                }
++            } else if constexpr (kSwapAB) {
+                 const auto effective_m = scheduler.get_aligned_effective_m_in_block(m_block_idx);
+                 epilogue::sm100_store_cd_swap_ab<BLOCK_M, BLOCK_N, STORE_BLOCK_M, STORE_BLOCK_N,
+                     kSwizzleCDMode, kNumTMAStoreStages, kNumUMMAStoreThreads,
+@@ -456,11 +547,49 @@
+         Allocator().free(0, kNumTmemCols);
+
+ #else
+-    if (blockIdx.x == 0 and threadIdx.x == 0)
++    if (cta_idx == 0 and threadIdx.x == 0)
+         DG_DEVICE_ASSERT(false and "This kernel only support sm_100f");
+ #endif
+ }
+
++template <cute::UMMA::Major kMajorA, cute::UMMA::Major kMajorB,
++          uint32_t SHAPE_M, uint32_t SHAPE_N, uint32_t SHAPE_K,
++          uint32_t BLOCK_M, uint32_t BLOCK_N, uint32_t BLOCK_K_,
++          uint32_t kNumGroups,
++          uint32_t kSwizzleAMode, uint32_t kSwizzleBMode, uint32_t kSwizzleCDMode,
++          uint32_t kNumStages_,
++          uint32_t kNumNonEpilogueThreads, uint32_t kNumEpilogueThreads,
++          uint32_t kNumMulticast, bool kIsMulticastOnA,
++          uint32_t kNumSMs,
++          uint32_t kKAlignment,
++          bool kSwapAB, bool kEnsureZeroPadding,
++          GemmType kGemmType, bool kWithAccumulation, typename cd_dtype_t,
++          uint64_t kTensorCoreUtilControl>
++CUTLASS_GLOBAL void __launch_bounds__(kNumNonEpilogueThreads + kNumEpilogueThreads, 1)
++sm100_bf16_gemm_impl(int* grouped_layout,
++                     uint32_t shape_m, uint32_t shape_n, uint32_t shape_k,
++                     const __grid_constant__ cute::TmaDescriptor tensor_map_a,
++                     const __grid_constant__ cute::TmaDescriptor tensor_map_b,
++                     const __grid_constant__ cute::TmaDescriptor tensor_map_cd) {
++    sm100_bf16_gemm_body<
++        kMajorA, kMajorB,
++        SHAPE_M, SHAPE_N, SHAPE_K,
++        BLOCK_M, BLOCK_N, BLOCK_K_,
++        kNumGroups,
++        kSwizzleAMode, kSwizzleBMode, kSwizzleCDMode,
++        kNumStages_,
++        kNumNonEpilogueThreads, kNumEpilogueThreads,
++        kNumMulticast, kIsMulticastOnA,
++        kNumSMs,
++        kKAlignment,
++        kSwapAB, kEnsureZeroPadding,
++        kGemmType, kWithAccumulation, cd_dtype_t,
++        kTensorCoreUtilControl>(
++            grouped_layout, shape_m, shape_n, shape_k,
++            tensor_map_a, tensor_map_b, tensor_map_cd,
++            static_cast<uint32_t>(blockIdx.x));
++}
++
+ };  // namespace deep_gemm
+
+ #pragma clang diagnostic pop

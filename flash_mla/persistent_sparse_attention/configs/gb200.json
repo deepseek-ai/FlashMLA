@@ -1,0 +1,22 @@
+{
+  "root_grid_sms": 152,
+  "root_projection_sms": 108,
+  "state_save_sms": 96,
+  "main_compress_sms": 96,
+  "swa_cache_insert_sms": 4,
+  "index_query_sms": 56,
+  "index_cache_sms": 148,
+  "index_logits_sms": 148,
+  "topk_sms": 148,
+  "kv_cache_gather_sms": 4,
+  "combine_sms": 152,
+  "reset_sms": 152,
+  "wqb_launch_sms": 152,
+  "wqb_steady_sms": 38,
+  "prefix_attention_sms": 152,
+  "tail_attention_sms": 68,
+  "tail_output_sms": 68,
+  "prefix_output_sms": 84,
+  "output_quant_sms": 152,
+  "output_projection_sms": 152
+}

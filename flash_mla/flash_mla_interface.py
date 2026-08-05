@@ -182,43 +182,172 @@ def flash_mla_sparse_fwd(
     attn_sink: Optional[torch.Tensor] = None,
     topk_length: Optional[torch.Tensor] = None,
     indexer_topk: int = 0,
+    *,
+    out: Optional[torch.Tensor] = None,
+    num_sms: Optional[int] = None,
+    q_ready: Optional[torch.Tensor] = None,
+    q_ready_chunk_size: int = 0,
+    q_positions: Optional[torch.Tensor] = None,
+    q_cos_sin_cache: Optional[torch.Tensor] = None,
+    q_norm_eps: float = 1.0e-6,
+    o_ready: Optional[torch.Tensor] = None,
+    fused_o_fp8: Optional[torch.Tensor] = None,
+    fused_o_scale: Optional[torch.Tensor] = None,
+    fused_o_positions: Optional[torch.Tensor] = None,
+    fused_o_skip_bf16: bool = False,
+    extra_kv: Optional[torch.Tensor] = None,
+    extra_indices: Optional[torch.Tensor] = None,
+    extra_topk_length: Optional[torch.Tensor] = None,
+    psa: bool = False,
 ) -> Union[
     Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
     Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
 ]:
-    """
-    Sparse attention prefill kernel
+    """Sparse attention prefill kernel.
+
+    Calls using only the original nv_dev arguments execute the stock
+    ``flash_mla.cuda`` operator, including ``indexer_topk`` support. Using any
+    non-default keyword-only option selects the SM100 persistent
+    sparse-attention extension. The extension currently requires ``h_q ==
+    128``, ``h_kv == 1``, ``d_qk == d_v == 512``, and a positive top-k that is
+    a multiple of 64 and no larger than 1280. It does not support
+    ``indexer_topk``.
 
     Args:
-        q: [s_q, h_q, d_qk], bfloat16
-        kv: [s_kv, h_kv, d_qk], bfloat16
-        indices: [s_q, h_kv, topk], int32. Invalid indices should be set to -1 or numbers >= s_kv
-        sm_scale: float
-        d_v: The dimension of value vectors. Can only be 512
-        attn_sink: optional, [h_q], float32.
-            If attn_sink is provided, when computing output, output will be additionally multiplied by exp(lse) / (exp(lse) + exp(attn_sink)).
-            +-inf in attn_sink will be handled normally (i.e., -inf has no effect, +inf will make corresponding output all zeros).
-            This argument has no effect on lse and max_logits.
-        topk_length: optional, [s_q], int32. If provided, the i-th q token will only attend to k tokens specified by indices[i, :, :topk_length[i]], ignoring later k/v tokens (even if provided in indices).
-            In extremely rare cases (topk_length provided, there is a valid topk index between topk_length[i] ~ s_kv, and that topk index points to a k token containing NaN), operator output will contain NaN, so please avoid this situation.
-        indexer_topk: int, 0/512/1024/2048. When > 0, the kernel additionally computes
-            lse_indexer over the first indexer_topk entries of indices (the
-            indexer/compress portion). Only supported for h_q == 64.
+        q: ``[s_q, h_q, d_qk]``, bfloat16.
+        kv: ``[s_kv, h_kv, d_qk]``, bfloat16.
+        indices: ``[s_q, h_kv, topk]``, int32. Invalid indices should be set
+            to -1 or values greater than or equal to ``s_kv``.
+        sm_scale: Scaling applied to QK scores before softmax.
+        d_v: The value-vector dimension. Can only be 512.
+        attn_sink: Optional ``[h_q]`` float32 tensor. When provided, output is
+            additionally multiplied by ``exp(lse) / (exp(lse) +
+            exp(attn_sink))``. ``+/-inf`` is handled normally: ``-inf`` has no
+            effect and ``+inf`` makes the corresponding output zero. This
+            argument does not affect the returned ``lse`` or ``max_logits``.
+        topk_length: Optional ``[s_q]`` int32 tensor. Query row ``i`` attends
+            only to entries ``indices[i, :, :topk_length[i]]``. In the rare
+            case where an ignored entry points to a K/V row containing NaN,
+            the output can still contain NaN; avoid that input combination.
+        indexer_topk: 0, 512, 1024, or 2048. When nonzero, the stock kernel
+            additionally computes ``lse_indexer`` over the first
+            ``indexer_topk`` entries (the indexer/compress portion). This is
+            supported only for ``h_q == 64`` and cannot be combined with the
+            keyword-only extension options.
+        out: Optional caller-owned contiguous bfloat16 output buffer with
+            shape ``[s_q, h_q, d_v]``. Providing it selects the extension.
+        num_sms: Optional positive persistent-grid limit, no greater than the
+            device SM count. ``psa=True`` requires an explicit even value.
+        q_ready: Optional 1-D int32 producer-ready flags with at least
+            ``ceil(s_q / q_ready_chunk_size)`` entries. Each release-published
+            flag makes one consecutive group of Q rows available.
+        q_ready_chunk_size: Number of consecutive Q rows represented by each
+            ``q_ready`` flag; must be positive when ``q_ready`` is provided.
+        q_positions: Optional ``[s_q]`` int64 positions enabling fused raw-Q
+            per-head RMSNorm and GPT-J RoPE. Requires ``q_cos_sin_cache``.
+        q_cos_sin_cache: Optional contiguous ``[max_position, 64]`` float32
+            table laid out as ``cos || sin`` for raw-Q preprocessing and the
+            fused output epilogue.
+        q_norm_eps: Positive epsilon used by fused raw-Q RMSNorm.
+        o_ready: Optional 1-D int32 output-completion flags with at least
+            ``2 * s_q`` entries. Each query owns two consecutive flags, one
+            for each CTA in its cluster.
+        fused_o_fp8: Optional float8_e4m3fn destination with logical shape
+            ``[s_q, 16, 4096]`` and physical ``[16, s_q, 4096]`` group-major
+            layout. Must be supplied with ``fused_o_scale`` and
+            ``fused_o_positions``.
+        fused_o_scale: Optional int32 destination with logical shape
+            ``[s_q, 16, 8]`` in packed DeepGEMM MN-major layout.
+        fused_o_positions: Optional ``[s_q]`` int64 positions used by the
+            fused inverse-RoPE and FP8 block-quantization epilogue.
+        fused_o_skip_bf16: Skip writing the bfloat16 ``out`` tensor when fused
+            output tensors are supplied. This mode cannot be combined with
+            ``psa=True``.
+        extra_kv: Optional second ``[s_extra_kv, h_kv, d_qk]`` bfloat16 KV
+            pool, used together with ``extra_indices``.
+        extra_indices: Optional ``[s_q, h_kv, extra_topk]`` int32 indices into
+            ``extra_kv``. ``extra_topk`` must be a multiple of 64 and the
+            combined primary and extra top-k must not exceed 1280.
+        extra_topk_length: Optional ``[s_q]`` int32 valid length for
+            ``extra_indices``. Requires both extra-pool tensors.
+        psa: Select the persistent sparse-attention topology. Requires an
+            explicit even ``num_sms`` and is mutually exclusive with the
+            fused output epilogue. The V4 CSA prefix/tail lane entry points are
+            exposed separately as ``sparse_attention_prefix`` and
+            ``sparse_attention_tail`` under
+            ``flash_mla.persistent_sparse_attention``.
 
     Returns:
-        - If indexer_topk == 0: (output, max_logits, lse)
-        - If indexer_topk > 0: (output, max_logits, lse, lse_indexer)
-        Please refer to tests/ref.py for the precise definitions of these parameters.
-        - output: [s_q, h_q, d_v], bfloat16
-        - max_logits:  [s_q, h_q], float
-        - lse: [s_q, h_q], float, log-sum-exp of attention scores
-        - lse_indexer: [s_q, h_q], float, LSE over the indexer portion only
+        When ``indexer_topk == 0``, returns ``(output, max_logits, lse)``.
+        Otherwise the stock route returns ``(output, max_logits, lse,
+        lse_indexer)``. ``output`` is ``[s_q, h_q, d_v]`` bfloat16;
+        ``max_logits`` and ``lse`` are ``[s_q, h_q]`` float32; and
+        ``lse_indexer`` is ``[s_q, h_q]`` float32 over the indexer portion.
+        See ``tests/ref.py`` for the precise definitions.
     """
-    results = flash_mla_cuda.sparse_prefill_fwd(
-        q, kv, indices, sm_scale, d_v, attn_sink, topk_length, indexer_topk
+    advanced = (
+        out is not None
+        or num_sms is not None
+        or q_ready is not None
+        or q_ready_chunk_size != 0
+        or q_positions is not None
+        or q_cos_sin_cache is not None
+        or q_norm_eps != 1.0e-6
+        or o_ready is not None
+        or fused_o_fp8 is not None
+        or fused_o_scale is not None
+        or fused_o_positions is not None
+        or fused_o_skip_bf16
+        or extra_kv is not None
+        or extra_indices is not None
+        or extra_topk_length is not None
+        or psa
     )
-    return results
+    if not advanced:
+        return flash_mla_cuda.sparse_prefill_fwd(
+            q,
+            kv,
+            indices,
+            sm_scale,
+            d_v,
+            attn_sink,
+            topk_length,
+            indexer_topk,
+        )
 
+    if indexer_topk != 0:
+        raise ValueError(
+            "indexer_topk is only supported by the stock nv_dev path"
+        )
+    from flash_mla.persistent_sparse_attention_interface import (
+        flash_mla_persistent_sparse_attention_fwd,
+    )
+
+    return flash_mla_persistent_sparse_attention_fwd(
+        q,
+        kv,
+        indices,
+        sm_scale,
+        d_v,
+        attn_sink,
+        topk_length,
+        out=out,
+        num_sms=num_sms,
+        q_ready=q_ready,
+        q_ready_chunk_size=q_ready_chunk_size,
+        q_positions=q_positions,
+        q_cos_sin_cache=q_cos_sin_cache,
+        q_norm_eps=q_norm_eps,
+        o_ready=o_ready,
+        fused_o_fp8=fused_o_fp8,
+        fused_o_scale=fused_o_scale,
+        fused_o_positions=fused_o_positions,
+        fused_o_skip_bf16=fused_o_skip_bf16,
+        extra_kv=extra_kv,
+        extra_indices=extra_indices,
+        extra_topk_length=extra_topk_length,
+        psa=psa,
+    )
 
 def _flash_attn_varlen_forward(
     q: torch.Tensor,

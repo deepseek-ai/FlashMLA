@@ -12,6 +12,8 @@ from torch.utils.cpp_extension import (
     CUDA_HOME
 )
 
+from persistent_sparse_attention_build import make_persistent_sparse_attention_extension
+
 
 def is_flag_set(flag: str) -> bool:
     return os.getenv(flag, "FALSE").lower() in ["true", "1", "y", "yes"]
@@ -49,9 +51,30 @@ def get_nvcc_thread_args():
     nvcc_threads = os.getenv("NVCC_THREADS") or "32"
     return ["--threads", nvcc_threads]
 
-subprocess.run(["git", "submodule", "update", "--init", "csrc/cutlass"])
-
 this_dir = os.path.dirname(os.path.abspath(__file__))
+
+build_persistent_suite = (
+    is_flag_set("FLASH_MLA_BUILD_PERSISTENT_SPARSE_ATTENTION_SUITE")
+    or is_flag_set("FLASH_MLA_BUILD_CSA")
+)
+
+submodules = ["csrc/cutlass"]
+if build_persistent_suite:
+    submodules.append("csrc/deep_gemm")
+missing_submodules = [
+    path for path in submodules
+    if not (Path(this_dir) / path / ".git").exists()
+]
+if missing_submodules:
+    subprocess.run(
+        [
+            "git",
+            "-c", f"safe.directory={this_dir}",
+            "submodule", "update", "--init",
+        ] + missing_submodules,
+        cwd=this_dir,
+        check=True,
+    )
 
 if IS_WINDOWS:
     cxx_args = ["/O2", "/std:c++20", "/DNDEBUG", "/W0"]
@@ -125,6 +148,7 @@ ext_modules.append(
             ] + get_features_args() + get_arch_flags() + get_nvcc_thread_args(),
         },
         include_dirs=[
+            Path(CUDA_HOME) / "include" / "cccl",
             Path(this_dir) / "csrc",
             Path(this_dir) / "csrc" / "kerutils" / "include",   # TODO Remove me
             Path(this_dir) / "csrc" / "sm90",
@@ -134,9 +158,27 @@ ext_modules.append(
     )
 )
 
+
+if not is_flag_set("FLASH_MLA_DISABLE_SM100"):
+    ext_modules.append(
+        make_persistent_sparse_attention_extension(
+            this_dir,
+            cxx_args,
+            get_features_args(),
+            get_arch_flags(),
+            get_nvcc_thread_args(),
+            build_full_suite=build_persistent_suite,
+        )
+    )
+
 try:
-    cmd = ['git', 'rev-parse', '--short', 'HEAD']
-    rev = '+' + subprocess.check_output(cmd).decode('ascii').rstrip()
+    cmd = [
+        'git', '-c', f'safe.directory={this_dir}',
+        'rev-parse', '--short', 'HEAD',
+    ]
+    rev = '+' + subprocess.check_output(
+        cmd, cwd=this_dir
+    ).decode('ascii').rstrip()
 except Exception as _:
     now = datetime.now()
     date_time_str = now.strftime("%Y-%m-%d-%H-%M-%S")
@@ -146,7 +188,11 @@ except Exception as _:
 setup(
     name="flash_mla",
     version="1.0.0" + rev,
-    packages=find_packages(include=['flash_mla']),
+    packages=find_packages(include=['flash_mla', 'flash_mla.*']),
+    package_data={
+        'flash_mla.persistent_sparse_attention': ['configs/*.json'],
+    },
     ext_modules=ext_modules,
     cmdclass={"build_ext": BuildExtension},
+    zip_safe=False,
 )
