@@ -35,6 +35,7 @@ def get_arch_flags():
 
     DISABLE_SM100 = is_flag_set("FLASH_MLA_DISABLE_SM100")
     DISABLE_SM90 = is_flag_set("FLASH_MLA_DISABLE_SM90")
+    DISABLE_SM80 = is_flag_set("FLASH_MLA_DISABLE_SM80")
     if major < 12 or (major == 12 and minor <= 8):
         assert DISABLE_SM100, "sm100 compilation for Flash MLA requires NVCC 12.9 or higher. Please set FLASH_MLA_DISABLE_SM100=1 to disable sm100 compilation, or update your environment."    # TODO Implement this
 
@@ -43,6 +44,8 @@ def get_arch_flags():
         arch_flags.extend(["-gencode", "arch=compute_100f,code=sm_100f"])
     if not DISABLE_SM90:
         arch_flags.extend(["-gencode", "arch=compute_90a,code=sm_90a"])
+    if not DISABLE_SM80:
+        arch_flags.extend(["-gencode", "arch=compute_80,code=sm_80"])
     return arch_flags
 
 def get_nvcc_thread_args():
@@ -53,59 +56,100 @@ subprocess.run(["git", "submodule", "update", "--init", "csrc/cutlass"])
 
 this_dir = os.path.dirname(os.path.abspath(__file__))
 
+
+def get_nvidia_wheel_includes():
+    """Collect include paths from pip-installed nvidia-* wheels (e.g.
+    nvidia-cusparse-cu12). PyTorch headers transitively include cusparse.h,
+    which is not present in some system CUDA toolkits."""
+    paths = []
+    try:
+        import nvidia
+        for nvidia_root in nvidia.__path__:
+            root = Path(nvidia_root)
+            if not root.exists():
+                continue
+            for sub in root.iterdir():
+                inc = sub / "include"
+                if inc.is_dir():
+                    paths.append(inc)
+    except ImportError:
+        pass
+    return paths
+
 if IS_WINDOWS:
     cxx_args = ["/O2", "/std:c++20", "/DNDEBUG", "/W0"]
 else:
     cxx_args = ["-O3", "-std=c++20", "-DNDEBUG", "-Wno-deprecated-declarations"]
 
+DISABLE_SM100 = is_flag_set("FLASH_MLA_DISABLE_SM100")
+DISABLE_SM90 = is_flag_set("FLASH_MLA_DISABLE_SM90")
+DISABLE_SM80 = is_flag_set("FLASH_MLA_DISABLE_SM80")
+
+sources = ["csrc/api/api.cpp"]
+
+# Misc kernels for decoding (arch-agnostic, used by all dense decode paths)
+sources += [
+    "csrc/smxx/decode/get_decoding_sched_meta/get_decoding_sched_meta.cu",
+    "csrc/smxx/decode/combine/combine.cu",
+]
+
+if not DISABLE_SM80:
+    sources += [
+        "csrc/sm80/decode/dense/instantiations/fp16.cu",
+        "csrc/sm80/decode/dense/instantiations/bf16.cu",
+    ]
+
+if not DISABLE_SM90:
+    sources += [
+        # sm90 dense decode
+        "csrc/sm90/decode/dense/instantiations/fp16.cu",
+        "csrc/sm90/decode/dense/instantiations/bf16.cu",
+        # sm90 sparse decode
+        "csrc/sm90/decode/sparse_fp8/instantiations/model1_persistent_h64.cu",
+        "csrc/sm90/decode/sparse_fp8/instantiations/model1_persistent_h128.cu",
+        "csrc/sm90/decode/sparse_fp8/instantiations/v32_persistent_h64.cu",
+        "csrc/sm90/decode/sparse_fp8/instantiations/v32_persistent_h128.cu",
+        # sm90 sparse prefill
+        "csrc/sm90/prefill/sparse/fwd.cu",
+        "csrc/sm90/prefill/sparse/instantiations/phase1_k512.cu",
+        "csrc/sm90/prefill/sparse/instantiations/phase1_k512_topklen.cu",
+        "csrc/sm90/prefill/sparse/instantiations/phase1_k576.cu",
+        "csrc/sm90/prefill/sparse/instantiations/phase1_k576_topklen.cu",
+    ]
+
+if not DISABLE_SM100:
+    sources += [
+        # sm100 dense prefill & backward
+        "csrc/sm100/prefill/dense/fmha_cutlass_fwd_sm100.cu",
+        "csrc/sm100/prefill/dense/fmha_cutlass_bwd_sm100.cu",
+        # sm100 sparse prefill
+        "csrc/sm100/prefill/sparse/fwd/head64/instantiations/phase1_k512.cu",
+        "csrc/sm100/prefill/sparse/fwd/head64/instantiations/phase1_k576.cu",
+        "csrc/sm100/prefill/sparse/fwd/head128/instantiations/phase1_k512.cu",
+        "csrc/sm100/prefill/sparse/fwd/head128/instantiations/phase1_k576.cu",
+        "csrc/sm100/prefill/sparse/fwd_for_small_topk/head128/instantiations/phase1_prefill_k512.cu",
+        # sm100 sparse decode
+        "csrc/sm100/decode/head64/instantiations/v32.cu",
+        "csrc/sm100/decode/head64/instantiations/model1.cu",
+        "csrc/sm100/prefill/sparse/fwd_for_small_topk/head128/instantiations/phase1_decode_k512.cu",
+    ]
+
+cxx_features = []
+if DISABLE_SM100:
+    cxx_features.append("-DFLASH_MLA_DISABLE_SM100")
+if DISABLE_SM90:
+    cxx_features.append("-DFLASH_MLA_DISABLE_SM90")
+if DISABLE_SM80:
+    cxx_features.append("-DFLASH_MLA_DISABLE_SM80")
+
 ext_modules = []
 ext_modules.append(
     CUDAExtension(
         name="flash_mla.cuda",
-        sources=[
-            # API
-            "csrc/api/api.cpp",
-
-            # Misc kernels for decoding
-            "csrc/smxx/decode/get_decoding_sched_meta/get_decoding_sched_meta.cu",
-            "csrc/smxx/decode/combine/combine.cu",
-
-            # sm90 dense decode
-            "csrc/sm90/decode/dense/instantiations/fp16.cu",
-            "csrc/sm90/decode/dense/instantiations/bf16.cu",
-
-            # sm90 sparse decode
-            "csrc/sm90/decode/sparse_fp8/instantiations/model1_persistent_h64.cu",
-            "csrc/sm90/decode/sparse_fp8/instantiations/model1_persistent_h128.cu",
-            "csrc/sm90/decode/sparse_fp8/instantiations/v32_persistent_h64.cu",
-            "csrc/sm90/decode/sparse_fp8/instantiations/v32_persistent_h128.cu",
-
-            # sm90 sparse prefill
-            "csrc/sm90/prefill/sparse/fwd.cu",
-            "csrc/sm90/prefill/sparse/instantiations/phase1_k512.cu",
-            "csrc/sm90/prefill/sparse/instantiations/phase1_k512_topklen.cu",
-            "csrc/sm90/prefill/sparse/instantiations/phase1_k576.cu",
-            "csrc/sm90/prefill/sparse/instantiations/phase1_k576_topklen.cu",
-
-            # sm100 dense prefill & backward
-            "csrc/sm100/prefill/dense/fmha_cutlass_fwd_sm100.cu",
-            "csrc/sm100/prefill/dense/fmha_cutlass_bwd_sm100.cu",
-
-            # sm100 sparse prefill
-            "csrc/sm100/prefill/sparse/fwd/head64/instantiations/phase1_k512.cu",
-            "csrc/sm100/prefill/sparse/fwd/head64/instantiations/phase1_k576.cu",
-            "csrc/sm100/prefill/sparse/fwd/head128/instantiations/phase1_k512.cu",
-            "csrc/sm100/prefill/sparse/fwd/head128/instantiations/phase1_k576.cu",
-            "csrc/sm100/prefill/sparse/fwd_for_small_topk/head128/instantiations/phase1_prefill_k512.cu",
-
-            # sm100 sparse decode
-            "csrc/sm100/decode/head64/instantiations/v32.cu",
-            "csrc/sm100/decode/head64/instantiations/model1.cu",
-            "csrc/sm100/prefill/sparse/fwd_for_small_topk/head128/instantiations/phase1_decode_k512.cu",
-        ],
+        sources=sources,
         extra_compile_args={
-            "cxx": cxx_args + get_features_args(),
-            "nvcc": [
+            "cxx": cxx_args + cxx_features + get_features_args(),
+            "nvcc": cxx_features + [
                 "-O3",
                 "-std=c++20",
                 "-DNDEBUG",
@@ -126,10 +170,11 @@ ext_modules.append(
         include_dirs=[
             Path(this_dir) / "csrc",
             Path(this_dir) / "csrc" / "kerutils" / "include",   # TODO Remove me
+            Path(this_dir) / "csrc" / "sm80",
             Path(this_dir) / "csrc" / "sm90",
             Path(this_dir) / "csrc" / "cutlass" / "include",
             Path(this_dir) / "csrc" / "cutlass" / "tools" / "util" / "include",
-        ],
+        ] + get_nvidia_wheel_includes(),
     )
 )
 

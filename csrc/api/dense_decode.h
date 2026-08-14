@@ -6,7 +6,12 @@
 #include "common.h"
 #include "params.h"
 
+#ifndef FLASH_MLA_DISABLE_SM90
 #include "sm90/decode/dense/splitkv_mla.h"
+#endif
+#ifndef FLASH_MLA_DISABLE_SM80
+#include "sm80/decode/dense/splitkv_mla.h"
+#endif
 #include "smxx/decode/get_decoding_sched_meta/get_decoding_sched_meta.h"
 #include "smxx/decode/combine/combine.h"
 
@@ -24,8 +29,8 @@ dense_attn_decode_interface(
 ) {
     // Check arch
     Arch arch = Arch();
-    if (!arch.is_sm90a()) {
-        TORCH_CHECK(false, "Dense decode MLA is only supported on SM90a architecture");
+    if (!arch.is_sm90a() && !arch.is_sm80()) {
+        TORCH_CHECK(false, "Dense decode MLA is only supported on SM80 or SM90a architectures");
     }
 
     // Check data types
@@ -75,7 +80,35 @@ dense_attn_decode_interface(
     const int num_heads = num_heads_k;
     q = q.view({batch_size, seqlen_q_ori, num_heads_k, num_q_heads_per_hk, head_size_k}).transpose(2, 3)
         .reshape({batch_size, q_seq_per_hk, num_heads, head_size_k});
-    int num_sm_parts = std::max(arch.num_sms / num_heads_k / cutlass::ceil_div(seqlen_q_ori*num_heads_q/num_heads_k, 64), 1);
+    // One partition per SM saturates the machine only when a single CTA is resident. The
+    // SM80 kernel stages K in a tile small enough for more than one, so ask the scheduler
+    // for as many partitions as will actually run side by side. SM90 is untouched.
+    //
+    // The extra partitions only pay off once the batch is large enough to absorb their
+    // fixed cost: every partition reloads the Q tile, runs a prologue and epilogue, and
+    // adds a row to the combine reduction. Measured on A100, doubling the count is worth
+    // +29% at batch 64 and -33% at batch 4, with the crossover between 4 and 16. The
+    // threshold below is that measurement, not a derived quantity.
+    constexpr int kMinBatchForExtraPartitions = 16;
+    constexpr int kMinPagesPerPartition = 4;
+    const int base_num_sm_parts = std::max(
+        arch.num_sms / num_heads_k / cutlass::ceil_div(seqlen_q_ori*num_heads_q/num_heads_k, 64),
+        1);
+    // Upper bound on the KV pages the scheduler has to hand out. Exact totals live in
+    // seqlens_k on the device; this bound needs no synchronisation and is tight whenever
+    // the requests fill their block table.
+    const int max_total_pages = batch_size * (int)block_table.size(1);
+
+    int ctas_per_sm = 1;
+#ifndef FLASH_MLA_DISABLE_SM80
+    if (arch.is_sm80() && batch_size >= kMinBatchForExtraPartitions) {
+        const int candidate = sm80::cfg::ctas_per_sm();
+        if (max_total_pages >= kMinPagesPerPartition * candidate * base_num_sm_parts) {
+            ctas_per_sm = candidate;
+        }
+    }
+#endif
+    int num_sm_parts = std::max(ctas_per_sm * base_num_sm_parts, 1);
 
     KU_CHECK_SHAPE(q, batch_size, q_seq_per_hk, num_heads, head_size_k);
     KU_CHECK_SHAPE(kcache, num_blocks, page_block_size, num_heads_k, head_size_k);
@@ -172,17 +205,44 @@ dense_attn_decode_interface(
 
     params.stream = at::cuda::getCurrentCUDAStream().stream();
 
+#define DISPATCH_DENSE_DECODE_KERNEL(SCALAR_T) \
+    do { \
+        if (arch.is_sm90a()) { \
+            CALL_SM90_DENSE_DECODE(SCALAR_T); \
+        } else if (arch.is_sm80()) { \
+            CALL_SM80_DENSE_DECODE(SCALAR_T); \
+        } else { \
+            TORCH_CHECK(false, "Unsupported arch for dense MLA decode"); \
+        } \
+    } while (0)
+
+#ifndef FLASH_MLA_DISABLE_SM90
+#define CALL_SM90_DENSE_DECODE(SCALAR_T) sm90::run_flash_splitkv_mla_kernel<SCALAR_T>(params)
+#else
+#define CALL_SM90_DENSE_DECODE(SCALAR_T) TORCH_CHECK(false, "FlashMLA was built with FLASH_MLA_DISABLE_SM90; cannot run on SM90 GPU")
+#endif
+
+#ifndef FLASH_MLA_DISABLE_SM80
+#define CALL_SM80_DENSE_DECODE(SCALAR_T) sm80::run_flash_splitkv_mla_kernel<SCALAR_T>(params)
+#else
+#define CALL_SM80_DENSE_DECODE(SCALAR_T) TORCH_CHECK(false, "FlashMLA was built with FLASH_MLA_DISABLE_SM80; cannot run on SM80 GPU")
+#endif
+
     if (q_dtype == torch::kBFloat16) {
-        sm90::run_flash_splitkv_mla_kernel<cutlass::bfloat16_t>(params);
+        DISPATCH_DENSE_DECODE_KERNEL(cutlass::bfloat16_t);
     } else if (q_dtype == torch::kHalf) {
 #ifdef FLASH_MLA_DISABLE_FP16
         TORCH_CHECK(false, "FlashMLA is compiled with -DFLASH_MLA_DISABLE_FP16. Please remove this flag from your environment and re-compile FlashMLA.");
 #else
-        sm90::run_flash_splitkv_mla_kernel<cutlass::half_t>(params);
+        DISPATCH_DENSE_DECODE_KERNEL(cutlass::half_t);
 #endif
     } else {
-        TORCH_CHECK(false, "Unsupported dtype for dense MLA on SM90");
+        TORCH_CHECK(false, "Unsupported dtype for dense MLA decode");
     }
+
+#undef DISPATCH_DENSE_DECODE_KERNEL
+#undef CALL_SM90_DENSE_DECODE
+#undef CALL_SM80_DENSE_DECODE
 
     CombineParams combine_params = {
         batch_size, seqlen_q_ori,

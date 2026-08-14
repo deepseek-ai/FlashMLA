@@ -8,7 +8,7 @@
 
 namespace smxx::decode {
 
-__global__ void __launch_bounds__(32, 1, 1)
+__global__ void __launch_bounds__(32, 1)
 get_mla_metadata_kernel(__grid_constant__ const GetDecodeSchedMetaParams params) {
     int *seqlens_k_ptr = params.seqlens_k_ptr;
     DecodingSchedMeta *tile_scheduler_metadata_ptr = params.tile_scheduler_metadata_ptr;

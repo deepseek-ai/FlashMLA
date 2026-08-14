@@ -56,7 +56,11 @@ flash_fwd_mla_combine_kernel(__grid_constant__ const CombineParams params) {
     __shared__ float smem_buf[BLOCK_SIZE_M][MAX_SPLITS];
 
     // Wait for the previous kernel (the MLA kernel) to finish
+    // PDL (Programmatic Dependent Launch) requires SM90+. On older arches the
+    // launch is not overlapped, so the dependency is already satisfied.
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
     cudaGridDependencySynchronize();
+#endif
 
     // Prefetch
     static_assert(HEAD_DIM_V % (32*4) == 0);

@@ -31,6 +31,10 @@ struct Arch {
         num_sms = device_prop->multiProcessorCount;
     }
 
+    bool is_sm80() const {
+        return major == 8 && minor == 0;
+    }
+
     bool is_sm90a() const {
         return major == 9 && minor == 0;
     }
