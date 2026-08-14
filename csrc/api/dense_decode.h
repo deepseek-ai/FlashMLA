@@ -80,7 +80,35 @@ dense_attn_decode_interface(
     const int num_heads = num_heads_k;
     q = q.view({batch_size, seqlen_q_ori, num_heads_k, num_q_heads_per_hk, head_size_k}).transpose(2, 3)
         .reshape({batch_size, q_seq_per_hk, num_heads, head_size_k});
-    int num_sm_parts = std::max(arch.num_sms / num_heads_k / cutlass::ceil_div(seqlen_q_ori*num_heads_q/num_heads_k, 64), 1);
+    // One partition per SM saturates the machine only when a single CTA is resident. The
+    // SM80 kernel stages K in a tile small enough for more than one, so ask the scheduler
+    // for as many partitions as will actually run side by side. SM90 is untouched.
+    //
+    // The extra partitions only pay off once the batch is large enough to absorb their
+    // fixed cost: every partition reloads the Q tile, runs a prologue and epilogue, and
+    // adds a row to the combine reduction. Measured on A100, doubling the count is worth
+    // +29% at batch 64 and -33% at batch 4, with the crossover between 4 and 16. The
+    // threshold below is that measurement, not a derived quantity.
+    constexpr int kMinBatchForExtraPartitions = 16;
+    constexpr int kMinPagesPerPartition = 4;
+    const int base_num_sm_parts = std::max(
+        arch.num_sms / num_heads_k / cutlass::ceil_div(seqlen_q_ori*num_heads_q/num_heads_k, 64),
+        1);
+    // Upper bound on the KV pages the scheduler has to hand out. Exact totals live in
+    // seqlens_k on the device; this bound needs no synchronisation and is tight whenever
+    // the requests fill their block table.
+    const int max_total_pages = batch_size * (int)block_table.size(1);
+
+    int ctas_per_sm = 1;
+#ifndef FLASH_MLA_DISABLE_SM80
+    if (arch.is_sm80() && batch_size >= kMinBatchForExtraPartitions) {
+        const int candidate = sm80::cfg::ctas_per_sm();
+        if (max_total_pages >= kMinPagesPerPartition * candidate * base_num_sm_parts) {
+            ctas_per_sm = candidate;
+        }
+    }
+#endif
+    int num_sm_parts = std::max(ctas_per_sm * base_num_sm_parts, 1);
 
     KU_CHECK_SHAPE(q, batch_size, q_seq_per_hk, num_heads, head_size_k);
     KU_CHECK_SHAPE(kcache, num_blocks, page_block_size, num_heads_k, head_size_k);

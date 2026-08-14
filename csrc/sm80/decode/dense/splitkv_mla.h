@@ -1,6 +1,7 @@
 #pragma once
 
 #include "params.h"
+#include "traits.h"
 
 namespace sm80 {
 

@@ -39,6 +39,8 @@ flash_fwd_splitkv_mla_kernel_sm80(__grid_constant__ const DenseAttnDecodeParams 
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
     using sm80::cfg::BLOCK_SIZE_M;
     using sm80::cfg::PAGE_BLOCK_SIZE;
+    using sm80::cfg::KV_TILE;
+    using sm80::cfg::TILES_PER_PAGE;
     using sm80::cfg::HEAD_DIM_K;
     using sm80::cfg::HEAD_DIM_V;
     using sm80::cfg::NUM_THREADS;
@@ -49,8 +51,8 @@ flash_fwd_splitkv_mla_kernel_sm80(__grid_constant__ const DenseAttnDecodeParams 
 
     constexpr int N_TILES_PER_WG = HEAD_DIM_V_PER_WG / 8;  // 16 PV N-tiles per wg
     constexpr int QK_K_TILES     = HEAD_DIM_K / 16;        // 36
-    constexpr int QK_N_TILES     = PAGE_BLOCK_SIZE / 8;    // 8
-    constexpr int PV_K_TILES     = PAGE_BLOCK_SIZE / 16;   // 4
+    constexpr int QK_N_TILES     = KV_TILE / 8;            // 2
+    constexpr int PV_K_TILES     = KV_TILE / 16;           // 1
 
     extern __shared__ char smem_buf[];
     T* sQ    = reinterpret_cast<T*>(smem_buf);
@@ -82,18 +84,21 @@ flash_fwd_splitkv_mla_kernel_sm80(__grid_constant__ const DenseAttnDecodeParams 
     constexpr int Q_TOTAL_CHUNKS    = BLOCK_SIZE_M * CHUNKS_PER_ROW;     // 16 * 72 = 1152
     constexpr int Q_PER_TID_BASE    = Q_TOTAL_CHUNKS / NUM_THREADS;      // 4 for 256 thread
     constexpr int Q_REMAINDER       = Q_TOTAL_CHUNKS - Q_PER_TID_BASE * NUM_THREADS;  // 128
-    constexpr int K_TOTAL_CHUNKS    = PAGE_BLOCK_SIZE * CHUNKS_PER_ROW;  // 64 * 72 = 4608
-    constexpr int K_CHUNKS_PER_TID  = K_TOTAL_CHUNKS / NUM_THREADS;      // 18
+    constexpr int K_TOTAL_CHUNKS    = KV_TILE * CHUNKS_PER_ROW;          // 16 * 72 = 1152
+    constexpr int K_CHUNKS_PER_TID  = K_TOTAL_CHUNKS / NUM_THREADS;      // 9
     constexpr int ELEMS_PER_CHUNK   = CHUNK_BYTES / sizeof(T);           // 8
     static_assert(Q_BYTES_PER_ROW % CHUNK_BYTES == 0,                "Q row not 16B aligned");
     static_assert(K_TOTAL_CHUNKS % NUM_THREADS == 0,                 "K chunks not divisible");
 
     // ---- per-block-iter K load helper ----
-    auto issue_k_load = [&](int block_idx, int stage, const int* block_table_ptr) {
-        int kv_block_index = __ldg(block_table_ptr + block_idx);
+    auto issue_k_load = [&](int tile_idx, int stage, const int* block_table_ptr) {
+        const int page_idx    = tile_idx / TILES_PER_PAGE;
+        const int row_in_page = (tile_idx % TILES_PER_PAGE) * KV_TILE;
+        int kv_block_index = __ldg(block_table_ptr + page_idx);
         const T* gK_block = (const T*)params.k_ptr
             + (int64_t)kv_block_index * params.k_batch_stride
-            + k_head_idx * params.k_head_stride;
+            + k_head_idx * params.k_head_stride
+            + (int64_t)row_in_page * params.k_row_stride;
         T* sK_dst = sK[stage];
         #pragma unroll
         for (int i = 0; i < K_CHUNKS_PER_TID; ++i) {
@@ -118,6 +123,9 @@ flash_fwd_splitkv_mla_kernel_sm80(__grid_constant__ const DenseAttnDecodeParams 
         const int end_block_idx  = batch_idx == sched_meta.end_req_idx
                                     ? sched_meta.end_block_idx
                                     : (seqlen_k + PAGE_BLOCK_SIZE - 1) / PAGE_BLOCK_SIZE;
+        // The scheduler hands out page ranges; the pipeline runs on sub-tiles of those pages.
+        const int start_tile_idx = start_block_idx * TILES_PER_PAGE;
+        const int end_tile_idx   = end_block_idx * TILES_PER_PAGE;
 
         const T* gQ = (const T*)params.q_ptr
             + batch_idx  * params.q_batch_stride
@@ -190,9 +198,9 @@ flash_fwd_splitkv_mla_kernel_sm80(__grid_constant__ const DenseAttnDecodeParams 
         }
         cp_async_commit_group();
 
-        // ---- Prologue: issue first K block load (stage 0) ----
-        if (start_block_idx < end_block_idx) {
-            issue_k_load(start_block_idx, 0, block_table_ptr);
+        // ---- Prologue: issue the first K tile (stage 0) ----
+        if (start_tile_idx < end_tile_idx) {
+            issue_k_load(start_tile_idx, 0, block_table_ptr);
         }
         // Wait for both Q and the first K to finish before starting compute.
         cp_async_wait_all();
@@ -203,13 +211,16 @@ flash_fwd_splitkv_mla_kernel_sm80(__grid_constant__ const DenseAttnDecodeParams 
         // during the compute of iter i. wait_group<1> at iter start waits for
         // K_i to be ready, leaving K_{i+1} (if any) in flight.
         int stage = 0;
-        // Issue prefetch for block_idx + 1 if it exists, before entering the loop.
-        if (start_block_idx + 1 < end_block_idx) {
-            issue_k_load(start_block_idx + 1, 1, block_table_ptr);
+        // Fill the remaining stages before entering the loop.
+        #pragma unroll
+        for (int s = 1; s < SK_STAGES; ++s) {
+            if (start_tile_idx + s < end_tile_idx) {
+                issue_k_load(start_tile_idx + s, s, block_table_ptr);
+            }
         }
 
-        for (int block_idx = start_block_idx; block_idx < end_block_idx; ++block_idx) {
-            const int start_token = block_idx * PAGE_BLOCK_SIZE;
+        for (int block_idx = start_tile_idx; block_idx < end_tile_idx; ++block_idx) {
+            const int start_token = block_idx * KV_TILE;
             T* sK_cur = sK[stage];
 
             // === QK^T + softmax + rPb pack (rP fp32 inner scope to free regs before PV) ===
@@ -342,17 +353,24 @@ flash_fwd_splitkv_mla_kernel_sm80(__grid_constant__ const DenseAttnDecodeParams 
             // PV is done with sK_cur, so the *current* stage is now safe to overwrite.
             // We use it as the buffer for K_{i+2}, leaving sK[1-stage] (=K_{i+1}) intact.
             __syncthreads();
-            if (block_idx + 2 < end_block_idx) {
-                issue_k_load(block_idx + 2, stage, block_table_ptr);
+            if (block_idx + SK_STAGES < end_tile_idx) {
+                issue_k_load(block_idx + SK_STAGES, stage, block_table_ptr);
             }
-            // Swap stage: next iter will compute on the buffer we previously prefetched.
-            stage = 1 - stage;
+            // Advance to the buffer holding K_{i+1}.
+            stage = (stage + 1) % SK_STAGES;
 
-            // Wait for the *new* current stage (K_{i+1}) to be ready before next iter's compute.
-            // Because we always have at most 2 commit_groups in flight (one per stage), we wait
-            // for the older one to complete using wait_group<1>.
-            if (block_idx + 1 < end_block_idx) {
-                cp_async_wait_group<1>();
+            // Wait for K_{i+1}. `cp_async_wait_group<N>` returns immediately when fewer than
+            // N + 1 groups are pending, so the bound has to match what is actually in flight;
+            // near the end of the range no new loads are issued and a fixed bound would let
+            // the next iteration read a tile that has not landed.
+            const int remaining = end_tile_idx - 1 - block_idx;
+            if (remaining > 0) {
+                const int in_flight = min(remaining, SK_STAGES - 1);
+                if (in_flight >= 2) {
+                    cp_async_wait_group<1>();
+                } else {
+                    cp_async_wait_group<0>();
+                }
                 __syncthreads();
             }
         }
