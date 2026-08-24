@@ -86,7 +86,7 @@ get_mla_metadata_kernel(__grid_constant__ const GetDecodeSchedMetaParams params)
                 }
             }
             cur_meta.end_req_idx = now_block > 0 ? now_req_idx : now_req_idx - 1;
-            cur_meta.end_block_idx = now_block > 0 ? now_block : (seqlens_k_shared[now_req_idx-1] == 0 ? 0 : num_blocks_shared[now_req_idx-1];
+            cur_meta.end_block_idx = now_block > 0 ? now_block : (seqlens_k_shared[now_req_idx-1] == 0 ? 0 : num_blocks_shared[now_req_idx-1]);
             cur_meta.is_last_req_splitted = cur_meta.end_block_idx != num_blocks_shared[cur_meta.end_req_idx] && seqlens_k_shared[cur_meta.end_req_idx] != 0;
             if (cur_meta.begin_req_idx == cur_meta.end_req_idx) {
                 cur_meta.is_first_req_splitted = cur_meta.is_last_req_splitted = cur_meta.is_first_req_splitted || cur_meta.is_last_req_splitted;
