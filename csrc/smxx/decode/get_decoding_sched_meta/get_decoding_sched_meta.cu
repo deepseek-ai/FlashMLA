@@ -22,8 +22,6 @@ get_mla_metadata_kernel(__grid_constant__ const GetDecodeSchedMetaParams params)
     int* num_blocks_shared = shared_mem; // [batch_size]
     int* num_splits_shared = shared_mem + batch_size; // [batch_size+1]
     int* seqlens_k_shared = shared_mem + batch_size*2+1; // [batch_size]
-    int* first_block_idx_shared = shared_mem + batch_size*3+1; // [batch_size]
-    int* last_block_idx_shared = shared_mem + batch_size*4+1; // [batch_size]
 
     int total_num_blocks = 0;
     for (int i = threadIdx.x; i < batch_size; i += 32) {
@@ -50,8 +48,6 @@ get_mla_metadata_kernel(__grid_constant__ const GetDecodeSchedMetaParams params)
         int num_blocks = cur_last_block_idx - cur_first_block_idx + 1;
         total_num_blocks += num_blocks + fixed_overhead_num_blocks;
         num_blocks_shared[i] = num_blocks;
-        first_block_idx_shared[i] = cur_first_block_idx;
-        last_block_idx_shared[i] = cur_last_block_idx;
     }
     for (int offset = 16; offset >= 1; offset /= 2) {
         total_num_blocks += __shfl_xor_sync(uint32_t(-1), total_num_blocks, offset);
@@ -66,7 +62,7 @@ get_mla_metadata_kernel(__grid_constant__ const GetDecodeSchedMetaParams params)
         for (int i = 0; i < num_sm_parts; ++i) {
             DecodingSchedMeta cur_meta;
             cur_meta.begin_req_idx = now_req_idx;
-            cur_meta.begin_block_idx = now_block + first_block_idx_shared[now_req_idx];
+            cur_meta.begin_block_idx = now_block;
             cur_meta.begin_split_idx = now_n_split_idx;
             cur_meta.is_first_req_splitted = (now_block != 0);
             int remain_payload = payload;
@@ -90,8 +86,8 @@ get_mla_metadata_kernel(__grid_constant__ const GetDecodeSchedMetaParams params)
                 }
             }
             cur_meta.end_req_idx = now_block > 0 ? now_req_idx : now_req_idx - 1;
-            cur_meta.end_block_idx = now_block > 0 ? now_block + first_block_idx_shared[now_req_idx] : (seqlens_k_shared[now_req_idx-1] == 0 ? 0 : last_block_idx_shared[now_req_idx-1] + 1);
-            cur_meta.is_last_req_splitted = cur_meta.end_block_idx != last_block_idx_shared[cur_meta.end_req_idx] + 1 && seqlens_k_shared[cur_meta.end_req_idx] != 0;
+            cur_meta.end_block_idx = now_block > 0 ? now_block : (seqlens_k_shared[now_req_idx-1] == 0 ? 0 : num_blocks_shared[now_req_idx-1];
+            cur_meta.is_last_req_splitted = cur_meta.end_block_idx != num_blocks_shared[cur_meta.end_req_idx] && seqlens_k_shared[cur_meta.end_req_idx] != 0;
             if (cur_meta.begin_req_idx == cur_meta.end_req_idx) {
                 cur_meta.is_first_req_splitted = cur_meta.is_last_req_splitted = cur_meta.is_first_req_splitted || cur_meta.is_last_req_splitted;
             }
@@ -107,7 +103,7 @@ get_mla_metadata_kernel(__grid_constant__ const GetDecodeSchedMetaParams params)
 }
 
 void run_get_decoding_sched_meta_kernel(GetDecodeSchedMetaParams &params) {
-    int smem_size = sizeof(int) * (params.b*5+1);
+    int smem_size = sizeof(int) * (params.b*3+1);
     CHECK_CUDA(cudaFuncSetAttribute(get_mla_metadata_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
     get_mla_metadata_kernel<<<1, 32, smem_size, params.stream>>>(params);
     CHECK_CUDA_KERNEL_LAUNCH();
