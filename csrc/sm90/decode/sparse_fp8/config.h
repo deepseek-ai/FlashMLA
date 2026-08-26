@@ -268,7 +268,7 @@ static __forceinline__ __device__ void store_o(
 }
 
 
-template<typename TMAParams>
+template<bool DYNAMIC_TOPK, typename TMAParams>
 static __device__ __forceinline__ void
 devfunc(const SparseAttnDecodeParams &params, const TMAParams &tma_params);
 

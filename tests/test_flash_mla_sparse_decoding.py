@@ -26,7 +26,7 @@ def gen_testcase() -> List[RawTestParam]:
     for d_qk in [576, 512]:
         for have_extra_k in ([False, True] if d_qk == 512 else [False]):
             for have_extra_topk_len in ([False, True] if have_extra_k else [False]):
-                for have_topk_len in ([False, True] if d_qk == 512 else [False]):
+                for have_topk_len in [False, True]:
                     for h_q in [64, 128]:
                         cur_correctness_cases = [
                             RawTestParam(b, h_q, s_q, 1, s_k, is_varlen, topk,

@@ -84,7 +84,7 @@ __forceinline__ __device__ void scale_softmax(
 }
 
 template<ModelType MODEL_TYPE, int NUM_HEADS>
-template<typename TMAParams>
+template<bool DYNAMIC_TOPK, typename TMAParams>
 __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnDecodeParams &params, const TMAParams &tma_params) {
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 900)) || (defined(__CLION_IDE__) || defined(__VSCODE_IDE__))
     const int head_block_idx = NUM_M_BLOCKS == 1 ? 0 : blockIdx.x;
@@ -158,14 +158,23 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
         int start_block_idx, end_block_idx;
         bool is_no_split;
 
+        // Valid for MODEL1 and dynamic-top-k V3.2.
+        int topk_length;
+
         // The following fields are only valid for MODEL1
-        int topk_length, extra_topk_length, num_orig_kv_blocks;
+        int extra_topk_length, num_orig_kv_blocks;
     };
     auto get_cur_req_info = [&](int batch_idx) -> MainloopArgs {
         MainloopArgs args;
         int total_topk_padded;
         if constexpr (MODEL_TYPE == ModelType::V32) {
-            total_topk_padded = params.topk;
+            if constexpr (DYNAMIC_TOPK) {
+                int topk_length = __ldg(params.topk_length + batch_idx);
+                total_topk_padded = max(ku::ceil(topk_length, (int)TOPK_BLOCK_SIZE), (int)TOPK_BLOCK_SIZE);
+                args.topk_length = topk_length;
+            } else {
+                total_topk_padded = params.topk;
+            }
         } else {
             int topk_length = params.topk_length ? __ldg(params.topk_length + batch_idx) : params.topk;
             int orig_topk_padded = max(ku::ceil(topk_length, (int)TOPK_BLOCK_SIZE), (int)TOPK_BLOCK_SIZE);
@@ -528,8 +537,7 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                             nxt_token_indexs[round] = __ldg(gExtraIndices + (block_idx+1-args.num_orig_kv_blocks)*TOPK_BLOCK_SIZE + idx_in_cluster*(TOPK_BLOCK_SIZE/2) + my_token_idx);
                     }
                     
-                    if constexpr (MODEL_TYPE == ModelType::MODEL1) {
-                        // For MODEL1, we need to check whether the token_index is within topk_length
+                    if constexpr (MODEL_TYPE == ModelType::MODEL1 || DYNAMIC_TOPK) {
                         if (rel_block_idx*TOPK_BLOCK_SIZE + idx_in_cluster*(TOPK_BLOCK_SIZE/2) + my_token_idx >= topk_length) {
                             token_index = -1;   // To prevent IMA when we have invalid (e.g. INT_MAX) topk indexes outside topk_length
                         }
@@ -628,7 +636,7 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                 if (idx_in_warpgroup < 32) {
                     // We put this after fence_view_async_shared() since this won't be read by async proxy
                     auto is_index_valid = [&](int index, int offset_within_thread) -> bool {
-                        if constexpr (MODEL_TYPE == ModelType::V32) {
+                        if constexpr (MODEL_TYPE == ModelType::V32 && !DYNAMIC_TOPK) {
                             return index != -1;
                         } else {
                             return index != -1 && rel_block_idx*TOPK_BLOCK_SIZE + lane_idx*2 + offset_within_thread < topk_length;
@@ -677,10 +685,10 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
 
 }
 
-template<typename Kernel, typename TMAParams>
+template<bool DYNAMIC_TOPK, typename Kernel, typename TMAParams>
 __global__ void __launch_bounds__(Kernel::NUM_THREADS, 1, Kernel::CLUSTER_SIZE)
 flash_fwd_splitkv_mla_fp8_sparse_kernel(__grid_constant__ const SparseAttnDecodeParams params, __grid_constant__ const TMAParams tma_params) {
-    Kernel::devfunc(params, tma_params);
+    Kernel::template devfunc<DYNAMIC_TOPK>(params, tma_params);
 }
 
 template<ModelType MODEL_TYPE, int NUM_HEADS>
@@ -698,7 +706,6 @@ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::run(const SparseAttnDecodeParams &pa
         }
     } else {
         KU_ASSERT(params.extra_kv == nullptr, "V3.2 does not support extra KV cache");
-        KU_ASSERT(params.topk_length == nullptr, "V3.2 does not support dynamic topk length");
         KU_ASSERT(params.stride_kv_row == 656);  // number of bytes per token (512 fp8 + 4 float32 + 64 bfloat16)
     }
 
@@ -748,7 +755,18 @@ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::run(const SparseAttnDecodeParams &pa
         shape_Q, tma_Q,
         tensor_map_o
     };
-    auto mla_kernel = &flash_fwd_splitkv_mla_fp8_sparse_kernel<KernelTemplate<MODEL_TYPE, NUM_HEADS>, decltype(tma_params)>;
+    using Kernel = KernelTemplate<MODEL_TYPE, NUM_HEADS>;
+    using MlaKernelPtr = decltype(&flash_fwd_splitkv_mla_fp8_sparse_kernel<true, Kernel, decltype(tma_params)>);
+    MlaKernelPtr mla_kernel;
+    if constexpr (MODEL_TYPE == ModelType::V32) {
+        if (params.topk_length != nullptr) {
+            mla_kernel = &flash_fwd_splitkv_mla_fp8_sparse_kernel<true, Kernel, decltype(tma_params)>;
+        } else {
+            mla_kernel = &flash_fwd_splitkv_mla_fp8_sparse_kernel<false, Kernel, decltype(tma_params)>;
+        }
+    } else {
+        mla_kernel = &flash_fwd_splitkv_mla_fp8_sparse_kernel<true, Kernel, decltype(tma_params)>;
+    }
 
     constexpr size_t smem_size = sizeof(SharedMemoryPlan);
     KU_CUDA_CHECK(cudaFuncSetAttribute(mla_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
