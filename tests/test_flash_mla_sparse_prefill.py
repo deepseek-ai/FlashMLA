@@ -24,7 +24,7 @@ def run_test(p: TestParam) -> bool:
     torch.cuda.synchronize()
     
     def run_prefill():
-        return lib.run_flash_mla_sparse_fwd(p, t, False)
+        return lib.run_flash_mla_sparse_fwd(p, t)
     
     prefill_ans_out, prefill_ans_max_logits, prefill_ans_lse = run_prefill()
     torch.cuda.synchronize()
@@ -105,7 +105,6 @@ if __name__ == '__main__':
             (114, 384),
         ]
         for s_q in [62, 213]
-        for have_sink_lse in [False, True]
         for have_attn_sink in [False, True]
         for have_topk_length in [False, True]
     ]
@@ -146,9 +145,9 @@ if __name__ == '__main__':
     performance_case_templates = [
         # V3.2
         (576, 128, 2048, [8192, 32768, 65536, 98304, 131072]),
-        # MODEL1 CONFIG1
+        # DeepSeek-V4 CONFIG1
         (512, 64, 512, [8192, 32768, 49152, 65536]),
-        # MODEL1 CONFIG2
+        # DeepSeek-V4 CONFIG2
         (512, 128, 1024, [8192, 32768, 49152, 65536]),
     ]
 

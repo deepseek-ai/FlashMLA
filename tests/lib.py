@@ -4,6 +4,7 @@ import enum
 from typing import List, Optional
 import random
 
+import argparse
 import torch
 import kernelkit as kk
 import flash_mla
@@ -24,7 +25,9 @@ class ExtraTestParamForDecode:
     block_size: int = 64
     extra_block_size: Optional[int] = None
     have_extra_topk_length: bool = False
-    
+    kvcache_layout: Optional["quant.KVCacheLayout"] = None          # Must be specified for d_qk == 512 to distinguish V4 / V41 / V41_FP4
+    extra_kvcache_layout: Optional["quant.KVCacheLayout"] = None    # None: same as kvcache_layout
+
 @dataclasses.dataclass
 class TestParam:
     s_q: int
@@ -41,6 +44,8 @@ class TestParam:
     have_attn_sink: bool = False
     have_topk_length: bool = False
     decode: Optional[ExtraTestParamForDecode] = None
+    k_amplifier_portion: float = 0.0        # Amplify a portion of the KV tokens to create a more skewed attention distribution
+    k_amplifier_ratio: float = 1.0          # Amplification ratio for the amplified KV tokens
 
 @dataclasses.dataclass
 class RawTestParamForDecode:
@@ -65,6 +70,8 @@ class RawTestParamForDecode:
     block_size: int = 64
     extra_block_size: Optional[int] = None
     have_extra_topk_length: bool = False
+    kvcache_layout: Optional["quant.KVCacheLayout"] = None
+    extra_kvcache_layout: Optional["quant.KVCacheLayout"] = None
     d_qk: int = 576      # Q/K head dim (= dv + RoPE dim)
     d_v: int = 512     # V head dim
     check_correctness: bool = True
@@ -82,7 +89,8 @@ class RawTestParamForDecode:
             decode = ExtraTestParamForDecode(
                 self.b, self.is_varlen, self.have_zero_seqlen_k,
                 self.extra_s_k, self.extra_topk,
-                self.block_size, self.extra_block_size, self.have_extra_topk_length
+                self.block_size, self.extra_block_size, self.have_extra_topk_length,
+                self.kvcache_layout, self.extra_kvcache_layout
             )
         )
     
@@ -147,6 +155,11 @@ def generate_testcase(t: TestParam) -> Testcase:
     if t.have_topk_length:
         topk_length = torch.randint(0, max(t.topk + 1, 64), (t.s_q, ), dtype=torch.int32, device=q.device).clamp_max(t.topk)
 
+    if t.k_amplifier_portion > 0.0:
+        selected_indices = torch.randint(0, t.s_kv, (int(t.s_kv * t.k_amplifier_portion), ), device=kv.device)
+        amplifier_coeffs = torch.rand((selected_indices.size(0), ), device=kv.device) * (t.k_amplifier_ratio - 1) + 1
+        kv[selected_indices] *= amplifier_coeffs.unsqueeze(-1).unsqueeze(-1)
+
     q = kk.non_contiguousify(q)
     kv = kk.non_contiguousify(kv)
     do = kk.non_contiguousify(do)
@@ -173,6 +186,7 @@ class KVScope:
     abs_indices: torch.Tensor
     indices_in_kvcache: torch.Tensor
     topk_length: Optional[torch.Tensor]
+    kvcache_layout: Optional["quant.KVCacheLayout"] = None
     blocked_k_quantized: Optional[torch.Tensor] = None
 
     def quant_and_dequant_(self):
@@ -180,16 +194,18 @@ class KVScope:
         For FP8 cases, we need to quantize the KV cache for Flash MLA.
         Besides, the quantization error may be too large to be distinguished from wrong kernels, so we de-quantize kvcache here to mitigate quantization error
         """
-        fp8_kvcache_layout = None
-        if self.t.d_qk == 576:
-            fp8_kvcache_layout = quant.FP8KVCacheLayout.V32_FP8Sparse
-        elif self.t.d_qk == 512:
-            assert self.abs_indices is not None
-            fp8_kvcache_layout = quant.FP8KVCacheLayout.MODEL1_FP8Sparse
-        else:
-            assert False
-        self.blocked_k_quantized = quant.quantize_k_cache(self.blocked_k, fp8_kvcache_layout)
-        blocked_k_dequantized = quant.dequantize_k_cache(self.blocked_k_quantized, fp8_kvcache_layout)
+        kvcache_layout = self.kvcache_layout
+        if kvcache_layout is None:
+            if self.t.d_qk == 576:
+                kvcache_layout = quant.KVCacheLayout.V32_FP8Sparse
+            elif self.t.d_qk == 512:
+                assert self.abs_indices is not None
+                kvcache_layout = quant.KVCacheLayout.V4_FP8Sparse
+            else:
+                assert False
+            self.kvcache_layout = kvcache_layout
+        self.blocked_k_quantized = quant.quantize_k_cache(self.blocked_k, kvcache_layout)
+        blocked_k_dequantized = quant.dequantize_k_cache(self.blocked_k_quantized, kvcache_layout)
         self.blocked_k = blocked_k_dequantized
 
     def get_kvcache_for_flash_mla(self) -> torch.Tensor:
@@ -211,6 +227,7 @@ class KVScope:
             self.abs_indices[perm],
             self.indices_in_kvcache[perm],
             self.topk_length[perm] if self.topk_length is not None else None,
+            self.kvcache_layout,
             self.blocked_k_quantized
         )
         return new_kvscope
@@ -239,7 +256,7 @@ def generate_testcase_for_decode(t: TestParam) -> TestcaseForDecode:
         attn_sink[inf_mask > 0.5] = float("inf")
         attn_sink[inf_mask < -0.5] = float("-inf")
 
-    def generate_one_k_scope(s_k: int, block_size: int, topk: int, is_varlen: bool, have_zero_seqlen: bool, is_all_indices_invalid: bool, have_topk_length: bool) -> KVScope:
+    def generate_one_k_scope(s_k: int, block_size: int, topk: int, is_varlen: bool, have_zero_seqlen: bool, is_all_indices_invalid: bool, have_topk_length: bool, kvcache_layout: Optional[quant.KVCacheLayout] = None) -> KVScope:
         b = t.decode.b  # type: ignore
         cache_seqlens_cpu = torch.full((b,), s_k, dtype=torch.int32, device='cpu')
         if is_varlen:
@@ -286,16 +303,17 @@ def generate_testcase_for_decode(t: TestParam) -> TestcaseForDecode:
         block_table = kk.non_contiguousify(block_table)
         abs_indices = kk.non_contiguousify(abs_indices)
         indices_in_kvcache = kk.non_contiguousify(indices_in_kvcache)
-        return KVScope(t, cache_seqlens, block_table, blocked_k, abs_indices, indices_in_kvcache, topk_length)
+        return KVScope(t, cache_seqlens, block_table, blocked_k, abs_indices, indices_in_kvcache, topk_length, kvcache_layout)
 
-    kv_scope0 = generate_one_k_scope(t.s_kv, t.decode.block_size, t.topk, t.decode.is_varlen, t.decode.have_zero_seqlen_k, t.is_all_indices_invalid, t.have_topk_length)
+    kv_scope0 = generate_one_k_scope(t.s_kv, t.decode.block_size, t.topk, t.decode.is_varlen, t.decode.have_zero_seqlen_k, t.is_all_indices_invalid, t.have_topk_length, t.decode.kvcache_layout)
     kv_scope0.quant_and_dequant_()
     if t.decode.extra_topk is not None:
         if t.decode.extra_s_k is None:
             t.decode.extra_s_k = t.decode.extra_topk*2
         if t.decode.extra_block_size is None:
             t.decode.extra_block_size = t.decode.block_size
-        kv_scope1 = generate_one_k_scope(t.decode.extra_s_k, t.decode.extra_block_size, t.decode.extra_topk, t.decode.is_varlen, t.decode.have_zero_seqlen_k, t.is_all_indices_invalid, t.decode.have_extra_topk_length)
+        extra_layout = t.decode.extra_kvcache_layout if t.decode.extra_kvcache_layout is not None else t.decode.kvcache_layout
+        kv_scope1 = generate_one_k_scope(t.decode.extra_s_k, t.decode.extra_block_size, t.decode.extra_topk, t.decode.is_varlen, t.decode.have_zero_seqlen_k, t.is_all_indices_invalid, t.decode.have_extra_topk_length, extra_layout)
         kv_scope1.quant_and_dequant_()
     else:
         assert t.decode.extra_block_size is None and t.decode.extra_s_k is None and not t.decode.have_extra_topk_length
@@ -307,8 +325,7 @@ def generate_testcase_for_decode(t: TestParam) -> TestcaseForDecode:
     return TestcaseForDecode(t, q, attn_sink, sm_scale, kv_scope0, kv_scope1)
 
 
-def run_flash_mla_sparse_fwd(p: TestParam, t: Testcase, return_p_sum: bool):
-    assert not return_p_sum
+def run_flash_mla_sparse_fwd(p: TestParam, t: Testcase):
     return flash_mla.flash_mla_sparse_fwd(
         t.q, t.kv, t.indices,
         sm_scale=t.sm_scale,
@@ -341,6 +358,7 @@ class FlopsAndMemVolStatistics:
     """
     fwd_flop: float
     fwd_mem_vol: float
+    fwd_prefill_with_fp8_out_mem_vol: float = 0.0   # Like `fwd_mem_vol`, but with the output stored as FP8 instead of bf16
 
 def count_flop_and_mem_vol(p: TestParam, t: Testcase) -> FlopsAndMemVolStatistics:
     total_topk = (p.s_q*p.topk) if t.topk_length is None else t.topk_length.sum().item()
@@ -354,6 +372,7 @@ def count_flop_and_mem_vol(p: TestParam, t: Testcase) -> FlopsAndMemVolStatistic
     return FlopsAndMemVolStatistics(
         fwd_flop,
         fwd_mem_vol,
+        fwd_mem_vol - p.s_q*p.h_q*p.d_v,    # The FP8 output only stores d_v bytes per element (and no separate SF traffic is counted)
     )
 
 @dataclasses.dataclass
@@ -403,3 +422,7 @@ def count_flop_and_mem_vol_for_decode(p: TestParam, t: TestcaseForDecode) -> Flo
 
 def is_no_cooldown() -> bool:
     return os.environ.get('NO_COOLDOWN', '').lower() in ['1', 'yes', 'y']
+
+def stick_unit_test_args(parser: argparse.ArgumentParser):
+    parser.add_argument("-nc", "--no-cooldown", action="store_true", help="Don't call time.sleep() before performance testcases")
+    parser.add_argument("-rf", "--run-to-finish", action="store_true", help="Don't exit when a testcase is failed")

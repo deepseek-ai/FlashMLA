@@ -12,6 +12,7 @@ import kernelkit as kk
 import flash_mla
 
 import lib
+import quant
 from lib import TestParam
 from lib import RawTestParamForDecode as RawTestParam
 import ref
@@ -21,6 +22,8 @@ Generate testcase for unit test
 """
 
 def gen_testcase() -> List[RawTestParam]:
+    # The DeepSeek-V4.1 KV cache formats (V41 / V41_FP4) are only supported on SM100f
+    supports_v41 = torch.cuda.get_device_capability()[0] >= 10
     correctness_cases = []
     corner_cases = []
     for d_qk in [576, 512]:
@@ -99,18 +102,53 @@ def gen_testcase() -> List[RawTestParam]:
                         ]
                         corner_cases.extend(cur_corner_cases)
 
+    # DeepSeek-V4.1: fp8 (V41) KV cache, optionally with an fp4 (V41_FP4) extra KV cache
+    if supports_v41:
+        for extra_fp4 in [False, True]:
+            correctness_cases.extend([
+                RawTestParam(b, h_q, s_q, 1, s_k, is_varlen, topk,
+                             have_topk_length=have_topk_len,
+                             enable_attn_sink=True,
+                             extra_s_k=extra_s_k,
+                             extra_topk=extra_topk,
+                             block_size=block_size,
+                             extra_block_size=extra_block_size,
+                             have_extra_topk_length=have_extra_topk_len,
+                             d_qk=512,
+                             kvcache_layout=quant.KVCacheLayout.V41_FP8Sparse,
+                             extra_kvcache_layout=quant.KVCacheLayout.V41_FP4 if extra_fp4 else None,
+                             check_correctness=True,
+                             num_runs=0)
+                for h_q in [64, 128]
+                for have_extra_topk_len in [False, True]
+                for have_topk_len in [False]
+                for (s_k, topk, block_size) in [(512, 64, 64), (1024, 576, 61)]
+                for (extra_s_k, extra_topk, extra_block_size) in [(512, 64, 64), (650, 576, 53)]
+                for b in [4]
+                for s_q in [1, 3]
+                for is_varlen in [True]
+            ])
+
     base_and_bszs = [
         # V3.2
         (RawTestParam(0, 128, 2, 1, 32768, True, topk=2048, d_qk=576), [2, 64, 74, 128]),
-        # MODEL1 CONFIG1
+        # DeepSeek-V4 CONFIG1
         (RawTestParam(0, 64, 2, 1, 16384, True, topk=128, d_qk=512, extra_s_k=16384, extra_topk=512, block_size=256, extra_block_size=64), [2, 64, 74, 128, 74*2, 256]),
-        # MODEL1 CONFIG2
+        # DeepSeek-V4 CONFIG2
         (RawTestParam(0, 128, 2, 1, 16384, True, topk=128, d_qk=512, extra_s_k=16384, extra_topk=1024, block_size=256, extra_block_size=64), [2, 64, 74, 128, 74*2, 256]),
-        # MODEL1 CONFIG3
+        # DeepSeek-V4 CONFIG3
         (RawTestParam(0, 64, 2, 1, 16384, True, topk=128, d_qk=512, extra_s_k=16384, extra_topk=1024, block_size=256, extra_block_size=2, have_extra_topk_length=True), [2, 64, 74, 128, 74*2, 256]),
-        # MODEL1 CONFIG4
+        # DeepSeek-V4 CONFIG4
         (RawTestParam(0, 128, 2, 1, 16384, True, topk=128, d_qk=512, extra_s_k=16384, extra_topk=1024, block_size=256, extra_block_size=2, have_extra_topk_length=True), [2, 64, 74, 128, 74*2, 256]),
     ]
+    if supports_v41:
+        base_and_bszs += [
+            # DeepSeek-V4.1 CONFIG1 (fp8 V41 KV cache + fp4 V41_FP4 extra KV cache)
+            (RawTestParam(0, 64, 2, 1, 16384, True, topk=128, d_qk=512, extra_s_k=16384, extra_topk=512, block_size=256, extra_block_size=64,
+                          kvcache_layout=quant.KVCacheLayout.V41_FP8Sparse, extra_kvcache_layout=quant.KVCacheLayout.V41_FP4), [2, 64, 74, 128, 74*2, 256]),
+            (RawTestParam(0, 128, 2, 1, 16384, True, topk=128, d_qk=512, extra_s_k=16384, extra_topk=512, block_size=256, extra_block_size=64,
+                          kvcache_layout=quant.KVCacheLayout.V41_FP8Sparse, extra_kvcache_layout=quant.KVCacheLayout.V41_FP4), [2, 64, 74, 128, 74*2, 256])
+        ]
     performance_cases = [
         # Production cases
         dataclasses.replace(base, b=b)

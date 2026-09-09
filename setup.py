@@ -40,7 +40,9 @@ def get_arch_flags():
 
     arch_flags = []
     if not DISABLE_SM100:
-        arch_flags.extend(["-gencode", "arch=compute_100f,code=sm_100f"])
+        # We use architecture-specific (sm_100a / sm_103a) targets instead of the family-specific one (sm_100f) for better SASS code generation
+        arch_flags.extend(["-gencode", "arch=compute_100a,code=sm_100a"])
+        arch_flags.extend(["-gencode", "arch=compute_103a,code=sm_103a"])
     if not DISABLE_SM90:
         arch_flags.extend(["-gencode", "arch=compute_90a,code=sm_90a"])
     return arch_flags
@@ -65,43 +67,79 @@ ext_modules.append(
         sources=[
             # API
             "csrc/api/api.cpp",
+            "csrc/api/sparse_prefill.cpp",
+            "csrc/api/sparse_decode.cpp",
+            "csrc/api/dense_fwd.cpp",
+            "csrc/api/dense_bwd.cpp",
+            "csrc/api/dense_decode.cpp",
+            "csrc/api/fused_norm_rope_attn_rope_cast_fwd.cpp",
 
             # Misc kernels for decoding
-            "csrc/smxx/decode/get_decoding_sched_meta/get_decoding_sched_meta.cu",
-            "csrc/smxx/decode/combine/combine.cu",
+            "csrc/kernels/smxx/decode/get_decoding_sched_meta/get_decoding_sched_meta.cu",
+            "csrc/kernels/smxx/decode/combine/combine.cu",
 
             # sm90 dense decode
-            "csrc/sm90/decode/dense/instantiations/fp16.cu",
-            "csrc/sm90/decode/dense/instantiations/bf16.cu",
+            "csrc/kernels/sm90/decode/dense/instantiations/fp16.cu",
+            "csrc/kernels/sm90/decode/dense/instantiations/bf16.cu",
 
             # sm90 sparse decode
-            "csrc/sm90/decode/sparse_fp8/instantiations/model1_persistent_h64.cu",
-            "csrc/sm90/decode/sparse_fp8/instantiations/model1_persistent_h128.cu",
-            "csrc/sm90/decode/sparse_fp8/instantiations/v32_persistent_h64.cu",
-            "csrc/sm90/decode/sparse_fp8/instantiations/v32_persistent_h128.cu",
+            "csrc/kernels/sm90/decode/sparse/instantiations/v4_persistent_h64.cu",
+            "csrc/kernels/sm90/decode/sparse/instantiations/v4_persistent_h128.cu",
+            "csrc/kernels/sm90/decode/sparse/instantiations/v32_persistent_h64.cu",
+            "csrc/kernels/sm90/decode/sparse/instantiations/v32_persistent_h128.cu",
 
             # sm90 sparse prefill
-            "csrc/sm90/prefill/sparse/fwd.cu",
-            "csrc/sm90/prefill/sparse/instantiations/phase1_k512.cu",
-            "csrc/sm90/prefill/sparse/instantiations/phase1_k512_topklen.cu",
-            "csrc/sm90/prefill/sparse/instantiations/phase1_k576.cu",
-            "csrc/sm90/prefill/sparse/instantiations/phase1_k576_topklen.cu",
+            "csrc/kernels/sm90/prefill/sparse/instantiations/phase1_k512.cu",
+            "csrc/kernels/sm90/prefill/sparse/instantiations/phase1_k512_topklen.cu",
+            "csrc/kernels/sm90/prefill/sparse/instantiations/phase1_k576.cu",
+            "csrc/kernels/sm90/prefill/sparse/instantiations/phase1_k576_topklen.cu",
 
             # sm100 dense prefill & backward
-            "csrc/sm100/prefill/dense/fmha_cutlass_fwd_sm100.cu",
-            "csrc/sm100/prefill/dense/fmha_cutlass_bwd_sm100.cu",
+            "csrc/kernels/sm100/prefill/dense/fmha_cutlass_fwd_sm100.cu",
+            "csrc/kernels/sm100/prefill/dense/fmha_cutlass_bwd_sm100.cu",
 
             # sm100 sparse prefill
-            "csrc/sm100/prefill/sparse/fwd/head64/instantiations/phase1_k512.cu",
-            "csrc/sm100/prefill/sparse/fwd/head64/instantiations/phase1_k576.cu",
-            "csrc/sm100/prefill/sparse/fwd/head128/instantiations/phase1_k512.cu",
-            "csrc/sm100/prefill/sparse/fwd/head128/instantiations/phase1_k576.cu",
-            "csrc/sm100/prefill/sparse/fwd_for_small_topk/head128/instantiations/phase1_prefill_k512.cu",
+            "csrc/kernels/sm100/prefill/sparse/fwd/head64/instantiations/phase1_h64_k512.cu",
+            "csrc/kernels/sm100/prefill/sparse/fwd/head64/instantiations/phase1_h64_k576.cu",
+            "csrc/kernels/sm100/prefill/sparse/fwd/head128/instantiations/phase1_k512.cu",
+            "csrc/kernels/sm100/prefill/sparse/fwd/head128/instantiations/phase1_k576.cu",
+            "csrc/kernels/sm100/prefill/sparse/fwd_for_small_topk/head128/instantiations/phase1_k512.cu",
+
+            # sm100 fused norm + rope + attn + rope + cast
+            "csrc/kernels/sm100/prefill/sparse/fused_norm_rope_attn_rope_cast_fwd/core_attn/instantiations/v4_h64_prefill_norm.cu",
+            "csrc/kernels/sm100/prefill/sparse/fused_norm_rope_attn_rope_cast_fwd/core_attn/instantiations/v4_h64_prefill_nonorm.cu",
+            "csrc/kernels/sm100/prefill/sparse/fused_norm_rope_attn_rope_cast_fwd/core_attn/instantiations/v4_h128_prefill_norm.cu",
+            "csrc/kernels/sm100/prefill/sparse/fused_norm_rope_attn_rope_cast_fwd/core_attn/instantiations/v4_h128_prefill_nonorm.cu",
+            "csrc/kernels/sm100/prefill/sparse/fused_norm_rope_attn_rope_cast_fwd/core_attn/instantiations/v4_h64_decode_norm.cu",
+            "csrc/kernels/sm100/prefill/sparse/fused_norm_rope_attn_rope_cast_fwd/core_attn/instantiations/v4_h64_decode_nonorm.cu",
+            "csrc/kernels/sm100/prefill/sparse/fused_norm_rope_attn_rope_cast_fwd/core_attn/instantiations/v4_h128_decode_norm.cu",
+            "csrc/kernels/sm100/prefill/sparse/fused_norm_rope_attn_rope_cast_fwd/core_attn/instantiations/v4_h128_decode_nonorm.cu",
+            "csrc/kernels/sm100/prefill/sparse/fused_norm_rope_attn_rope_cast_fwd/core_attn/instantiations/v41_h64_decode_norm.cu",
+            "csrc/kernels/sm100/prefill/sparse/fused_norm_rope_attn_rope_cast_fwd/core_attn/instantiations/v41_h64_decode_nonorm.cu",
+            "csrc/kernels/sm100/prefill/sparse/fused_norm_rope_attn_rope_cast_fwd/core_attn/instantiations/v41_h128_decode_norm.cu",
+            "csrc/kernels/sm100/prefill/sparse/fused_norm_rope_attn_rope_cast_fwd/core_attn/instantiations/v41_h128_decode_nonorm.cu",
+            "csrc/kernels/sm100/prefill/sparse/fused_norm_rope_attn_rope_cast_fwd/core_attn/instantiations/v41fp4_h64_decode_norm.cu",
+            "csrc/kernels/sm100/prefill/sparse/fused_norm_rope_attn_rope_cast_fwd/core_attn/instantiations/v41fp4_h64_decode_nonorm.cu",
+            "csrc/kernels/sm100/prefill/sparse/fused_norm_rope_attn_rope_cast_fwd/core_attn/instantiations/v41fp4_h128_decode_norm.cu",
+            "csrc/kernels/sm100/prefill/sparse/fused_norm_rope_attn_rope_cast_fwd/core_attn/instantiations/v41fp4_h128_decode_nonorm.cu",
+            "csrc/kernels/sm100/prefill/sparse/fused_norm_rope_attn_rope_cast_fwd/permute_q_b_proj/kernel.cu",
+            "csrc/kernels/sm100/prefill/sparse/fused_norm_rope_attn_rope_cast_fwd/permute_wv_proj/kernel.cu",
 
             # sm100 sparse decode
-            "csrc/sm100/decode/head64/instantiations/v32.cu",
-            "csrc/sm100/decode/head64/instantiations/model1.cu",
-            "csrc/sm100/prefill/sparse/fwd_for_small_topk/head128/instantiations/phase1_decode_k512.cu",
+            "csrc/kernels/sm100/decode/sparse/head64/instantiations/v32_h64.cu",
+            "csrc/kernels/sm100/decode/sparse/head64/instantiations/v32_h64_no_split.cu",
+            "csrc/kernels/sm100/decode/sparse/head64/instantiations/v4_h64.cu",
+            "csrc/kernels/sm100/decode/sparse/head64/instantiations/v4_h64_no_split.cu",
+            "csrc/kernels/sm100/decode/sparse/head64/instantiations/v41_h64.cu",
+            "csrc/kernels/sm100/decode/sparse/head64/instantiations/v41_h64_no_split.cu",
+            "csrc/kernels/sm100/decode/sparse/head64/instantiations/v41fp4_h64.cu",
+            "csrc/kernels/sm100/decode/sparse/head64/instantiations/v41fp4_h64_no_split.cu",
+            "csrc/kernels/sm100/prefill/sparse/fwd_for_small_topk/head128/instantiations/phase1_decode_k512.cu",
+            "csrc/kernels/sm100/prefill/sparse/fwd_for_small_topk/head128/instantiations/phase1_decode_k512_splitkv.cu",
+            "csrc/kernels/sm100/prefill/sparse/fwd_for_small_topk/head128/instantiations/phase1_decode_k512_v41.cu",
+            "csrc/kernels/sm100/prefill/sparse/fwd_for_small_topk/head128/instantiations/phase1_decode_k512_v41_splitkv.cu",
+            "csrc/kernels/sm100/prefill/sparse/fwd_for_small_topk/head128/instantiations/phase1_decode_k512_v41fp4.cu",
+            "csrc/kernels/sm100/prefill/sparse/fwd_for_small_topk/head128/instantiations/phase1_decode_k512_v41fp4_splitkv.cu",
         ],
         extra_compile_args={
             "cxx": cxx_args + get_features_args(),
@@ -125,10 +163,11 @@ ext_modules.append(
         },
         include_dirs=[
             Path(this_dir) / "csrc",
-            Path(this_dir) / "csrc" / "kerutils" / "include",   # TODO Remove me
-            Path(this_dir) / "csrc" / "sm90",
+            Path(this_dir) / "csrc" / "kerutils" / "include",
             Path(this_dir) / "csrc" / "cutlass" / "include",
             Path(this_dir) / "csrc" / "cutlass" / "tools" / "util" / "include",
+            Path(CUDA_HOME) / "targets" / "x86_64-linux" / "include" / "cccl",   # for cuda/std headers in CUDA 13+
+            Path(CUDA_HOME) / "targets" / "sbsa-linux" / "include" / "cccl",
         ],
     )
 )

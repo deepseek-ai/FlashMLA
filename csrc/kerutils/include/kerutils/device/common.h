@@ -61,10 +61,15 @@ static_assert(false, "kerutils doesn't support SM architectures below SM80");
 #define KERUTILS_ENABLE_SM100A
 #endif
 
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1030 && __CUDA_ARCH__ < 1200))
+#define KERUTILS_ENABLE_SM103A
+#endif
+
 #if (defined(__CLION_IDE__) || defined(__VSCODE_IDE__))
 #define KERUTILS_ENABLE_SM80
 #define KERUTILS_ENABLE_SM90
 #define KERUTILS_ENABLE_SM90A
 #define KERUTILS_ENABLE_SM100
 #define KERUTILS_ENABLE_SM100A
+#define KERUTILS_ENABLE_SM103A
 #endif

@@ -1,14 +1,13 @@
 #pragma once
 
+#include <cstdio>
 #include <exception>
 #include <string>
 #include <sstream>
 #include <vector>
 
 #include <cuda_runtime_api.h>
-#include <cuda.h>
-
-#include <cutlass/cuda_host_adapter.hpp>
+#include <cudaTypedefs.h>
 
 #include "kerutils/common/common.h"
 
@@ -35,35 +34,42 @@ public:
 #define THROW_KU_EXCEPTION(name, ...) \
     throw kerutils::KUException(name, __FILE__, __LINE__, __VA_ARGS__)
 
-#define KU_CUDA_CHECK(call)                                                                                  \
-do {                                                                                                  \
-    cudaError_t status_ = call;                                                                       \
-    if (status_ != cudaSuccess) {                                                                     \
-        fprintf(stderr, "CUDA error (%s:%d): %s\n", __FILE__, __LINE__, cudaGetErrorString(status_)); \
-        THROW_KU_EXCEPTION("CUDA", "CUDA error: ", cudaGetErrorString(status_));                       \
-    }                                                                                                 \
+#define KU_CUDA_CHECK(call)                                                                                   \
+do {                                                                                                          \
+    cudaError_t status_ = (call);                                                                             \
+    if (status_ != cudaSuccess) {                                                                             \
+        char _ku_buf[1024];                                                                                   \
+        snprintf(_ku_buf, sizeof(_ku_buf), "CUDA error (%s:%d): %s", __FILE__, __LINE__, cudaGetErrorString(status_)); \
+        fprintf(stderr, "%s\n", _ku_buf);                                                                    \
+        THROW_KU_EXCEPTION("CUDA", _ku_buf);                                                                  \
+    }                                                                                                         \
 } while(0)
 
-#define KU_CUTLASS_CHECK(call) \
-do {                                                                                                  \
-    cutlass::Status status_ = call;                                                                   \
-    if (status_ != cutlass::Status::kSuccess) {                                                      \
-        fprintf(stderr, "CUTLASS error (%s:%d): %d\n", __FILE__, __LINE__, static_cast<int>(status_)); \
-        THROW_KU_EXCEPTION("CUTLASS", "CUTLASS error: ", static_cast<int>(status_));                 \
-    }                                                                                                 \
+#define KU_CUTLASS_CHECK(call)                                                                                   \
+do {                                                                                                             \
+    cutlass::Status status_ = (call);                                                                            \
+    if (status_ != cutlass::Status::kSuccess) {                                                                 \
+        char _ku_buf[1024];                                                                                      \
+        snprintf(_ku_buf, sizeof(_ku_buf), "CUTLASS error (%s:%d): %d", __FILE__, __LINE__, static_cast<int>(status_)); \
+        fprintf(stderr, "%s\n", _ku_buf);                                                                       \
+        THROW_KU_EXCEPTION("CUTLASS", _ku_buf);                                                                 \
+    }                                                                                                            \
 } while(0)
 
 // This `KU_ASSERT` is triggered no matter if the code is compiled with `-DNDEBUG` or not.
-#define KU_ASSERT(cond, ...)                                                                                      \
-    do {                                                                                                  \
-        if (not (cond)) {                                                                                 \
-            fprintf(stderr, "Assertion `%s` failed (%s:%d): ", #cond, __FILE__, __LINE__);          \
-            if constexpr (sizeof(#__VA_ARGS__) > 1) {                                                \
-                fprintf(stderr, ", " __VA_ARGS__);                                                        \
-            }                                                                                             \
-            fprintf(stderr, "\n");                                                                       \
-            THROW_KU_EXCEPTION("Assertion", "Assertion `", #cond, "` failed.");                          \
-        }                                                                                                 \
+#define KU_ASSERT(cond, ...)                                                                     \
+    do {                                                                                         \
+        if (not (cond)) {                                                                        \
+            char _ku_buf[1024];                                                                  \
+            int _ku_len = snprintf(_ku_buf, sizeof(_ku_buf),                                    \
+                                   "Assertion `%s` failed (%s:%d)", #cond, __FILE__, __LINE__); \
+            __VA_OPT__(                                                                          \
+                _ku_len += snprintf(_ku_buf + _ku_len, sizeof(_ku_buf) - _ku_len,              \
+                                    ": " __VA_ARGS__);                                          \
+            )                                                                                    \
+            fprintf(stderr, "%s\n", _ku_buf);                                                    \
+            THROW_KU_EXCEPTION("Assertion", _ku_buf);                                            \
+        }                                                                                        \
     } while(0)
 
 #define KU_CHECK_KERNEL_LAUNCH() KU_CUDA_CHECK(cudaGetLastError())
@@ -76,6 +82,13 @@ inline __host__ __device__ constexpr T ceil_div(const T &a, const T &b) {
 template<typename T>
 inline __host__ __device__ constexpr T ceil(const T &a, const T &b) {
     return (a + b - 1) / b * b;
+}
+
+template<typename T, T LOWER_BOUND = 1>
+inline __host__ __device__ constexpr T find_next_power_of_2(const T& x) {
+    if (x <= LOWER_BOUND)
+        return LOWER_BOUND;
+    return find_next_power_of_2<T, LOWER_BOUND*2>(x);
 }
 
 // A wrapper for make_tensor_map
@@ -103,8 +116,30 @@ static inline CUtensorMap make_tensor_map(
     }
     KU_ASSERT(strides.size() == (uint32_t)dim-1 && box_size.size() == (uint32_t)dim && element_strides.size() == (uint32_t)dim);
 
+    auto call_cuTensorMapEncodeTiled = [&]<typename... Args>(Args... args) {
+        cudaDriverEntryPointQueryResult cuda_status;
+        void* pfn = nullptr;
+#if (__CUDACC_VER_MAJOR__ > 12)
+        KU_CUDA_CHECK(cudaGetDriverEntryPointByVersion(
+            "cuTensorMapEncodeTiled",
+            &pfn, 12000,
+            cudaEnableDefault,
+            &cuda_status));
+#else
+        KU_CUDA_CHECK(cudaGetDriverEntryPoint(
+            "cuTensorMapEncodeTiled",
+            &pfn,
+            cudaEnableDefault,
+            &cuda_status));
+#endif
+        if (cuda_status != cudaDriverEntryPointSuccess) {
+            KU_ASSERT(false, "Failed to load `cuTensorMapEncodeTiled`. cuda_status = %d", cuda_status);
+        }
+        return reinterpret_cast<decltype(&cuTensorMapEncodeTiled)>(pfn)(args...); \
+    };
+
     CUtensorMap result;
-    CUresult ret_code = CUTLASS_CUDA_DRIVER_WRAPPER_CALL(cuTensorMapEncodeTiled)(
+    CUresult ret_code = call_cuTensorMapEncodeTiled(
         &result,
         data_type,
         dim,

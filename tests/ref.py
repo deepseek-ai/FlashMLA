@@ -16,7 +16,7 @@ def _merge_two_lse(lse0: torch.Tensor, lse1: Optional[torch.Tensor], s_q: int, h
             dim=0
         )
         
-def ref_sparse_attn_fwd(p: TestParam, t: Testcase) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+def ref_sparse_attn_fwd(p: TestParam, t: Testcase, rms_norm_scale_factor: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Returns:
     - o: [s_q, h_q, dv]
@@ -34,7 +34,10 @@ def ref_sparse_attn_fwd(p: TestParam, t: Testcase) -> Tuple[torch.Tensor, torch.
     q = t.q.float()
     gathered_kv = t.kv.index_select(dim=0, index=indices.flatten()).reshape(p.s_q, p.topk, p.d_qk).float()   # [s_q, topk, d_qk]
     P = (q @ gathered_kv.transpose(1, 2))   # [s_q, h_q, topk]
-    P *= t.sm_scale
+    if rms_norm_scale_factor is not None:
+        P *= t.sm_scale * rms_norm_scale_factor.unsqueeze(-1)
+    else:
+        P *= t.sm_scale
     P[invalid_mask.unsqueeze(1).broadcast_to(P.shape)] = float("-inf")
 
     orig_lse = torch.logsumexp(P, dim=-1)   # [s_q, h_q]
@@ -54,7 +57,8 @@ def ref_sparse_attn_fwd(p: TestParam, t: Testcase) -> Tuple[torch.Tensor, torch.
 
 def ref_sparse_attn_decode(
     p: TestParam,
-    t: TestcaseForDecode
+    t: TestcaseForDecode,
+    rms_norm_scale_factor: Optional[torch.Tensor] = None   # [b, s_q, h_q]
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     A reference implementation of sparse decoding attention in PyTorch
@@ -83,7 +87,10 @@ def ref_sparse_attn_decode(
     gathered_kv[gathered_kv != gathered_kv] = 0.0
     q = t.q.float().view(b*p.s_q, p.h_q, p.d_qk)
     attn_weight = q @ gathered_kv.transpose(-1, -2)  # [t.b*t.s_q, t.h_q, topk+extra_topk]
-    attn_weight *= t.sm_scale
+    if rms_norm_scale_factor is not None:
+        attn_weight *= t.sm_scale * rms_norm_scale_factor.view(b*p.s_q, p.h_q).unsqueeze(-1)
+    else:
+        attn_weight *= t.sm_scale
     attn_weight[invalid_mask.view(b*p.s_q, 1, -1).broadcast_to(b*p.s_q, p.h_q, invalid_mask.size(-1))] = float("-inf")
     lse = attn_weight.logsumexp(dim=-1)  # [t.b*t.s_q, t.h_q]
     attn_weight = torch.exp(attn_weight - lse.unsqueeze(-1))

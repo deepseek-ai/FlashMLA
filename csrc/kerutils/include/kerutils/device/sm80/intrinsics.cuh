@@ -110,8 +110,8 @@ void atomicadd_f32_with_policy_and_pred(void* global_addr, const float &data, in
 }
 
 // Get the id of the current SM
-// About %smid (https://docs.nvidia.com/cuda/parallel-thread-execution/#special-registers-smid): PTX document says that %smid ranges from 0 to %nsmid-1, while "The SM identifier numbering is not guaranteed to be contiguous, so %nsmid may be larger than the physical number of SMs in the device.". However, result shows that, at least for sm90 and sm100f, %nsmid is the number of physical SMs - 1. For the sake of safety, I recommend you to check the return of get_sm_id manually or call `get_sm_id_with_range_check()` defined in `device/sm80/helpers.cuh`.
-// Besides, PTX document also says that this number may change due to preemption, but currently this never happens according to [DATEN GELÖSCHT]
+// About %smid (https://docs.nvidia.com/cuda/parallel-thread-execution/#special-registers-smid): PTX document says that %smid ranges from 0 to %nsmid-1, while "The SM identifier numbering is not guaranteed to be contiguous, so %nsmid may be larger than the physical number of SMs in the device.". However, result shows that, at least for sm90 and sm100, %nsmid is the number of physical SMs - 1. For the sake of safety, I recommend you to check the return of get_sm_id manually or call `get_sm_id_with_range_check()` defined in `device/sm80/helpers.cuh`.
+// Besides, PTX document also says that this number may change due to preemption, but currently this never happens in practice
 CUTE_DEVICE
 uint32_t get_sm_id() {
     uint32_t ret;
@@ -143,4 +143,18 @@ void trap() {
         ); \
     }
 
+// STG.128 (https://docs.nvidia.com/cuda/parallel-thread-execution/#data-movement-and-conversion-instructions-st)
+// L2_CACHE_HINT_STR should be ".L2::evict_XXX" (only available on sm100+) or ""
+#define KU_STG_128(global_addr, src, L1_CACHE_HINT_STR, L2_CACHE_HINT_STR) \
+    { \
+        static_assert(std::is_pointer_v<decltype(global_addr)> || std::is_array_v<decltype(global_addr)>, "`global_addr` must be a pointer"); \
+        static_assert(std::is_pointer_v<decltype(src)> || std::is_array_v<decltype(src)>, "`src` must be a pointer"); \
+        uint64_t const* src_as_uint64_ptr = (uint64_t const*)(src); \
+        asm volatile( \
+            "st.global.L1::" L1_CACHE_HINT_STR L2_CACHE_HINT_STR ".v2.u64 [%0], {%1, %2};\n" \
+            : \
+            : "l"(global_addr), "l"(src_as_uint64_ptr[0]), "l"(src_as_uint64_ptr[1]) \
+        ); \
+    }
+    
 }
