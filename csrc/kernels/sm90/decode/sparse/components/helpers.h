@@ -77,7 +77,7 @@ void launch_tma_copy(
 template<typename T>
 CUTE_DEVICE
 static void st_async_128b(void* dst_ptr, const T& data, const transac_bar_t* mbar_ptr) {
-    long2 data_long2 = *reinterpret_cast<const long2*>(&data);
+    longlong2 data_long2 = *reinterpret_cast<const longlong2*>(&data);
     uint32_t dst_addr = cute::cast_smem_ptr_to_uint(dst_ptr);
     uint32_t mbar_addr = cute::cast_smem_ptr_to_uint(mbar_ptr);
     asm volatile (

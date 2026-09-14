@@ -9,7 +9,7 @@ template<typename T>
 CUTE_DEVICE
 static void st_async(void* dst_ptr, const T& data, transac_bar_t &mbar) {
     static_assert(sizeof(T) == 16, "Data type must be 16 bytes (128 bits) for st_async.");
-    long2 data_long2 = *reinterpret_cast<const long2*>(&data);
+    longlong2 data_long2 = *reinterpret_cast<const longlong2*>(&data);
     uint32_t dst_addr = cute::cast_smem_ptr_to_uint(dst_ptr);
     uint32_t mbar_addr = cute::cast_smem_ptr_to_uint(&mbar);
     asm volatile (
