@@ -100,30 +100,23 @@ To use the MLA decoding kernels, call get_mla_metadata once before the decoding 
 ```python
 from flash_mla import get_mla_metadata, flash_mla_with_kvcache
 
-tile_scheduler_metadata, num_splits = get_mla_metadata(
-    cache_seqlens,
-    s_q * h_q // h_kv,
-    h_kv,
-    h_q,
-    is_fp8,
-    topk,
-)
+tile_scheduler_metadata, num_splits = get_mla_metadata()
 
 for i in range(num_layers):
     ...
     o_i, lse_i = flash_mla_with_kvcache(
         q_i, kvcache_i, block_table, cache_seqlens, dv,
         tile_scheduler_metadata, num_splits,
-        is_causal, is_fp8_kvcache, indices,
+        causal=is_causal, is_fp8_kvcache=is_fp8_kvcache, indices=indices,
     )
     ...
 ```
 
 Where
 
-- `s_q` is the number of q tokens per q sequence. If MTP (speculative decoding) is disabled, it should be 1.
-- `h_kv` is the number of key-value heads.
-- `h_q` is the number of query heads.
+- `get_mla_metadata` takes no arguments now. The actual scheduling metadata is generated during the first invocation of `flash_mla_with_kvcache`, and `num_splits` is always `None`.
+- `causal`, `is_fp8_kvcache`, and `indices` must be passed as keyword arguments, since the parameters before them (`num_splits`, `softmax_scale`) are kept for compatibility with the old interface.
+- `s_q` (the second dimension of `q_i`) is the number of q tokens per q sequence. If MTP (speculative decoding) is disabled, it should be 1.
 
 **FP8 KV Cache:**
 If `is_fp8_kvcache` is set to `True`, the kernel reads the KV cache in the "FP8 with scale" format (described below). It dequantizes the cache to bfloat16 and performs attention computation in bfloat16. The output is also in bfloat16. In this repository, `is_fp8_kvcache=True` is only supported together with `indices` (i.e. sparse attention); the dense decoding kernel reads bf16 / fp16 KV caches. 
