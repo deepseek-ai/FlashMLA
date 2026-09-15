@@ -204,11 +204,11 @@ __forceinline__ __device__ void warpgroup_cooperative_qkt_gemm(
 ) {
     Tensor sQ_tiled = flat_divide(sQ, Shape<Int<T::BLOCK_SIZE_M>, _64>{})(_, _, _0{}, _);	// (BLOCK_SIZE_M, 64, 9)
     Tensor sKV_tiled = flat_divide(sKV, Shape<Int<T::PAGE_BLOCK_SIZE>, _64>{})(_, _, _0{}, _);	// (PAGE_BLOCK_SIZE, 64, 9)
-    TiledMMA tiled_mma_sQ = (typename T::TiledMMA_QK_sQ){};
+    TiledMMA tiled_mma_sQ = typename T::TiledMMA_QK_sQ{};
     ThrMMA thr_mma_sQ = tiled_mma_sQ.get_slice(idx_in_warpgroup);
     Tensor thr_mma_sQ_tiled = thr_mma_sQ.partition_fragment_A(sQ_tiled);	// (MMA, 1, 4, 9)
     Tensor thr_mma_sKV_tiled = thr_mma_sQ.partition_fragment_B(sKV_tiled);	// (MMA, 1, 4, 9)
-    TiledMMA tiled_mma_rQ = (typename T::TiledMMA_QK_rQ){};
+    TiledMMA tiled_mma_rQ = typename T::TiledMMA_QK_rQ{};
 
     #define QKT_GEMM_ONE_TILE(TILE_IDX) \
         if constexpr(TILE_IDX != 8) { \
@@ -266,7 +266,7 @@ __forceinline__ __device__ void warpgroup_cooperative_qkt_gemm_no_pipeline(
     Tensor<Engine2, Layout2> &rP,	// ((2, 2, 8), 1, 1)
     int idx_in_warpgroup
 ) {
-    TiledMMA tiled_mma = (typename T::TiledMMA_QK_sQ){};
+    TiledMMA tiled_mma = typename T::TiledMMA_QK_sQ{};
     ThrMMA thr_mma = tiled_mma.get_slice(idx_in_warpgroup);
     Tensor thr_mma_sQ = thr_mma.partition_fragment_A(sQ);	// (MMA, 1, 576/16=36)
     Tensor thr_mma_sKV = thr_mma.partition_fragment_B(sKV);	// (MMA, 1, 576/16=36)
@@ -287,7 +287,7 @@ __forceinline__ __device__ void warpgroup_cooperative_pv_gemm_localP(
     Tensor<Engine2, Layout2> &rO,	// ((2, 2, 32), 1, 1)
     int idx_in_warpgroup
 ) {
-    TiledMMA tiled_mma = (typename T::TiledMMA_PV_LocalP){};
+    TiledMMA tiled_mma = typename T::TiledMMA_PV_LocalP{};
     ThrMMA thr_mma = tiled_mma.get_slice(idx_in_warpgroup);
     Tensor rP_retiled = make_tensor(rP.data(), Layout<
         Shape<Shape<_2, _2, _2>, _1, _4>,
@@ -311,7 +311,7 @@ __forceinline__ __device__ void warpgroup_cooperative_pv_gemm_remoteP(
     Tensor<Engine2, Layout2> &rO,	// ((2, 2, 32), 1, 1)
     int idx_in_warpgroup
 ) {
-    TiledMMA tiled_mma = (typename T::TiledMMA_PV_RemoteP){};
+    TiledMMA tiled_mma = typename T::TiledMMA_PV_RemoteP{};
     ThrMMA thr_mma = tiled_mma.get_slice(idx_in_warpgroup);
     Tensor thr_mma_sP = thr_mma.partition_fragment_A(sP);
     Tensor thr_mma_sKV_half = thr_mma.partition_fragment_B(sKV_half);	// (MMA, 1, 64/16=4)
@@ -488,7 +488,7 @@ __forceinline__ __device__ void save_rPb_to_sP(
 ) {
     auto r2s_copy = make_tiled_copy_C(
         Copy_Atom<SM90_U32x4_STSM_N, typename T::InputT>{},
-        (typename T::TiledMMA_QK_sQ){}
+        typename T::TiledMMA_QK_sQ{}
     );
     ThrCopy thr_copy = r2s_copy.get_slice(idx_in_warpgroup);
     Tensor thr_copy_rPb = thr_copy.retile_S(rPb);
@@ -510,7 +510,7 @@ __forceinline__ __device__ void retrieve_rP_from_sP(
 ) {
     TiledCopy s2r_copy = make_tiled_copy_A(
         Copy_Atom<SM75_U32x4_LDSM_N, typename T::InputT>{},
-        (typename T::TiledMMA_PV_LocalP){}
+        typename T::TiledMMA_PV_LocalP{}
     );
     ThrCopy thr_copy = s2r_copy.get_slice(idx_in_warpgroup);
     Tensor thr_copy_sP = thr_copy.partition_S(sP);
@@ -635,7 +635,7 @@ __forceinline__ __device__ void store_o(
         Tensor sMyOutputBuf = local_tile(sOutputBuf, Shape<_64, _256>{}, make_coord(_0{}, warpgroup_idx));
         TiledCopy r2s_tiled_copy = make_tiled_copy_C(
             Copy_Atom<SM90_U32x4_STSM_N, InputT>{},
-            (typename T::TiledMMA_PV_LocalP){}
+            typename T::TiledMMA_PV_LocalP{}
         );
         ThrCopy r2s_thr_copy = r2s_tiled_copy.get_slice(idx_in_warpgroup);
         Tensor r2s_thr_copy_rOb = r2s_thr_copy.retile_S(rOb);
@@ -717,7 +717,7 @@ template<
 __forceinline__ __device__ auto get_half_V(
     Tensor<Engine0, Layout0> &sK
 ) {
-    Tensor sV = make_tensor(sK.data(), (typename T::SmemLayoutV){});
+    Tensor sV = make_tensor(sK.data(), typename T::SmemLayoutV{});
     return flat_divide(sV, Shape<Int<T::HEAD_DIM_V/2>, Int<T::PAGE_BLOCK_SIZE>>{})(_, _, Int<(int)IS_R>{}, _0{});
 }
 
@@ -979,10 +979,10 @@ flash_fwd_splitkv_mla_kernel(__grid_constant__ const DenseAttnDecodeParams param
     extern __shared__ char wksp_buf[];
     using SharedMemoryPlan = typename T::SharedMemoryPlan;
     SharedMemoryPlan &plan = *reinterpret_cast<SharedMemoryPlan*>(wksp_buf);
-    Tensor sQ = make_tensor(make_smem_ptr(plan.smem_sQ.data()), (typename T::SmemLayoutQ){});
-    Tensor sK0 = make_tensor(make_smem_ptr(plan.smem_sK0.data()), (typename T::SmemLayoutK){});
-    Tensor sK1 = make_tensor(make_smem_ptr(plan.smem_sK1.data()), (typename T::SmemLayoutK){});
-    Tensor sP0 = make_tensor(make_smem_ptr(plan.smem_sP0.data()), (typename T::SmemLayoutP0){});
+    Tensor sQ = make_tensor(make_smem_ptr(plan.smem_sQ.data()), typename T::SmemLayoutQ{});
+    Tensor sK0 = make_tensor(make_smem_ptr(plan.smem_sK0.data()), typename T::SmemLayoutK{});
+    Tensor sK1 = make_tensor(make_smem_ptr(plan.smem_sK1.data()), typename T::SmemLayoutK{});
+    Tensor sP0 = make_tensor(make_smem_ptr(plan.smem_sP0.data()), typename T::SmemLayoutP0{});
     Tensor sP1 = flat_divide(sQ, Shape<Int<T::BLOCK_SIZE_M>, Int<T::PAGE_BLOCK_SIZE>>{})(_, _, _0{}, _8{}); // Overlap with sQ's 8-th tile
     Tensor sM = make_tensor(make_smem_ptr(plan.smem_sM.data()), make_shape(Int<T::BLOCK_SIZE_M>{}));
     Tensor sL_reduction_wksp = make_tensor(make_smem_ptr(plan.sL_reduction_wksp.data()), make_shape(Int<2*T::BLOCK_SIZE_M>{}));
@@ -1085,7 +1085,7 @@ flash_fwd_splitkv_mla_kernel(__grid_constant__ const DenseAttnDecodeParams param
             launch_kv_tiles_copy_tma<0, 4>(tma_gK(_, _, __ldg(block_table_ptr + start_block_idx+1)), sK1, tma_params.tma_K, barriers_K1, threadIdx.x);
         }
 
-        Tensor rO = partition_fragment_C((typename T::TiledMMA_PV_LocalP){}, Shape<Int<T::BLOCK_SIZE_M>, Int<T::HEAD_DIM_V / 2>>{});	// ((2, 2, 32), 1, 1)
+        Tensor rO = partition_fragment_C(typename T::TiledMMA_PV_LocalP{}, Shape<Int<T::BLOCK_SIZE_M>, Int<T::HEAD_DIM_V / 2>>{});	// ((2, 2, 32), 1, 1)
         float rL[2];
         rL[0] = rL[1] = 0.0f;
         
@@ -1104,7 +1104,7 @@ flash_fwd_splitkv_mla_kernel(__grid_constant__ const DenseAttnDecodeParams param
 
         if (warpgroup_idx == 0) {
             // Warpgroup 0
-            Tensor rP0 = make_tensor<float>((typename T::rP0Layout){});
+            Tensor rP0 = make_tensor<float>(typename T::rP0Layout{});
             
             // NOTE We don't use the pipelined version of Q K^T here since it leads
             // to a slow-down (or even register spilling, thanks to the great NVCC)
@@ -1148,7 +1148,7 @@ flash_fwd_splitkv_mla_kernel(__grid_constant__ const DenseAttnDecodeParams param
 
         } else {
             // Warpgroup 1
-            Tensor rP1 = make_tensor<float>((typename T::rP0Layout){});
+            Tensor rP1 = make_tensor<float>(typename T::rP0Layout{});
             
             if (start_block_idx+1 < end_block_idx) {
                 // Issue rP1 = sQ @ sK1, wait
