@@ -55,6 +55,14 @@ subprocess.run(["git", "submodule", "update", "--init", "csrc/cutlass"])
 
 this_dir = os.path.dirname(os.path.abspath(__file__))
 
+# Read base version from _version.py without importing the flash_mla package.
+# Python always executes __init__.py first when importing any submodule,
+# and flash_mla/__init__.py imports the C extension which is not yet built.
+_ver_ns = {}
+with open(os.path.join(this_dir, "flash_mla", "_version.py")) as f:
+    exec(f.read(), _ver_ns)
+__base_version__ = _ver_ns.get("__version__", "1.0.0")
+
 if IS_WINDOWS:
     cxx_args = ["/O2", "/std:c++20", "/DNDEBUG", "/W0"]
 else:
@@ -183,7 +191,7 @@ except Exception as _:
 
 setup(
     name="flash_mla",
-    version="1.0.0" + rev,
+    version=__base_version__ + rev,
     packages=find_packages(include=['flash_mla']),
     ext_modules=ext_modules,
     cmdclass={"build_ext": BuildExtension},
