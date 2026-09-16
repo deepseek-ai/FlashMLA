@@ -586,7 +586,11 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                         auto dequant_and_save_bf16x8 = [&](const fp8x8 &data, int offset) {
                             int smem_offset = (dim_idx*64 + offset) * TOPK_BLOCK_SIZE;
                             bf16x8 cur_bf16x8 = cvt_fp8x8_bf16x8(data, __bfloat162bfloat162(*(__nv_bfloat16*)(&scale)));
-                            *(__int128_t*)(sK_nope_base + smem_offset) = *(__int128_t*)&cur_bf16x8;
+                            #if defined(_MSC_VER)
+    *reinterpret_cast<uint4*>(sK_nope_base + smem_offset) = *reinterpret_cast<uint4*>(&cur_bf16x8);
+#else
+    *(__int128_t*)(sK_nope_base + smem_offset) = *(__int128_t*)&cur_bf16x8;
+#endif
                             if constexpr (CLUSTER_SIZE == 2) {
                                 st_async_128b(sK_nope_peer_base + smem_offset, cur_bf16x8, peer_bar_k_remote_ready);
                             }
@@ -616,7 +620,11 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                                 *(uint128_t*)(&cur_bf16x8) = uint128_t();
                         }
                         int smem_offset = (HEAD_DIM_NOPE + dim_idx*32) * TOPK_BLOCK_SIZE;
-                        *(__int128_t*)(sK_rope_base + smem_offset) = *(__int128_t*)&cur_bf16x8;
+                        #if defined(_MSC_VER)
+    *reinterpret_cast<uint4*>(sK_rope_base + smem_offset) = *reinterpret_cast<uint4*>(&cur_bf16x8);
+#else
+    *(__int128_t*)(sK_rope_base + smem_offset) = *(__int128_t*)&cur_bf16x8;
+#endif
                         if constexpr (CLUSTER_SIZE == 2) {
                             st_async_128b(sK_rope_peer_base + smem_offset, cur_bf16x8, peer_bar_k_remote_ready);
                         }

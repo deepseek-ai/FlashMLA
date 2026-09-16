@@ -29,6 +29,43 @@ float2 float2float2(const float &x) {
     return float2 {x, x};
 }
 
+// MSVC has no `__int128_t`; use `uint4` with `.v4.u32` PTX there.
+// GCC/Clang keep the existing `.b128` path unchanged.
+#if defined(_MSC_VER)
+
+CUTE_DEVICE
+void st_shared(void* ptr, uint4 val) {
+    asm volatile(
+        "st.shared.v4.u32 [%0], {%1, %2, %3, %4};"
+        :
+        : "r"(cute::cast_smem_ptr_to_uint(ptr)), "r"(val.x), "r"(val.y), "r"(val.z), "r"(val.w)
+    );
+}
+
+CUTE_DEVICE
+void st_shared(void* ptr, float4 val) {
+    st_shared(ptr, *reinterpret_cast<uint4*>(&val));
+}
+
+CUTE_DEVICE
+uint4 ld_shared(const void* ptr) {
+    uint4 val;
+    asm volatile(
+        "ld.shared.v4.u32 {%0, %1, %2, %3}, [%4];"
+        : "=r"(val.x), "=r"(val.y), "=r"(val.z), "=r"(val.w)
+        : "r"(cute::cast_smem_ptr_to_uint(ptr))
+    );
+    return val;
+}
+
+CUTE_DEVICE
+float4 ld_shared_float4(const void* ptr) {
+    uint4 temp = ld_shared(ptr);
+    return *reinterpret_cast<float4*>(&temp);
+}
+
+#else
+
 CUTE_DEVICE
 void st_shared(void* ptr, __int128_t val) {
     asm volatile("st.shared.b128 [%0], %1;" :: "r"(cute::cast_smem_ptr_to_uint(ptr)), "q"(val));
@@ -51,5 +88,7 @@ float4 ld_shared_float4(const void* ptr) {
     __int128_t temp = ld_shared(ptr);
     return *(float4*)&temp;
 }
+
+#endif
 
 }
