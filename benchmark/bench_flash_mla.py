@@ -25,7 +25,7 @@ def scaled_dot_product_attention(query, key, value, h_q, h_kv, is_causal=False):
         attn_bias = torch.zeros(s_q, s_k, dtype=query.dtype)
         temp_mask = torch.ones(s_q, s_k, dtype=torch.bool).tril(diagonal=s_k - s_q)
         attn_bias.masked_fill_(temp_mask.logical_not(), float("-inf"))
-        attn_bias.to(query.dtype)
+        attn_bias = attn_bias.to(query.dtype)
         attn_weight += attn_bias
     lse = attn_weight.logsumexp(dim=-1)
     attn_weight = torch.softmax(attn_weight, dim=-1, dtype=torch.float32)
