@@ -23,6 +23,7 @@ struct Config {
     bool ENABLE_Q_NORM;
     // The API selects this specialization for the measured B200 H64 path.
     bool ENABLE_H64_PIPELINE = false;
+    bool USE_PREFILL_MMA_WARP11 = false;
 };
 
 // Parameters for the fused Q-b-norm + Q RoPE + Core Attention Forward (prefill/decoding) + O RoPE + O Cast kernel

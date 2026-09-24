@@ -108,6 +108,8 @@ static constexpr bool ENABLE_Q_NORM = CONFIG.ENABLE_Q_NORM;
 static constexpr bool ENABLE_H64_PIPELINE = CONFIG.ENABLE_H64_PIPELINE;
 static_assert(!ENABLE_H64_PIPELINE || (H_Q == 64 && !ENABLE_Q_NORM &&
     (!IS_DECODE || (MODEL_TYPE == ModelType::V41 && EXTRA_MODEL_TYPE == ModelType::V41))));
+static_assert(!CONFIG.USE_PREFILL_MMA_WARP11 || (ENABLE_H64_PIPELINE && !IS_DECODE));
+static constexpr uint32_t MMA_WARP = CONFIG.USE_PREFILL_MMA_WARP11 ? 11 : 8;
 
 // Cluster shape selection
 static constexpr uint32_t CLUSTER_SIZE = ku::ceil_div((uint32_t)H_Q, 64u);

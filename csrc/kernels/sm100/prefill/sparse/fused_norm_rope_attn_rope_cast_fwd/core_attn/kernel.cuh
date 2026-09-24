@@ -686,7 +686,7 @@ void Kernel<CONFIG>::devfunc(const Params &params, const TMAParams &tma_params, 
         } while (cur_job.is_valid);
     } else if (warpgroup_idx == 2) {
         cutlass::arch::warpgroup_reg_dealloc<72>();
-        if (warp_idx == 8 && cta_idx == 0 && elect_one_sync()) {
+        if (warp_idx == MMA_WARP && cta_idx == 0 && elect_one_sync()) {
             // MMA warp (CTA0 only)
             auto tiled_mma_qk = TiledMMA_QK{};
             auto tiled_mma_sv = TiledMMA_SV{};
@@ -1662,6 +1662,22 @@ void Kernel<CONFIG>::run(const Params &params) {
 
 template<Config CONFIG>
 void run_fused_norm_rope_attn_rope_cast_fwd_kernel(const ParamT<CONFIG.FWD_MODE>& params) {
+    if constexpr (CONFIG.ENABLE_H64_PIPELINE && CONFIG.FWD_MODE == SparseAttnFwdMode::Prefill) {
+        // Issuer relocation only improved these measured large-query cases.
+        // Smaller inputs keep warp 8 while retaining the other H64 changes.
+        bool use_mma11 = params.topk == 640 && (
+            (params.s_q == 1024 && params.s_kv == 32768) ||
+            (params.s_q == 4096 && (params.s_kv == 8192 || params.s_kv == 32768)));
+        if (use_mma11) {
+            constexpr Config mma11_config = [] {
+                Config config = CONFIG;
+                config.USE_PREFILL_MMA_WARP11 = true;
+                return config;
+            }();
+            Kernel<mma11_config>::run(params);
+            return;
+        }
+    }
     using KernelType = Kernel<CONFIG>;
     KernelType::run(params);
 }
