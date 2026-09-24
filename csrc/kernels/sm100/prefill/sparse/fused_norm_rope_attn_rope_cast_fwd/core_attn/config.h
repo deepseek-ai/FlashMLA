@@ -105,6 +105,9 @@ static constexpr uint32_t D_ROPE = 64;
 static constexpr uint32_t D_NOPE = D_QK - D_ROPE;
 static constexpr uint32_t WV_GROUP_SIZE = 8;
 static constexpr bool ENABLE_Q_NORM = CONFIG.ENABLE_Q_NORM;
+static constexpr bool ENABLE_H64_PIPELINE = CONFIG.ENABLE_H64_PIPELINE;
+static_assert(!ENABLE_H64_PIPELINE || (H_Q == 64 && !ENABLE_Q_NORM &&
+    (!IS_DECODE || (MODEL_TYPE == ModelType::V41 && EXTRA_MODEL_TYPE == ModelType::V41))));
 
 // Cluster shape selection
 static constexpr uint32_t CLUSTER_SIZE = ku::ceil_div((uint32_t)H_Q, 64u);

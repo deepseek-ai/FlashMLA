@@ -544,7 +544,8 @@ void Kernel<CONFIG>::devfunc(const Params &params, const TMAParams &tma_params, 
                     NUM_ELEMS_PER_THREAD,
                     barrier_ids::WG3_WARP02_SYNC,
                     barrier_ids::WG3_WARP13_SYNC,
-                    false
+                    false,
+                    ENABLE_H64_PIPELINE
                 >(
                     tmem_cols::get_p(p_buf_idx),
                     (char*)&smem.is_k_valid[indices_buf_idx],

@@ -171,6 +171,12 @@ static std::vector<at::Tensor> fused_norm_rope_attn_rope_cast_fwd(
     TORCH_CHECK(h_q == 64 || h_q == 128, "Only h_q == 64 or 128 is supported for fused_norm_rope_attn_rope_cast_fwd, got ", h_q);
     DISPATCH_NUM_HEADS(h_q, H_Q, ([&]() {
         DISPATCH_BOOLEAN_FLAG(enable_q_norm, ENABLE_Q_NORM, ([&]() {
+            if constexpr (H_Q == 64 && !ENABLE_Q_NORM) {
+                if (arch.minor == 0 && arch.num_sms == 148) {
+                    sm100::prefill::fused_norm_rope_attn_rope_cast_fwd::core_attn::run_fused_norm_rope_attn_rope_cast_fwd_kernel<Config{SparseAttnFwdMode::Prefill, ModelType::V4, ModelType::V4, H_Q, ENABLE_Q_NORM, true}>(params);
+                    return;
+                }
+            }
             sm100::prefill::fused_norm_rope_attn_rope_cast_fwd::core_attn::run_fused_norm_rope_attn_rope_cast_fwd_kernel<Config{SparseAttnFwdMode::Prefill, ModelType::V4, ModelType::V4, H_Q, ENABLE_Q_NORM}>(params);
         }));
     }));
@@ -399,6 +405,12 @@ static std::vector<at::Tensor> fused_norm_rope_attn_rope_cast_decode(
             } else if (model_type == ModelType::V4) {
                 sm100::prefill::fused_norm_rope_attn_rope_cast_fwd::core_attn::run_fused_norm_rope_attn_rope_cast_fwd_kernel<Config{SparseAttnFwdMode::Decode, ModelType::V4, ModelType::V4, H_Q, ENABLE_Q_NORM}>(params);
             } else if (model_type == ModelType::V41) {
+                if constexpr (H_Q == 64 && !ENABLE_Q_NORM) {
+                    if (arch.minor == 0 && arch.num_sms == 148) {
+                        sm100::prefill::fused_norm_rope_attn_rope_cast_fwd::core_attn::run_fused_norm_rope_attn_rope_cast_fwd_kernel<Config{SparseAttnFwdMode::Decode, ModelType::V41, ModelType::V41, H_Q, ENABLE_Q_NORM, true}>(params);
+                        return;
+                    }
+                }
                 sm100::prefill::fused_norm_rope_attn_rope_cast_fwd::core_attn::run_fused_norm_rope_attn_rope_cast_fwd_kernel<Config{SparseAttnFwdMode::Decode, ModelType::V41, ModelType::V41, H_Q, ENABLE_Q_NORM}>(params);
             } else {
                 TORCH_CHECK(false, "Unsupported model_type: ", get_dynamic_enum_name(model_type));

@@ -71,7 +71,8 @@ template<
     int NUM_ELEMS_PER_THREAD,
     int BARRIER_WARP02_SYNC_ID,
     int BARRIER_WARP13_SYNC_ID,
-    bool STORE_BACK_P
+    bool STORE_BACK_P,
+    bool SKIP_ALL_VALID_MASK = false
 >
 CUTE_DEVICE
 void retrieve_mask_and_reduce_p(
@@ -122,10 +123,21 @@ void retrieve_mask_and_reduce_p(
         *(uint16_t*)(is_k_valid_masks + 2) = *(uint16_t*)(k_validness_base + k_validness_offset + 2);
         *(uint16_t*)(is_k_valid_masks + 4) = *(uint16_t*)(k_validness_base + k_validness_offset + 4);
     }
-    CUTE_UNROLL
-    for (int i = 0; i < NUM_ELEMS_PER_THREAD; i += 1) {
-        if (!(is_k_valid_masks[i/8] >> (i%8) & 1))
-            p[i] = -CUDART_INF_F;
+    bool needs_masking = true;
+    if constexpr (SKIP_ALL_VALID_MASK) {
+        static_assert(NUM_ELEMS_PER_THREAD == 32);
+        uint32_t validity;
+        __builtin_memcpy(&validity, is_k_valid_masks, sizeof(validity));
+        needs_masking = validity != 0xFFFFFFFFu;
+    }
+    // Each lane in a warp has the same validity word. Partial and empty
+    // masks still take the original per-element path.
+    if (needs_masking) {
+        CUTE_UNROLL
+        for (int i = 0; i < NUM_ELEMS_PER_THREAD; i += 1) {
+            if (!(is_k_valid_masks[i/8] >> (i%8) & 1))
+                p[i] = -CUDART_INF_F;
+        }
     }
 
     // Reduce P within the cluster

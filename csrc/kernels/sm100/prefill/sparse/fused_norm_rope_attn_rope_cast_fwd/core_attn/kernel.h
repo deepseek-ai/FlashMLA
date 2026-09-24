@@ -21,6 +21,8 @@ struct Config {
     ModelType EXTRA_MODEL_TYPE;    // Decode only, the format of the extra KV cache. Equals MODEL_TYPE for prefill
     uint32_t H_Q;
     bool ENABLE_Q_NORM;
+    // The API selects this specialization for the measured B200 H64 path.
+    bool ENABLE_H64_PIPELINE = false;
 };
 
 // Parameters for the fused Q-b-norm + Q RoPE + Core Attention Forward (prefill/decoding) + O RoPE + O Cast kernel
