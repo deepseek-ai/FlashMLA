@@ -535,8 +535,20 @@ void Kernel<CONFIG>::devfunc(const Params &params, const TMAParams &tma_params, 
             for (uint32_t kv_block_idx = 0; kv_block_idx < cur_job.num_kv_blocks; ++kv_block_idx) {
                 auto [indices_buf_idx, indices_bar_phase] = rs.get<NUM_INDICES_BUFS>();
                 auto [p_buf_idx, p_bar_phase] = rs.get<NUM_P_BUFS>();
+                uint32_t preloaded_validity = 0;
+                if constexpr (ENABLE_H64_PIPELINE) {
+                    static_assert(NUM_ELEMS_PER_THREAD == 32);
+                    smem.bar_indices_full[indices_buf_idx].wait(indices_bar_phase);
+                    uint32_t mask_address = static_cast<uint32_t>(__cvta_generic_to_shared(
+                        (char*)&smem.is_k_valid[indices_buf_idx] + (local_warp_idx >= 2 ? 4 : 0)));
+                    asm volatile("ld.shared.u32 %0, [%1];" : "=r"(preloaded_validity) : "r"(mask_address) : "memory");
+                    // Keep this mask generation alive until the original
+                    // indices-empty arrival, but overlap its load with QK.
+                }
                 smem.bar_tP_full[p_buf_idx].wait(p_bar_phase);
-                smem.bar_indices_full[indices_buf_idx].wait(indices_bar_phase);
+                if constexpr (!ENABLE_H64_PIPELINE) {
+                    smem.bar_indices_full[indices_buf_idx].wait(indices_bar_phase);
+                }
                 ku::tcgen05_after_thread_sync();
 
                 float p[NUM_ELEMS_PER_THREAD];
@@ -557,7 +569,8 @@ void Kernel<CONFIG>::devfunc(const Params &params, const TMAParams &tma_params, 
                         }
                     },
                     smem.p_exchange_buf,
-                    p
+                    p,
+                    preloaded_validity
                 );
 
                 float cur_pi_max = get_max<NUM_ELEMS_PER_THREAD>(p);

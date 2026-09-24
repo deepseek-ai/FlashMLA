@@ -72,7 +72,7 @@ template<
     int BARRIER_WARP02_SYNC_ID,
     int BARRIER_WARP13_SYNC_ID,
     bool STORE_BACK_P,
-    bool SKIP_ALL_VALID_MASK = false
+    bool MASK_PREFETCHED = false
 >
 CUTE_DEVICE
 void retrieve_mask_and_reduce_p(
@@ -82,7 +82,8 @@ void retrieve_mask_and_reduce_p(
     int lane_idx,
     auto slot_bar_P_empty_arrival,
     float p_exchange_buf[4][32*NUM_ELEMS_PER_THREAD],
-    float p[NUM_ELEMS_PER_THREAD]
+    float p[NUM_ELEMS_PER_THREAD],
+    uint32_t preloaded_validity = 0
 ) {
     using namespace cute;
     using cutlass::arch::NamedBarrier;
@@ -117,18 +118,20 @@ void retrieve_mask_and_reduce_p(
     if constexpr (NUM_ELEMS_PER_THREAD == 16) {
         *(uint16_t*)is_k_valid_masks = *(uint16_t*)(k_validness_base + k_validness_offset);
     } else if constexpr (NUM_ELEMS_PER_THREAD == 32) {
-        *(uint32_t*)is_k_valid_masks = *(uint32_t*)(k_validness_base + k_validness_offset);
+        if constexpr (MASK_PREFETCHED) {
+            __builtin_memcpy(is_k_valid_masks, &preloaded_validity, sizeof(preloaded_validity));
+        } else {
+            *(uint32_t*)is_k_valid_masks = *(uint32_t*)(k_validness_base + k_validness_offset);
+        }
     } else if constexpr (NUM_ELEMS_PER_THREAD == 48) {
         *(uint16_t*)(is_k_valid_masks + 0) = *(uint16_t*)(k_validness_base + k_validness_offset + 0);
         *(uint16_t*)(is_k_valid_masks + 2) = *(uint16_t*)(k_validness_base + k_validness_offset + 2);
         *(uint16_t*)(is_k_valid_masks + 4) = *(uint16_t*)(k_validness_base + k_validness_offset + 4);
     }
     bool needs_masking = true;
-    if constexpr (SKIP_ALL_VALID_MASK) {
+    if constexpr (MASK_PREFETCHED) {
         static_assert(NUM_ELEMS_PER_THREAD == 32);
-        uint32_t validity;
-        __builtin_memcpy(&validity, is_k_valid_masks, sizeof(validity));
-        needs_masking = validity != 0xFFFFFFFFu;
+        needs_masking = preloaded_validity != 0xFFFFFFFFu;
     }
     // Each lane in a warp has the same validity word. Partial and empty
     // masks still take the original per-element path.
