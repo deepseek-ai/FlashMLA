@@ -347,28 +347,53 @@ void Kernel<CONFIG>::devfunc(const Params &params, const TMAParams &tma_params, 
             static_assert(NUM_O_TMEM_COLS_PER_ATOM % EPILOGUE_TILE_SIZE == 0);  // TODO When FOLD_FACTOR is 4 and MODEL_TYPE is V4 (so NUM_O_TMEM_COLS_PER_ATOM is 128), this isn't hold
             fp8_e4m3 output_fp8[NUM_MMA_ATOMS][NUM_O_TMEM_COLS_PER_ATOM];
             uint8_t output_sf[NUM_MMA_ATOMS][NUM_O_TMEM_COLS_PER_ATOM / O_QUANT_TILE_SIZE];
+            static_assert(!ENABLE_H64_PIPELINE || (FOLD_FACTOR == 2 && EPILOGUE_TILE_SIZE == 32 && NUM_EPILOGUE_TILES_PER_ATOM >= 2));
+            float final_output_cache[EPILOGUE_TILE_SIZE];
+            float final_output_reduction;
 
             CUTE_UNROLL
             for (uint32_t mma_atom_idx = 0; mma_atom_idx < NUM_MMA_ATOMS; mma_atom_idx += 1) {
                 CUTE_UNROLL
                 for (uint32_t epilogue_tile_idx_in_atom = 0; epilogue_tile_idx_in_atom < NUM_EPILOGUE_TILES_PER_ATOM; ++epilogue_tile_idx_in_atom) {
-                    // Fetch output from TMEM
+                    // Drain the final two tiles before processing either one,
+                    // so the next query can reuse O while the epilogue finishes.
                     uint32_t tmem_col_base = tmem_cols::O + mma_atom_idx * NUM_O_TMEM_COLS_PER_ATOM + epilogue_tile_idx_in_atom * EPILOGUE_TILE_SIZE;
                     float output[EPILOGUE_TILE_SIZE];
                     float reduce_result_by_tmem_ld;
-                    if constexpr (IS_TMEM_LD_WITH_RED_AVAILABLE) {
-                        ku::tmem_ld_red_32dp32bNx<EPILOGUE_TILE_SIZE, true, true, true>(tmem_col_base, output, reduce_result_by_tmem_ld);
+                    bool is_cached_final_tile = ENABLE_H64_PIPELINE && mma_atom_idx + 1 == NUM_MMA_ATOMS &&
+                        epilogue_tile_idx_in_atom + 1 == NUM_EPILOGUE_TILES_PER_ATOM;
+                    if (is_cached_final_tile) {
+                        CUTE_UNROLL
+                        for (uint32_t j = 0; j < EPILOGUE_TILE_SIZE; ++j)
+                            output[j] = final_output_cache[j];
+                        if constexpr (IS_TMEM_LD_WITH_RED_AVAILABLE)
+                            reduce_result_by_tmem_ld = final_output_reduction;
                     } else {
-                        ku::tmem_ld_32dp32bNx<EPILOGUE_TILE_SIZE>(tmem_col_base, output);
-                    }
-                    cutlass::arch::fence_view_async_tmem_load();
-
-                    // Notify tO's emptyness
-                    if (mma_atom_idx+1 == NUM_MMA_ATOMS && epilogue_tile_idx_in_atom+1 == NUM_EPILOGUE_TILES_PER_ATOM) {
-                        ku::tcgen05_before_thread_sync();
-                        if (!is_last_job) {
-                            // Don't arrive on the barrier if this job is the last job, to avoid "cluster target block not present"
-                            arrive_on_cta0_barrier(smem.bar_tO_empty);
+                        if constexpr (IS_TMEM_LD_WITH_RED_AVAILABLE) {
+                            ku::tmem_ld_red_32dp32bNx<EPILOGUE_TILE_SIZE, true, true, true>(tmem_col_base, output, reduce_result_by_tmem_ld);
+                        } else {
+                            ku::tmem_ld_32dp32bNx<EPILOGUE_TILE_SIZE>(tmem_col_base, output);
+                        }
+                        bool drains_output = mma_atom_idx + 1 == NUM_MMA_ATOMS &&
+                            epilogue_tile_idx_in_atom + (ENABLE_H64_PIPELINE ? 2 : 1) == NUM_EPILOGUE_TILES_PER_ATOM;
+                        if constexpr (ENABLE_H64_PIPELINE) {
+                            if (drains_output) {
+                                if constexpr (IS_TMEM_LD_WITH_RED_AVAILABLE) {
+                                    ku::tmem_ld_red_32dp32bNx<EPILOGUE_TILE_SIZE, true, true, true>(tmem_col_base + EPILOGUE_TILE_SIZE, final_output_cache, final_output_reduction);
+                                } else {
+                                    ku::tmem_ld_32dp32bNx<EPILOGUE_TILE_SIZE>(tmem_col_base + EPILOGUE_TILE_SIZE, final_output_cache);
+                                }
+                            }
+                        }
+                        // Complete every outstanding TMEM read before any of
+                        // the 128 readers announces that O can be overwritten.
+                        cutlass::arch::fence_view_async_tmem_load();
+                        if (drains_output) {
+                            ku::tcgen05_before_thread_sync();
+                            if (!is_last_job) {
+                                // The final job has no successor CTA to notify.
+                                arrive_on_cta0_barrier(smem.bar_tO_empty);
+                            }
                         }
                     }
 
