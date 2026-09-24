@@ -104,7 +104,9 @@ void Kernel<CONFIG>::devfunc(const Params &params, const TMAParams &tma_params, 
         smem.bar_tO_full.init(1);       // CTA0 -> Every CTA
         smem.bar_tO_empty.init(128*CLUSTER_SIZE);   // Every CTA -> CTA0
         smem.bar_SO_full.init(128*CLUSTER_SIZE);    // Every CTA -> CTA0
-        smem.bar_SO_empty.init(1);      // CTA0 -> Every CTA
+        if constexpr (!REUSE_KV_COMPLETION) {
+            smem.bar_SO_empty.init(1);  // CTA0 -> Every CTA
+        }
         smem.bar_li_mi_full.init(128);  // CTA-local
         smem.bar_li_mi_empty.init(128); // CTA-local
         if constexpr (IS_DECODE) {
@@ -507,6 +509,9 @@ void Kernel<CONFIG>::devfunc(const Params &params, const TMAParams &tma_params, 
         static_assert(FOLD_FACTOR == 2);
         bf16* sS_base = smem.s + (local_warp_idx >= 2 ? H_Q_PER_CTA * (B_TOPK/2) : 0) + (idx_in_warpgroup%H_Q_PER_CTA) * 8;
         RingBufferState rs;
+        // Track the immediately preceding PV across CLC jobs, like rs.
+        uint32_t s_previous_slot = NUM_KV_SLOTS - 1;
+        uint32_t s_previous_phase = 1;
         do {
             // For definition and consistency about `mi`, `li`, and `real_mi`, plz refer to head64 prefill
             static constexpr uint32_t NUM_ELEMS_PER_THREAD = B_TOPK * H_Q_PER_CTA / 128;
@@ -600,7 +605,16 @@ void Kernel<CONFIG>::devfunc(const Params &params, const TMAParams &tma_params, 
                 li = fmaf(li, scale_for_old, cur_sum);
 
                 // Store S
-                smem.bar_SO_empty.wait(rs.get<1>().second^1);
+                if constexpr (REUSE_KV_COMPLETION) {
+                    // The previous PV's full completion releases both KV and S
+                    // and makes O safe to rescale. Reusing that KV slot again
+                    // requires this S tile, so the completion cannot phase-skip.
+                    // Initially slot 2 is in phase zero; waiting on phase one
+                    // succeeds without waiting for a nonexistent previous PV.
+                    smem.bar_kv_slot_empty[s_previous_slot].wait(s_previous_phase);
+                } else {
+                    smem.bar_SO_empty.wait(rs.get<1>().second^1);
+                }
                 CUTE_UNROLL
                 for (int i = 0; i < NUM_ELEMS_PER_THREAD/8; ++i) {
                     ku::st_shared(sS_base + i*8*H_Q_PER_CTA, *(__int128_t*)(s + i*8));
@@ -616,6 +630,12 @@ void Kernel<CONFIG>::devfunc(const Params &params, const TMAParams &tma_params, 
                 fence_view_async_shared();
                 ku::tcgen05_before_thread_sync();
                 arrive_on_cta0_barrier(smem.bar_SO_full);
+                if constexpr (REUSE_KV_COMPLETION) {
+                    if (++s_previous_slot == NUM_KV_SLOTS) {
+                        s_previous_slot = 0;
+                        s_previous_phase ^= 1;
+                    }
+                }
                 rs.update();
             }
 
@@ -706,7 +726,9 @@ void Kernel<CONFIG>::devfunc(const Params &params, const TMAParams &tma_params, 
                 ku::tcgen05_after_thread_sync();
                 ku::utcmma_ss(tiled_mma_sv, sS, sV, tO, kv_block_idx == 0);
                 umma_arrive_on_every_cta(smem.bar_kv_slot_empty[kv_slot_idx]);
-                umma_arrive_on_every_cta(smem.bar_SO_empty);
+                if constexpr (!REUSE_KV_COMPLETION) {
+                    umma_arrive_on_every_cta(smem.bar_SO_empty);
+                }
                 if (kv_block_idx == job.num_kv_blocks-1) {
                     umma_arrive_on_every_cta(smem.bar_tO_full);
                 }

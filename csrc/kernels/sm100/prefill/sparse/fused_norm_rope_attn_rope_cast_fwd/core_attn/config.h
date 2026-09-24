@@ -171,6 +171,8 @@ static constexpr uint32_t NUM_MRGEMM_RAILS = 2; // The number of "rails" (batch 
 static constexpr uint32_t NUM_P_ELEMS_PER_THREAD = H_Q_PER_CTA * B_TOPK / 128;
 
 static constexpr uint32_t NUM_KV_SLOTS = 3;
+static constexpr bool REUSE_KV_COMPLETION = ENABLE_H64_PIPELINE && !IS_DECODE;
+static_assert(!REUSE_KV_COMPLETION || (CLUSTER_SIZE == 1 && NUM_KV_SLOTS == 3));
 static constexpr uint32_t NUM_INDICES_BUFS = 4;
 static constexpr uint32_t NUM_P_BUFS = CLUSTER_SIZE == 2 ? 1 : 2;
 static constexpr uint32_t NEED_TP_EMPTY_BAR = NUM_P_BUFS == 1;  // Don't need to wait for P's emptiness as long as P has >= 2 buffers, since "we are issuing P[i]" <-- "O[i-2] has been issued" <-- "S[i-2] is ready" <-- "P[i-2] is free"
