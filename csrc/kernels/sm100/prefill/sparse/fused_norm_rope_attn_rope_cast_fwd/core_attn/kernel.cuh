@@ -85,7 +85,7 @@ void Kernel<CONFIG>::devfunc(const Params &params, const TMAParams &tma_params, 
         CUTE_UNROLL
         for (uint32_t i = 0; i < NUM_INDICES_BUFS; ++i) {
             smem.bar_indices_full[i].init(32);  // CTA-local
-            smem.bar_indices_empty[i].init(IS_DECODE ? 256 : 128);    // CTA-local
+            smem.bar_indices_empty[i].init(IS_DECODE ? 256 + (FP8_RAW_PIPE ? 1 : 0) : 128);    // CTA-local
         }
         CUTE_UNROLL
         for (uint32_t i = 0; i < NUM_P_BUFS; ++i) {
@@ -104,11 +104,14 @@ void Kernel<CONFIG>::devfunc(const Params &params, const TMAParams &tma_params, 
         smem.bar_tO_full.init(1);       // CTA0 -> Every CTA
         smem.bar_tO_empty.init(128*CLUSTER_SIZE);   // Every CTA -> CTA0
         smem.bar_SO_full.init(128*CLUSTER_SIZE);    // Every CTA -> CTA0
-        smem.bar_SO_empty.init(1);      // CTA0 -> Every CTA
+        if constexpr (!REUSE_KV_COMPLETION) {
+            smem.bar_SO_empty.init(1);  // CTA0 -> Every CTA
+        }
         smem.bar_li_mi_full.init(128);  // CTA-local
         smem.bar_li_mi_empty.init(128); // CTA-local
         if constexpr (IS_DECODE) {
             smem.bar_raw_kv_full.init(1);   // CTA-local
+            if constexpr (FP8_RAW_PIPE) smem.bar_raw_kv_empty[0].init(128);
         }
         fence_barrier_init();
     } else if (warp_idx == 3) {
@@ -345,28 +348,53 @@ void Kernel<CONFIG>::devfunc(const Params &params, const TMAParams &tma_params, 
             static_assert(NUM_O_TMEM_COLS_PER_ATOM % EPILOGUE_TILE_SIZE == 0);  // TODO When FOLD_FACTOR is 4 and MODEL_TYPE is V4 (so NUM_O_TMEM_COLS_PER_ATOM is 128), this isn't hold
             fp8_e4m3 output_fp8[NUM_MMA_ATOMS][NUM_O_TMEM_COLS_PER_ATOM];
             uint8_t output_sf[NUM_MMA_ATOMS][NUM_O_TMEM_COLS_PER_ATOM / O_QUANT_TILE_SIZE];
+            static_assert(!ENABLE_H64_PIPELINE || (FOLD_FACTOR == 2 && EPILOGUE_TILE_SIZE == 32 && NUM_EPILOGUE_TILES_PER_ATOM >= 2));
+            float final_output_cache[EPILOGUE_TILE_SIZE];
+            float final_output_reduction;
 
             CUTE_UNROLL
             for (uint32_t mma_atom_idx = 0; mma_atom_idx < NUM_MMA_ATOMS; mma_atom_idx += 1) {
                 CUTE_UNROLL
                 for (uint32_t epilogue_tile_idx_in_atom = 0; epilogue_tile_idx_in_atom < NUM_EPILOGUE_TILES_PER_ATOM; ++epilogue_tile_idx_in_atom) {
-                    // Fetch output from TMEM
+                    // Drain the final two tiles before processing either one,
+                    // so the next query can reuse O while the epilogue finishes.
                     uint32_t tmem_col_base = tmem_cols::O + mma_atom_idx * NUM_O_TMEM_COLS_PER_ATOM + epilogue_tile_idx_in_atom * EPILOGUE_TILE_SIZE;
                     float output[EPILOGUE_TILE_SIZE];
                     float reduce_result_by_tmem_ld;
-                    if constexpr (IS_TMEM_LD_WITH_RED_AVAILABLE) {
-                        ku::tmem_ld_red_32dp32bNx<EPILOGUE_TILE_SIZE, true, true, true>(tmem_col_base, output, reduce_result_by_tmem_ld);
+                    bool is_cached_final_tile = ENABLE_H64_PIPELINE && mma_atom_idx + 1 == NUM_MMA_ATOMS &&
+                        epilogue_tile_idx_in_atom + 1 == NUM_EPILOGUE_TILES_PER_ATOM;
+                    if (is_cached_final_tile) {
+                        CUTE_UNROLL
+                        for (uint32_t j = 0; j < EPILOGUE_TILE_SIZE; ++j)
+                            output[j] = final_output_cache[j];
+                        if constexpr (IS_TMEM_LD_WITH_RED_AVAILABLE)
+                            reduce_result_by_tmem_ld = final_output_reduction;
                     } else {
-                        ku::tmem_ld_32dp32bNx<EPILOGUE_TILE_SIZE>(tmem_col_base, output);
-                    }
-                    cutlass::arch::fence_view_async_tmem_load();
-
-                    // Notify tO's emptyness
-                    if (mma_atom_idx+1 == NUM_MMA_ATOMS && epilogue_tile_idx_in_atom+1 == NUM_EPILOGUE_TILES_PER_ATOM) {
-                        ku::tcgen05_before_thread_sync();
-                        if (!is_last_job) {
-                            // Don't arrive on the barrier if this job is the last job, to avoid "cluster target block not present"
-                            arrive_on_cta0_barrier(smem.bar_tO_empty);
+                        if constexpr (IS_TMEM_LD_WITH_RED_AVAILABLE) {
+                            ku::tmem_ld_red_32dp32bNx<EPILOGUE_TILE_SIZE, true, true, true>(tmem_col_base, output, reduce_result_by_tmem_ld);
+                        } else {
+                            ku::tmem_ld_32dp32bNx<EPILOGUE_TILE_SIZE>(tmem_col_base, output);
+                        }
+                        bool drains_output = mma_atom_idx + 1 == NUM_MMA_ATOMS &&
+                            epilogue_tile_idx_in_atom + (ENABLE_H64_PIPELINE ? 2 : 1) == NUM_EPILOGUE_TILES_PER_ATOM;
+                        if constexpr (ENABLE_H64_PIPELINE) {
+                            if (drains_output) {
+                                if constexpr (IS_TMEM_LD_WITH_RED_AVAILABLE) {
+                                    ku::tmem_ld_red_32dp32bNx<EPILOGUE_TILE_SIZE, true, true, true>(tmem_col_base + EPILOGUE_TILE_SIZE, final_output_cache, final_output_reduction);
+                                } else {
+                                    ku::tmem_ld_32dp32bNx<EPILOGUE_TILE_SIZE>(tmem_col_base + EPILOGUE_TILE_SIZE, final_output_cache);
+                                }
+                            }
+                        }
+                        // Complete every outstanding TMEM read before any of
+                        // the 128 readers announces that O can be overwritten.
+                        cutlass::arch::fence_view_async_tmem_load();
+                        if (drains_output) {
+                            ku::tcgen05_before_thread_sync();
+                            if (!is_last_job) {
+                                // The final job has no successor CTA to notify.
+                                arrive_on_cta0_barrier(smem.bar_tO_empty);
+                            }
                         }
                     }
 
@@ -507,6 +535,9 @@ void Kernel<CONFIG>::devfunc(const Params &params, const TMAParams &tma_params, 
         static_assert(FOLD_FACTOR == 2);
         bf16* sS_base = smem.s + (local_warp_idx >= 2 ? H_Q_PER_CTA * (B_TOPK/2) : 0) + (idx_in_warpgroup%H_Q_PER_CTA) * 8;
         RingBufferState rs;
+        // Track the immediately preceding PV across CLC jobs, like rs.
+        uint32_t s_previous_slot = NUM_KV_SLOTS - 1;
+        uint32_t s_previous_phase = 1;
         do {
             // For definition and consistency about `mi`, `li`, and `real_mi`, plz refer to head64 prefill
             static constexpr uint32_t NUM_ELEMS_PER_THREAD = B_TOPK * H_Q_PER_CTA / 128;
@@ -535,8 +566,20 @@ void Kernel<CONFIG>::devfunc(const Params &params, const TMAParams &tma_params, 
             for (uint32_t kv_block_idx = 0; kv_block_idx < cur_job.num_kv_blocks; ++kv_block_idx) {
                 auto [indices_buf_idx, indices_bar_phase] = rs.get<NUM_INDICES_BUFS>();
                 auto [p_buf_idx, p_bar_phase] = rs.get<NUM_P_BUFS>();
+                uint32_t preloaded_validity = 0;
+                if constexpr (ENABLE_H64_PIPELINE) {
+                    static_assert(NUM_ELEMS_PER_THREAD == 32);
+                    smem.bar_indices_full[indices_buf_idx].wait(indices_bar_phase);
+                    uint32_t mask_address = static_cast<uint32_t>(__cvta_generic_to_shared(
+                        (char*)&smem.is_k_valid[indices_buf_idx] + (local_warp_idx >= 2 ? 4 : 0)));
+                    asm volatile("ld.shared.u32 %0, [%1];" : "=r"(preloaded_validity) : "r"(mask_address) : "memory");
+                    // Keep this mask generation alive until the original
+                    // indices-empty arrival, but overlap its load with QK.
+                }
                 smem.bar_tP_full[p_buf_idx].wait(p_bar_phase);
-                smem.bar_indices_full[indices_buf_idx].wait(indices_bar_phase);
+                if constexpr (!ENABLE_H64_PIPELINE) {
+                    smem.bar_indices_full[indices_buf_idx].wait(indices_bar_phase);
+                }
                 ku::tcgen05_after_thread_sync();
 
                 float p[NUM_ELEMS_PER_THREAD];
@@ -544,7 +587,8 @@ void Kernel<CONFIG>::devfunc(const Params &params, const TMAParams &tma_params, 
                     NUM_ELEMS_PER_THREAD,
                     barrier_ids::WG3_WARP02_SYNC,
                     barrier_ids::WG3_WARP13_SYNC,
-                    false
+                    false,
+                    ENABLE_H64_PIPELINE
                 >(
                     tmem_cols::get_p(p_buf_idx),
                     (char*)&smem.is_k_valid[indices_buf_idx],
@@ -556,7 +600,8 @@ void Kernel<CONFIG>::devfunc(const Params &params, const TMAParams &tma_params, 
                         }
                     },
                     smem.p_exchange_buf,
-                    p
+                    p,
+                    preloaded_validity
                 );
 
                 float cur_pi_max = get_max<NUM_ELEMS_PER_THREAD>(p);
@@ -586,7 +631,16 @@ void Kernel<CONFIG>::devfunc(const Params &params, const TMAParams &tma_params, 
                 li = fmaf(li, scale_for_old, cur_sum);
 
                 // Store S
-                smem.bar_SO_empty.wait(rs.get<1>().second^1);
+                if constexpr (REUSE_KV_COMPLETION) {
+                    // The previous PV's full completion releases both KV and S
+                    // and makes O safe to rescale. Reusing that KV slot again
+                    // requires this S tile, so the completion cannot phase-skip.
+                    // Initially slot 2 is in phase zero; waiting on phase one
+                    // succeeds without waiting for a nonexistent previous PV.
+                    smem.bar_kv_slot_empty[s_previous_slot].wait(s_previous_phase);
+                } else {
+                    smem.bar_SO_empty.wait(rs.get<1>().second^1);
+                }
                 CUTE_UNROLL
                 for (int i = 0; i < NUM_ELEMS_PER_THREAD/8; ++i) {
                     ku::st_shared(sS_base + i*8*H_Q_PER_CTA, *(__int128_t*)(s + i*8));
@@ -602,6 +656,12 @@ void Kernel<CONFIG>::devfunc(const Params &params, const TMAParams &tma_params, 
                 fence_view_async_shared();
                 ku::tcgen05_before_thread_sync();
                 arrive_on_cta0_barrier(smem.bar_SO_full);
+                if constexpr (REUSE_KV_COMPLETION) {
+                    if (++s_previous_slot == NUM_KV_SLOTS) {
+                        s_previous_slot = 0;
+                        s_previous_phase ^= 1;
+                    }
+                }
                 rs.update();
             }
 
@@ -627,7 +687,7 @@ void Kernel<CONFIG>::devfunc(const Params &params, const TMAParams &tma_params, 
         } while (cur_job.is_valid);
     } else if (warpgroup_idx == 2) {
         cutlass::arch::warpgroup_reg_dealloc<72>();
-        if (warp_idx == 8 && cta_idx == 0 && elect_one_sync()) {
+        if (warp_idx == MMA_WARP && cta_idx == 0 && elect_one_sync()) {
             // MMA warp (CTA0 only)
             auto tiled_mma_qk = TiledMMA_QK{};
             auto tiled_mma_sv = TiledMMA_SV{};
@@ -692,7 +752,9 @@ void Kernel<CONFIG>::devfunc(const Params &params, const TMAParams &tma_params, 
                 ku::tcgen05_after_thread_sync();
                 ku::utcmma_ss(tiled_mma_sv, sS, sV, tO, kv_block_idx == 0);
                 umma_arrive_on_every_cta(smem.bar_kv_slot_empty[kv_slot_idx]);
-                umma_arrive_on_every_cta(smem.bar_SO_empty);
+                if constexpr (!REUSE_KV_COMPLETION) {
+                    umma_arrive_on_every_cta(smem.bar_SO_empty);
+                }
                 if (kv_block_idx == job.num_kv_blocks-1) {
                     umma_arrive_on_every_cta(smem.bar_tO_full);
                 }
@@ -716,7 +778,7 @@ void Kernel<CONFIG>::devfunc(const Params &params, const TMAParams &tma_params, 
                 
                 cur_job = next_job;
             } while (cur_job.is_valid);
-        } else if (warp_idx == 9 && elect_one_sync()) {
+        } else if (warp_idx == CLC_WARP && elect_one_sync()) {
             // CLC warp
             bool phase = 0;
             while (true) {
@@ -878,6 +940,35 @@ void Kernel<CONFIG>::devfunc(const Params &params, const TMAParams &tma_params, 
                 }
                 cur_job = get_next_job(cur_job);
             } while (cur_job.is_valid);
+        } else if (warp_idx == 11) {
+            if constexpr (FP8_RAW_PIPE) {
+                if (elect_one_sync()) {
+                    OuterloopArgs cur_job = get_first_job();
+                    RingBufferState rs;
+                    do {
+                        run_along_kv_blocks(cur_job, [&]<KVLocation LOC>(uint32_t kv_block_idx) {
+                            auto [index_slot, index_phase] = rs.get<NUM_INDICES_BUFS>();
+                            smem.bar_indices_full[index_slot].wait(index_phase);
+                            smem.bar_raw_kv_empty[0].wait(rs.get<1>().second ^ 1);
+                            CUTE_UNROLL
+                            for (uint32_t row = 0; row < B_TOPK; row += 4) {
+                                bool extra = LOC == KVLocation::EXTRA ||
+                                    (LOC == KVLocation::ORIG_AND_EXTRA && kv_block_idx * B_TOPK + row >= cur_job.num_orig_slots);
+                                auto tensor_map = extra ? &tma_params.tensor_map_extra_kv_fp8_part_cta0 :
+                                    &tma_params.tensor_map_kv_fp8_part_cta0;
+                                int4 coords = *(int4*)(smem.decode_tma_coords[index_slot] + row);
+                                ku::tma_gather4(tensor_map, smem.bar_raw_kv_full,
+                                    smem.raw_kv + row * RAW_FP8_TOKEN_SMEM_STRIDE_CTA0, 0, coords,
+                                    (int64_t)TMA::CacheHintSm90::EVICT_FIRST);
+                            }
+                            smem.bar_indices_empty[index_slot].arrive();
+                            smem.bar_raw_kv_full.arrive_and_expect_tx(B_TOPK * RAW_FP8_TOKEN_SMEM_STRIDE_CTA0);
+                            rs.update();
+                        });
+                        cur_job = get_next_job(cur_job);
+                    } while (cur_job.is_valid);
+                }
+            }
         }
     } else if (warpgroup_idx == 1) {
         cutlass::arch::warpgroup_reg_alloc<128>();
@@ -1168,7 +1259,9 @@ void Kernel<CONFIG>::devfunc(const Params &params, const TMAParams &tma_params, 
                 // 24 25 26 27
                 // 28 29 30 31
                 //
-                // Dequant pipeline:
+                // FP8_RAW_PIPE fetches the next raw block in warp 11 while WG1
+                // converts the current block and writes a separate BF16 slot.
+                // Otherwise use the original in-place dequant pipeline:
                 //  1. Load raw FP8 KV from global memory into the target shared-memory KV buffer via TMA gather4.
                 //  2. While TMA is in flight, load scale factors via plain global loads.
                 //  3. Wait for TMA, then read raw FP8 KV via LDS.128. Synchronize afterward to prevent the
@@ -1230,7 +1323,9 @@ void Kernel<CONFIG>::devfunc(const Params &params, const TMAParams &tma_params, 
                         CUTE_UNROLL
                         for (uint32_t local_row_idx = 0; local_row_idx < NUM_TOKENS_PER_THREAD; ++local_row_idx) {
                             uint32_t row = get_row_idx(local_row_idx);
-                            cached_tma_coord[local_row_idx] = smem.decode_tma_coords[indices_buf_idx][row];
+                            if constexpr (!FP8_RAW_PIPE) {
+                                cached_tma_coord[local_row_idx] = smem.decode_tma_coords[indices_buf_idx][row];
+                            }
                             uint8_t *scale_src = smem.decode_scales[indices_buf_idx] +
                                 row * NUM_SCALES_EACH_TOKEN_PER_CTA;
                             if constexpr (NUM_SCALED_EACH_TOKEN_LOCAL == 4) {
@@ -1245,75 +1340,77 @@ void Kernel<CONFIG>::devfunc(const Params &params, const TMAParams &tma_params, 
                         smem.bar_indices_empty[indices_buf_idx].arrive();
 
                         auto [kv_slot_idx, kv_bar_phase] = rs.get<NUM_KV_SLOTS>();
-                        smem.bar_kv_slot_empty[kv_slot_idx].wait(kv_bar_phase^1);
+                        if constexpr (!FP8_RAW_PIPE) smem.bar_kv_slot_empty[kv_slot_idx].wait(kv_bar_phase^1);
                     
-                        int4 collected_tma_coords[NUM_TOKENS_PER_THREAD][2];
-                        CUTE_UNROLL
-                        for (uint32_t local_row_idx = 0; local_row_idx < NUM_TOKENS_PER_THREAD; ++local_row_idx) {
-                            CUTE_UNROLL
-                            for (uint32_t i = 0; i < 2; ++i) {
-                                // Each tma_gather4 covers 4 consecutive rows, which must share one tensor
-                                // map. `run()` asserts topk % 4 == 0 when the extra KV is present, so a
-                                // 4-row group never straddles the orig/extra boundary
-                                uint32_t row_start = local_row_idx*NUM_DEQUANT_WARPS*NUM_ROWS_PER_WARP + local_warp_idx*NUM_ROWS_PER_WARP + i*4;
-                                bool group_in_extra = is_pos_in_extra(kv_block_idx*B_TOPK + row_start);
-                                auto tensor_map = group_in_extra ? 
-                                    (cta_idx == 0 ? &tma_params.tensor_map_extra_kv_fp8_part_cta0 : &tma_params.tensor_map_extra_kv_fp8_part_cta1) :
-                                    (cta_idx == 0 ? &tma_params.tensor_map_kv_fp8_part_cta0 : &tma_params.tensor_map_kv_fp8_part_cta1);
-                                int4 coords;
-                                coords.x = i == 0 ? cached_tma_coord[local_row_idx] : __shfl_sync(0xFFFFFFFF, cached_tma_coord[local_row_idx], i*16); // Since the thread being elected is always lane 0 on SM100
-                                coords.y = __shfl_sync(0xFFFFFFFF, cached_tma_coord[local_row_idx], i*16+4);
-                                coords.z = __shfl_sync(0xFFFFFFFF, cached_tma_coord[local_row_idx], i*16+8);
-                                coords.w = __shfl_sync(0xFFFFFFFF, cached_tma_coord[local_row_idx], i*16+12);
-                                collected_tma_coords[local_row_idx][i] = coords;
-                                if (elect_one_sync()) {
-                                    auto smem_ptr = (fp8_e4m3*)smem.kv_slots[kv_slot_idx] + row_start * d_fp8_this_cta_padded;
-                                    ku::tma_gather4(
-                                        tensor_map,
-                                        smem.bar_raw_kv_full,
-                                        smem_ptr,
-                                        0,
-                                        coords,
-                                        (int64_t)TMA::CacheHintSm90::EVICT_FIRST
-                                    );
-                                }
-                            }
-                        }
-
-                        if (D_BF16 > 0 && cta_idx+1 == CLUSTER_SIZE && elect_one_sync()) {
+                        if constexpr (!FP8_RAW_PIPE) {
+                            int4 collected_tma_coords[NUM_TOKENS_PER_THREAD][2];
                             CUTE_UNROLL
                             for (uint32_t local_row_idx = 0; local_row_idx < NUM_TOKENS_PER_THREAD; ++local_row_idx) {
                                 CUTE_UNROLL
                                 for (uint32_t i = 0; i < 2; ++i) {
+                                    // Each tma_gather4 covers 4 consecutive rows, which must share one tensor
+                                    // map. `run()` asserts topk % 4 == 0 when the extra KV is present, so a
+                                    // 4-row group never straddles the orig/extra boundary
                                     uint32_t row_start = local_row_idx*NUM_DEQUANT_WARPS*NUM_ROWS_PER_WARP + local_warp_idx*NUM_ROWS_PER_WARP + i*4;
-                                    // Like the fp8 part above, a 4-row gather4 group never straddles the orig/extra boundary
-                                    auto tensor_map = is_pos_in_extra(kv_block_idx*B_TOPK + row_start) ? &tma_params.tensor_map_extra_kv_bf16_part : &tma_params.tensor_map_kv_bf16_part;
-                                    auto smem_ptr = smem.kv_slots[kv_slot_idx] + (IS_2CTA ? (D_FP8-D_VO/2)/64 : D_FP8/64) * B_TOPK * 64 + row_start * 64;
-                                    if constexpr (IS_2CTA) {
-                                        ku::tma_gather4_cta_group_2<true>(
-                                            tensor_map,
-                                            smem.bar_kv_slot_full[kv_slot_idx],
-                                            smem_ptr,
-                                            0,
-                                            collected_tma_coords[local_row_idx][i],
-                                            (int64_t)TMA::CacheHintSm90::EVICT_FIRST
-                                        );
-                                    } else {
+                                    bool group_in_extra = is_pos_in_extra(kv_block_idx*B_TOPK + row_start);
+                                    auto tensor_map = group_in_extra ?
+                                        (cta_idx == 0 ? &tma_params.tensor_map_extra_kv_fp8_part_cta0 : &tma_params.tensor_map_extra_kv_fp8_part_cta1) :
+                                        (cta_idx == 0 ? &tma_params.tensor_map_kv_fp8_part_cta0 : &tma_params.tensor_map_kv_fp8_part_cta1);
+                                    int4 coords;
+                                    coords.x = i == 0 ? cached_tma_coord[local_row_idx] : __shfl_sync(0xFFFFFFFF, cached_tma_coord[local_row_idx], i*16); // Since the thread being elected is always lane 0 on SM100
+                                    coords.y = __shfl_sync(0xFFFFFFFF, cached_tma_coord[local_row_idx], i*16+4);
+                                    coords.z = __shfl_sync(0xFFFFFFFF, cached_tma_coord[local_row_idx], i*16+8);
+                                    coords.w = __shfl_sync(0xFFFFFFFF, cached_tma_coord[local_row_idx], i*16+12);
+                                    collected_tma_coords[local_row_idx][i] = coords;
+                                    if (elect_one_sync()) {
+                                        auto smem_ptr = (fp8_e4m3*)smem.kv_slots[kv_slot_idx] + row_start * d_fp8_this_cta_padded;
                                         ku::tma_gather4(
                                             tensor_map,
-                                            smem.bar_kv_slot_full[kv_slot_idx],
+                                            smem.bar_raw_kv_full,
                                             smem_ptr,
                                             0,
-                                            collected_tma_coords[local_row_idx][i],
+                                            coords,
                                             (int64_t)TMA::CacheHintSm90::EVICT_FIRST
                                         );
                                     }
                                 }
                             }
-                        }
 
-                        if (idx_in_warpgroup == 0) {
-                            smem.bar_raw_kv_full.arrive_and_expect_tx(B_TOPK*d_fp8_this_cta_padded*sizeof(fp8_e4m3));
+                            if (D_BF16 > 0 && cta_idx+1 == CLUSTER_SIZE && elect_one_sync()) {
+                                CUTE_UNROLL
+                                for (uint32_t local_row_idx = 0; local_row_idx < NUM_TOKENS_PER_THREAD; ++local_row_idx) {
+                                    CUTE_UNROLL
+                                    for (uint32_t i = 0; i < 2; ++i) {
+                                        uint32_t row_start = local_row_idx*NUM_DEQUANT_WARPS*NUM_ROWS_PER_WARP + local_warp_idx*NUM_ROWS_PER_WARP + i*4;
+                                        // Like the fp8 part above, a 4-row gather4 group never straddles the orig/extra boundary
+                                        auto tensor_map = is_pos_in_extra(kv_block_idx*B_TOPK + row_start) ? &tma_params.tensor_map_extra_kv_bf16_part : &tma_params.tensor_map_kv_bf16_part;
+                                        auto smem_ptr = smem.kv_slots[kv_slot_idx] + (IS_2CTA ? (D_FP8-D_VO/2)/64 : D_FP8/64) * B_TOPK * 64 + row_start * 64;
+                                        if constexpr (IS_2CTA) {
+                                            ku::tma_gather4_cta_group_2<true>(
+                                                tensor_map,
+                                                smem.bar_kv_slot_full[kv_slot_idx],
+                                                smem_ptr,
+                                                0,
+                                                collected_tma_coords[local_row_idx][i],
+                                                (int64_t)TMA::CacheHintSm90::EVICT_FIRST
+                                            );
+                                        } else {
+                                            ku::tma_gather4(
+                                                tensor_map,
+                                                smem.bar_kv_slot_full[kv_slot_idx],
+                                                smem_ptr,
+                                                0,
+                                                collected_tma_coords[local_row_idx][i],
+                                                (int64_t)TMA::CacheHintSm90::EVICT_FIRST
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+
+                            if (idx_in_warpgroup == 0) {
+                                smem.bar_raw_kv_full.arrive_and_expect_tx(B_TOPK*d_fp8_this_cta_padded*sizeof(fp8_e4m3));
+                            }
                         }
                         smem.bar_raw_kv_full.wait(rs.get<1>().second);
 
@@ -1327,7 +1424,7 @@ void Kernel<CONFIG>::devfunc(const Params &params, const TMAParams &tma_params, 
                                     continue;
                                 }
                                 *(__int128_t*)(cached_input[local_row_idx][local_col_idx]) = ku::ld_shared(
-                                    (fp8_e4m3*)smem.kv_slots[kv_slot_idx] + 
+                                    (FP8_RAW_PIPE ? (fp8_e4m3*)smem.raw_kv : (fp8_e4m3*)smem.kv_slots[kv_slot_idx]) +
                                     row*d_fp8_this_cta_padded + 
                                     local_col_idx*GROUP_SIZE*16 + 
                                     idx_in_group*16
@@ -1335,6 +1432,13 @@ void Kernel<CONFIG>::devfunc(const Params &params, const TMAParams &tma_params, 
                             }
                         }
                         NamedBarrier::arrive_and_wait(128, 7);  // Make sure everyone has finished reading
+                        if constexpr (FP8_RAW_PIPE) {
+                            // All readers hold the raw values in registers. Release the
+                            // raw slot before waiting for a BF16 destination, allowing
+                            // the next TMA load to overlap conversion and stores.
+                            smem.bar_raw_kv_empty[0].arrive();
+                            smem.bar_kv_slot_empty[kv_slot_idx].wait(kv_bar_phase^1);
+                        }
 
                         CUTE_UNROLL
                         for (uint32_t local_row_idx = 0; local_row_idx < NUM_TOKENS_PER_THREAD; ++local_row_idx) {
@@ -1601,6 +1705,22 @@ void Kernel<CONFIG>::run(const Params &params) {
 
 template<Config CONFIG>
 void run_fused_norm_rope_attn_rope_cast_fwd_kernel(const ParamT<CONFIG.FWD_MODE>& params) {
+    if constexpr (CONFIG.ENABLE_H64_PIPELINE && CONFIG.FWD_MODE == SparseAttnFwdMode::Prefill) {
+        // Issuer relocation only improved these measured large-query cases.
+        // Smaller inputs keep warp 8 while retaining the other H64 changes.
+        bool use_mma11 = params.topk == 640 && (
+            (params.s_q == 1024 && params.s_kv == 32768) ||
+            (params.s_q == 4096 && (params.s_kv == 8192 || params.s_kv == 32768)));
+        if (use_mma11) {
+            constexpr Config mma11_config = [] {
+                Config config = CONFIG;
+                config.USE_PREFILL_MMA_WARP11 = true;
+                return config;
+            }();
+            Kernel<mma11_config>::run(params);
+            return;
+        }
+    }
     using KernelType = Kernel<CONFIG>;
     KernelType::run(params);
 }

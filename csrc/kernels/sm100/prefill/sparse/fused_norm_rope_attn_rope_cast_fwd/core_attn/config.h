@@ -44,8 +44,9 @@ Execution structure:
     FP8 quant, store to gmem). Timeline: Q0 Q1 O0 Q2 O1 ... Qn O(n-1) On
   - WG1: KV producer. Prefill: gathers the bf16 KV block via TMA gather4. Decode: loads the fp8 / fp4
     part from the paged cache and dequantizes it into the smem KV slots in registers
-  - WG2: MMA warp (warp 8, issues UMMAs on CTA0 only), CLC warp (warp 9), indices / validity
-    mask generator (warp 10), and (decode only) TMA warp for the bf16 KV part (warp 11)
+  - WG2: MMA issuer on CTA0, CLC issuer, indices / validity mask generator (warp 10).
+    MMA/CLC use warps 8/9 by default, 9/8 in the H64 FP8 pipeline. Selected H64 Prefill
+    cases move MMA to warp 11; the H64 FP8 pipeline uses warp 11 for raw KV TMA
   - WG3: Scale & Exp: reduces P, maintains the online softmax state (mi / li), produces S
 - KV tokens are processed in blocks of B_TOPK (96 for 2-CTA, 64 for 1-CTA) with NUM_KV_SLOTS-deep
   software pipelining
@@ -57,9 +58,10 @@ Multi-rail GeMM is always used:
 Decoding mode (FWD_MODE == SparseAttnFwdMode::Decode):
 - Batch size must be 1; the grid covers the s_q query tokens
 - The KV cache is a paged FP8 cache with the same format as `sm100::decode::sparse::head64` (V4 layout).
-  The fp8 (D_FP8) part is loaded from global memory and dequantized in-place into the KV slots by
-  warpgroup 1 (no intermediate raw-fp8 smem buffer), while the bf16 (D_BF16, RoPE) part is loaded via
-  TMA gather4 by warp 11. An optional extra (secondary) KV cache is supported
+  By default, warpgroup 1 loads the fp8 (D_FP8) part and dequantizes it in-place in a KV slot,
+  and issues TMA gathers for the bf16 (D_BF16, RoPE) part. The H64 V4.1 FP8 pipeline instead
+  uses warp 11 to fill an independent raw buffer and WG1 to write two BF16 slots.
+  An optional extra (secondary) KV cache is supported
 - EXTRA_MODEL_TYPE == ModelType::V41_FP4 selects an fp4 extra KV cache: every token is 512 e2m1 + 32 e4m3 scales,
   each page block stores [page_block_size x 256 B data rows] + [page_block_size x 32 B scale rows]. Warpgroup 1 then
   dequantizes both caches with a common code path (see there) instead of the fp8-only one
@@ -105,6 +107,13 @@ static constexpr uint32_t D_ROPE = 64;
 static constexpr uint32_t D_NOPE = D_QK - D_ROPE;
 static constexpr uint32_t WV_GROUP_SIZE = 8;
 static constexpr bool ENABLE_Q_NORM = CONFIG.ENABLE_Q_NORM;
+static constexpr bool ENABLE_H64_PIPELINE = CONFIG.ENABLE_H64_PIPELINE;
+static_assert(!ENABLE_H64_PIPELINE || (H_Q == 64 && !ENABLE_Q_NORM &&
+    (!IS_DECODE || (MODEL_TYPE == ModelType::V41 && EXTRA_MODEL_TYPE == ModelType::V41))));
+static_assert(!CONFIG.USE_PREFILL_MMA_WARP11 || (ENABLE_H64_PIPELINE && !IS_DECODE));
+static constexpr bool FP8_RAW_PIPE = ENABLE_H64_PIPELINE && IS_DECODE;
+static constexpr uint32_t MMA_WARP = FP8_RAW_PIPE ? 9 : (CONFIG.USE_PREFILL_MMA_WARP11 ? 11 : 8);
+static constexpr uint32_t CLC_WARP = FP8_RAW_PIPE ? 8 : 9;
 
 // Cluster shape selection
 static constexpr uint32_t CLUSTER_SIZE = ku::ceil_div((uint32_t)H_Q, 64u);
@@ -151,8 +160,20 @@ static constexpr uint32_t KV_CACHE_BYTES_PER_TOKEN = OrigKVFormat::BYTES_PER_TOK
 static constexpr uint32_t RAW_KV_GROUP_BYTES = ku::ceil_div(4 * std::max(OrigKVFormat::RAW_TOKEN_SMEM_STRIDE, ExtraKVFormat::RAW_TOKEN_SMEM_STRIDE), 128u) * 128;
 static_assert(!HAS_FP4_KV || B_TOPK / 4 * RAW_KV_GROUP_BYTES <= B_TOPK * D_QK / CLUSTER_SIZE * sizeof(bf16));
 
+static constexpr uint32_t D_FP8_CTA0 = CLUSTER_SIZE == 1 ? D_FP8 : D_VO/2;
+static constexpr uint32_t D_FP8_CTA1 = D_FP8 - D_FP8_CTA0;
+static constexpr bool IS_CTA0_RAW_KV_PADDED = D_FP8_CTA0 % 128 == 0;
+static constexpr bool IS_CTA1_RAW_KV_PADDED = D_FP8_CTA1 % 128 == 0;
+// Bytes of one raw fp8 row in shared memory, i.e. the box of the fp8 tensor maps: the fp8-only dequant path pads a row by 64 B
+// when needed, the common path (HAS_FP4_KV) by 16 B (KVFormat::RAW_TOKEN_SMEM_STRIDE)
+static constexpr uint32_t RAW_FP8_TOKEN_SMEM_STRIDE_CTA0 = HAS_FP4_KV ? OrigKVFormat::RAW_TOKEN_SMEM_STRIDE : D_FP8_CTA0 + (IS_CTA0_RAW_KV_PADDED ? 64 : 0);
+static constexpr uint32_t RAW_FP8_TOKEN_SMEM_STRIDE_CTA1 = HAS_FP4_KV ? OrigKVFormat::RAW_TOKEN_SMEM_STRIDE : D_FP8_CTA1 + (IS_CTA1_RAW_KV_PADDED ? 64 : 0);
+
 static constexpr uint32_t NUM_THREADS = 512;
-static constexpr uint32_t NUM_WORKING_THREADS = 
+// The all-FP8 pipeline keeps the existing padded row layout in a separate
+// raw buffer. One elected thread in warp 11 feeds the four dequant warps.
+static_assert(!FP8_RAW_PIPE || (CLUSTER_SIZE == 1 && D_FP8 == 512 && D_BF16 == 0));
+static constexpr uint32_t NUM_WORKING_THREADS = (
     CLUSTER_SIZE == 1 ? (
         IS_DECODE ?
         128 + 128 + (1+1+32) + 128 :   // WG0 + WG3 + (MMA + CLC + indices) + WG1 (dequant)
@@ -161,13 +182,15 @@ static constexpr uint32_t NUM_WORKING_THREADS =
         IS_DECODE ? 
         128*2 + 128*2 + (1+2+32*2) + 128*2 :
         128*2 + 128*2 + (1+2+32*2) + 4*2
-    );
+    )) + (FP8_RAW_PIPE ? 1 : 0);
 
 static constexpr uint32_t FOLD_FACTOR = 128 / H_Q_PER_CTA;
 static constexpr uint32_t NUM_MRGEMM_RAILS = 2; // The number of "rails" (batch size) during multi-rail GeMM. Currently must be 2
 static constexpr uint32_t NUM_P_ELEMS_PER_THREAD = H_Q_PER_CTA * B_TOPK / 128;
 
-static constexpr uint32_t NUM_KV_SLOTS = 3;
+static constexpr uint32_t NUM_KV_SLOTS = FP8_RAW_PIPE ? 2 : 3;
+static constexpr bool REUSE_KV_COMPLETION = ENABLE_H64_PIPELINE && !IS_DECODE;
+static_assert(!REUSE_KV_COMPLETION || (CLUSTER_SIZE == 1 && NUM_KV_SLOTS == 3));
 static constexpr uint32_t NUM_INDICES_BUFS = 4;
 static constexpr uint32_t NUM_P_BUFS = CLUSTER_SIZE == 2 ? 1 : 2;
 static constexpr uint32_t NEED_TP_EMPTY_BAR = NUM_P_BUFS == 1;  // Don't need to wait for P's emptiness as long as P has >= 2 buffers, since "we are issuing P[i]" <-- "O[i-2] has been issued" <-- "S[i-2] is ready" <-- "P[i-2] is free"
@@ -208,6 +231,7 @@ using TiledMMA_SV = cute::conditional_t<
 
 struct SharedMemoryPlan {
     CUTE_ALIGNAS(1024) bf16 kv_slots[NUM_KV_SLOTS][B_TOPK * D_QK / CLUSTER_SIZE];    // Cluster size = 1: the whole KV; cluster size = 2: half KV
+    CUTE_ALIGNAS(128) uint8_t raw_kv[FP8_RAW_PIPE ? B_TOPK * RAW_FP8_TOKEN_SMEM_STRIDE_CTA0 : 0];
     CUTE_ALIGNAS(1024) bf16 s[H_Q_PER_CTA * B_TOPK];
     CUTE_ALIGNAS(1024) float p_exchange_buf[4][32*NUM_P_ELEMS_PER_THREAD];
     CUTE_ALIGNAS(1024) uint8_t is_k_valid[NUM_INDICES_BUFS][ku::find_next_power_of_2(B_TOPK/8)];
@@ -233,6 +257,7 @@ struct SharedMemoryPlan {
     transac_bar_t bar_clc_full, bar_clc_empty;
     transac_bar_t bar_li_mi_full, bar_li_mi_empty;
     transac_bar_t bar_raw_kv_full;
+    transac_bar_t bar_raw_kv_empty[FP8_RAW_PIPE ? 1 : 0];
 
     ku::CLCResponseObj clc_response_obj;
     array_aligned<uint32_t, 1> tmem_start_addr;
@@ -252,14 +277,6 @@ struct TMAParams {
     CUtensorMap tensor_map_extra_kv_fp4_part_cta0;
     CUtensorMap tensor_map_extra_kv_fp4_part_cta1;
 };
-static constexpr uint32_t D_FP8_CTA0 = CLUSTER_SIZE == 1 ? D_FP8 : D_VO/2;
-static constexpr uint32_t D_FP8_CTA1 = D_FP8 - D_FP8_CTA0;
-static constexpr bool IS_CTA0_RAW_KV_PADDED = D_FP8_CTA0 % 128 == 0;
-static constexpr bool IS_CTA1_RAW_KV_PADDED = D_FP8_CTA1 % 128 == 0;
-// Bytes of one raw fp8 row in shared memory, i.e. the box of the fp8 tensor maps: the fp8-only dequant path pads a row by 64 B
-// when needed, the common path (HAS_FP4_KV) by 16 B (KVFormat::RAW_TOKEN_SMEM_STRIDE)
-static constexpr uint32_t RAW_FP8_TOKEN_SMEM_STRIDE_CTA0 = HAS_FP4_KV ? OrigKVFormat::RAW_TOKEN_SMEM_STRIDE : D_FP8_CTA0 + (IS_CTA0_RAW_KV_PADDED ? 64 : 0);
-static constexpr uint32_t RAW_FP8_TOKEN_SMEM_STRIDE_CTA1 = HAS_FP4_KV ? OrigKVFormat::RAW_TOKEN_SMEM_STRIDE : D_FP8_CTA1 + (IS_CTA1_RAW_KV_PADDED ? 64 : 0);
 
 using AllocatorT = std::conditional_t<IS_2CTA, cute::TMEM::Allocator2Sm, cute::TMEM::Allocator1Sm>;
 
