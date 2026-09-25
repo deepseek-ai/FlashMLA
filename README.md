@@ -66,7 +66,9 @@ This kernel fuses Q-norm (only used in V4, not V4.1), Q-RoPE, core attention, O-
 
 - SM90 / SM100 (See the support matrix below)
 - CUDA 12.8 and above (CUDA 12.9+ is required for SM100 kernels)
-- PyTorch 2.0 and above
+- Build-time PyTorch 2.11+
+
+The resulting wheel will be compatible with PyTorch 2.10+ and Python 3.10+ at runtime.
 
 Support matrix:
 
