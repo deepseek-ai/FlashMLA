@@ -2,6 +2,6 @@
 
 #include "kernels/sm100/prefill/dense/interface.h"
 
-TORCH_LIBRARY_IMPL(flash_mla, CUDA, m) {
-    m.impl("dense_prefill_fwd", &FMHACutlassSM100FwdRun);
+STABLE_TORCH_LIBRARY_IMPL(flash_mla, CUDA, m) {
+    m.impl("dense_prefill_fwd", TORCH_BOX(&FMHACutlassSM100FwdRun));
 }

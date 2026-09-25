@@ -17,7 +17,13 @@ def is_flag_set(flag: str) -> bool:
     return os.getenv(flag, "FALSE").lower() in ["true", "1", "y", "yes"]
 
 def get_features_args():
-    features_args = []
+    # ABI-stable flags (always on): TORCH_TARGET_VERSION pins the minimum runtime
+    # PyTorch version and bans unstable ATen/c10/torch headers at compile time;
+    # USE_CUDA exposes aoti_torch_get_current_cuda_stream from the shim.
+    features_args = [
+        "-DTORCH_TARGET_VERSION=0x020a000000000000",  # PyTorch >= 2.10 at runtime
+        "-DUSE_CUDA",
+    ]
     if is_flag_set("FLASH_MLA_DISABLE_FP16"):
         features_args.append("-DFLASH_MLA_DISABLE_FP16")
     return features_args
