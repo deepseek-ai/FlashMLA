@@ -1,0 +1,1 @@
+# We use this `__init__.py` to let `setup.py` be able to import `tests.kernelkit`

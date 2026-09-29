@@ -1,17 +1,35 @@
 #pragma once
 
+#include <array>
+#include <limits>
 #include <span>
+#include <string>
+#include <string_view>
+#include <type_traits>
+#include <utility>
+#include <vector>
 
 #include <torch/extension.h>
-#include <ATen/cuda/CUDAContext.h>
-#include <c10/cuda/CUDAGuard.h>
 #include <kerutils/supplemental/torch_tensors.h>
 
-#include <cutlass/bfloat16.h>
-
-#include "kernels/kv_cache_format.h"
+#include "cuda_kernels/kv_cache_format.h"
 
 static constexpr float LOG_2_E = 1.44269504f;
+
+#ifdef FLASH_MLA_IS_BUILD_ON_CUDA
+#include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAGuard.h>
+#include <cutlass/bfloat16.h>
+#endif
+
+#ifdef FLASH_MLA_IS_BUILD_ON_ASCEND
+#include <acl/acl.h>
+#include <torch_npu/csrc/core/npu/NPUStream.h>
+#endif
+
+#ifdef FLASH_MLA_IS_BUILD_ON_CUDA
+
+using bf16 = cutlass::bfloat16_t;
 
 // Instantiation for tensor.data_ptr<cutlass::bfloat16_t>()
 template<>
@@ -33,14 +51,40 @@ struct Arch {
         num_sms = device_prop->multiProcessorCount;
     }
 
-    bool is_sm90a() const {
-        return major == 9 && minor == 0;
-    }
-
     bool is_sm100f() const {
         return major == 10;
     }
 };
+#endif  // FLASH_MLA_IS_BUILD_ON_CUDA
+
+// For CUDA GPU, return the number of Stream Multiprocessor (SM)s; For Ascend NPU, return the number of AI Cores
+inline int get_num_sms() {
+    static int num_sms = []() {
+        #ifdef FLASH_MLA_IS_BUILD_ON_CUDA
+            return Arch().num_sms;
+        #endif
+        #ifdef FLASH_MLA_IS_BUILD_ON_ASCEND
+            int32_t device_id = 0;
+            aclrtGetDevice(&device_id);
+            int64_t num_ai_cores;
+            aclrtGetDeviceInfo(device_id, ACL_DEV_ATTR_AICORE_CORE_NUM, &num_ai_cores);
+            return num_ai_cores;
+        #endif
+    }();    // This is thread safe since static variable initialization is protected by lock
+    return num_sms;
+}
+
+// For CUDA GPU, return the current `cudaStream_t`; For Ascend NPU, return the current `aclrtStream`
+#ifdef FLASH_MLA_IS_BUILD_ON_CUDA
+inline cudaStream_t get_current_stream() {
+    return at::cuda::getCurrentCUDAStream().stream();
+}
+#endif
+#ifdef FLASH_MLA_IS_BUILD_ON_ASCEND
+inline aclrtStream get_current_stream() {
+    return c10_npu::getCurrentNPUStream().stream();
+}
+#endif
 
 // Convert int64_t stride to int32_t, with overflow check.
 inline int int64_stride_to_int(int64_t orig_stride) {
@@ -50,6 +94,8 @@ inline int int64_stride_to_int(int64_t orig_stride) {
     return static_cast<int>(orig_stride);
 }
 
+// Dispatch the runtime number of query heads to a compile-time constant.
+// The kernels are instantiated for num_heads_q == 64 and num_heads_q == 128.
 #define DISPATCH_NUM_HEADS(NUM_HEADS, CONSTEXPR_NAME, ...) \
     [&] () { \
         if (NUM_HEADS == 128) { \
@@ -63,19 +109,6 @@ inline int int64_stride_to_int(int64_t orig_stride) {
         } \
     } ();
 
-#define DISPATCH_HEAD_DIM(HEAD_DIM, CONSTEXPR_NAME, ...) \
-[&] () { \
-    if (HEAD_DIM == 576) { \
-        static constexpr int CONSTEXPR_NAME = 576; \
-        return __VA_ARGS__(); \
-    } else if (HEAD_DIM == 512) { \
-        static constexpr int CONSTEXPR_NAME = 512; \
-        return __VA_ARGS__(); \
-    } else { \
-        TORCH_CHECK(false, "Unsupported head_dim_qk: ", HEAD_DIM); \
-    } \
-} ();
-
 #define DISPATCH_BOOLEAN_FLAG(FLAG, CONSTEXPR_NAME, ...) \
     [&] () { \
         if (FLAG) { \
@@ -86,19 +119,6 @@ inline int int64_stride_to_int(int64_t orig_stride) {
             return __VA_ARGS__(); \
         } \
     } ();
-
-#define DISPATCH_MODEL_TYPE(MODEL_TYPE, CONSTEXPR_NAME, ...) \
-[&] () { \
-    if (MODEL_TYPE == ModelType::V32) { \
-        static constexpr ModelType CONSTEXPR_NAME = ModelType::V32; \
-        return __VA_ARGS__(); \
-    } else if (MODEL_TYPE == ModelType::V4) { \
-        static constexpr ModelType CONSTEXPR_NAME = ModelType::V4; \
-        return __VA_ARGS__(); \
-    } else { \
-        TORCH_CHECK(false, "Unsupported model type: ", (int)MODEL_TYPE); \
-    } \
-} ();
 
 // The following code is adapted from https://ykiko.me/en/articles/680412313/, which converts enum values to string names.
 template<auto value>
@@ -122,7 +142,7 @@ constexpr auto get_static_enum_name(){
     };
 }
 
-template<typename T, std::size_t N = 0> 
+template<typename T, std::size_t N = 0>
 static constexpr std::size_t get_enum_max(){
     constexpr T value = static_cast<T>(N);
     if constexpr (get_static_enum_name<value>().find(")") == std::string_view::npos)
@@ -135,8 +155,8 @@ template<typename T> requires std::is_enum_v<T>
 static constexpr std::string get_dynamic_enum_name(T value){
     constexpr std::size_t num = get_enum_max<T>();
     constexpr auto names = []<std::size_t... Is>(std::index_sequence<Is...>){
-        return std::array<std::string_view, num>{ 
-            get_static_enum_name<static_cast<T>(Is)>()... 
+        return std::array<std::string_view, num>{
+            get_static_enum_name<static_cast<T>(Is)>()...
         };
     }(std::make_index_sequence<num>{});
     return (std::string)names[static_cast<std::size_t>(value)];
@@ -146,19 +166,19 @@ static constexpr std::string get_dynamic_enum_name(T value){
 // Paged quantized KV cache formats (decoding)
 // =============================================
 
-// The format of a paged quantized KV cache with d_qk = 512 (V4 / V4.1 / V4.1 fp4), detected by bytes_per_token (kv.size(3))
+// The format of a paged quantized KV cache with d_qk = 512 (V4.1 fp8 / fp4), detected by bytes_per_token (kv.size(3))
 inline ModelType detect_kv_cache_format_for_headdim_512(int bytes_per_token) {
-    for (ModelType mt : {ModelType::V4, ModelType::V41, ModelType::V41_FP4}) {
+    for (ModelType mt : {ModelType::V41, ModelType::V41_FP4}) {
         if (bytes_per_token == kv_cache_bytes_per_token(mt)) {
             return mt;
         }
     }
     TORCH_CHECK(false, "Unsupported bytes_per_token for d_qk=512: ", bytes_per_token, ". Expected ",
-        kv_cache_bytes_per_token(ModelType::V4), " (V4), ", kv_cache_bytes_per_token(ModelType::V41), " (V4.1) or ",
+        kv_cache_bytes_per_token(ModelType::V41), " (V4.1) or ",
         kv_cache_bytes_per_token(ModelType::V41_FP4), " (V4.1 fp4)");
 }
 
-// Dispatches the runtime (kv, extra_kv) format pair
+// Dispatches runtime (kv, extra_kv) format pair
 template<typename... Pairs, typename Fn>
 inline void dispatch_kv_formats(KVFormatPairs<Pairs...>, ModelType kv, ModelType extra_kv, Fn &&fn) {
     bool matched = ((kv == Pairs::kv && extra_kv == Pairs::extra_kv ? (fn.template operator()<Pairs::kv, Pairs::extra_kv>(), true) : false) || ...);
@@ -241,9 +261,11 @@ public:
                 }
             }
             fprintf(stderr, "\n");
+#ifdef FLASH_MLA_IS_BUILD_ON_CUDA
             Arch cur_gpu_arch = Arch();
             fprintf(stderr, "Current GPU: %s, SM %d.%d with %d SMs\n", cur_gpu_arch.device_prop->name, cur_gpu_arch.major, cur_gpu_arch.minor, cur_gpu_arch.num_sms);
             fprintf(stderr, "This means that the dispatcher has chosen an implementation that does not support all required features. Maybe there is a bug in the dispatcher, or you have requested an invalid combination of features.\n");
+#endif
             TORCH_CHECK(false, "The chosen implementation does not support all required features. See message above for details.");
         }
     }
@@ -253,4 +275,3 @@ public:
         run_(params, required_features);
     }
 };
-

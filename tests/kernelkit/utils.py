@@ -1,5 +1,8 @@
 import os
+import contextlib
 import functools
+
+from .platform import Platform, requires_platform
 
 colors = {
     'RED_FG': '\033[31m',
@@ -28,7 +31,9 @@ def is_using_profiling_tools() -> bool:
     is_using_nsys = os.environ.get('NSYS_PROFILING_SESSION_ID') is not None
     is_using_ncu = os.environ.get('NV_COMPUTE_PROFILER_PERFWORKS_DIR') is not None
     is_using_compute_sanitizer = os.environ.get('NV_SANITIZER_INJECTION_PORT_RANGE_BEGIN') is not None
-    return is_using_nsys or is_using_ncu or is_using_compute_sanitizer
+
+    is_using_msprof = os.environ.get('MSOPPROF_EXE_PATH') is not None
+    return is_using_nsys or is_using_ncu or is_using_compute_sanitizer or is_using_msprof
 
 def set_random_seed(seed: int):
     import random
@@ -48,3 +53,24 @@ class Counter:
     def next(self) -> int:
         self.count += 1
         return self.count - 1
+
+@functools.lru_cache(maxsize=1)
+def try_to_import_torch_npu():
+    """
+    Try to import torch_npu
+    """
+    try:
+        import torch_npu
+        return torch_npu
+    except ModuleNotFoundError:
+        return None
+
+@contextlib.contextmanager
+def suppress_stdout_stderr(suppress: bool = True):
+    if not suppress:
+        yield
+        return
+
+    with open(os.devnull, 'w') as devnull:
+        with contextlib.redirect_stderr(devnull), contextlib.redirect_stdout(devnull):
+            yield
