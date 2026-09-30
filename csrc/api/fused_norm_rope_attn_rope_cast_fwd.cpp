@@ -1,15 +1,12 @@
 #include "common.h"
 
-#include "kernels/params.h"
+#ifdef FLASH_MLA_IS_BUILD_ON_CUDA
 
-#include "kernels/sm100/prefill/sparse/fused_norm_rope_attn_rope_cast_fwd/core_attn/kernel.h"
-#include "kernels/sm100/prefill/sparse/fused_norm_rope_attn_rope_cast_fwd/permute_q_b_proj/kernel.h"
-#include "kernels/sm100/prefill/sparse/fused_norm_rope_attn_rope_cast_fwd/permute_wv_proj/kernel.h"
+#include "params.h"
 
-// Local aliases: `kernels/defines.h` declares this type as `fp8`, and the fused kernel headers declare
-// it inside their own namespace, so this translation unit needs the explicit name at file scope.
-using bf16 = cutlass::bfloat16_t;
-using fp8_e4m3 = cutlass::float_e4m3_t;
+#include "cuda_kernels/sm100/prefill/sparse/fused_norm_rope_attn_rope_cast_fwd/core_attn/kernel.h"
+#include "cuda_kernels/sm100/prefill/sparse/fused_norm_rope_attn_rope_cast_fwd/permute_q_b_proj/kernel.h"
+#include "cuda_kernels/sm100/prefill/sparse/fused_norm_rope_attn_rope_cast_fwd/permute_wv_proj/kernel.h"
 
 using Params = sm100::prefill::fused_norm_rope_attn_rope_cast_fwd::core_attn::ParamT<SparseAttnFwdMode::Prefill>;
 using DecodeParams = sm100::prefill::fused_norm_rope_attn_rope_cast_fwd::core_attn::ParamT<SparseAttnFwdMode::Decode>;
@@ -30,7 +27,9 @@ static at::Tensor allocate_scale_factor(uint32_t batch_size, uint32_t hidden_dim
     return sf;
 }
 
-static std::vector<at::Tensor> fused_norm_rope_attn_rope_cast_fwd(
+#endif  // FLASH_MLA_IS_BUILD_ON_CUDA
+
+std::vector<at::Tensor> fused_norm_rope_attn_rope_cast_fwd(
     const at::Tensor &q,
     const at::Tensor &kv,
     const at::Tensor &indices,
@@ -51,6 +50,7 @@ static std::vector<at::Tensor> fused_norm_rope_attn_rope_cast_fwd(
     bool round_sf,
     bool use_packed_ue8m0
 ) {
+#ifdef FLASH_MLA_IS_BUILD_ON_CUDA
     Arch arch = Arch();
     bool is_sm100f = arch.is_sm100f();
     TORCH_CHECK(is_sm100f, "Fused Norm + RoPE + Core Attn + RoPE + Cast (fused_norm_rope_attn_rope_cast_fwd) is only supported on SM100f architectures.");
@@ -71,6 +71,11 @@ static std::vector<at::Tensor> fused_norm_rope_attn_rope_cast_fwd(
     int topk = indices.size(2);
     uint32_t wv_group_size = h_q / n_wv_group;
 
+    // Metadata sanity check
+    TORCH_CHECK(h_q == 64 || h_q == 128, "Only h_q == 64 or 128 is supported for fused_norm_rope_attn_rope_cast_fwd, got ", h_q);
+    TORCH_CHECK(h_kv == 1, "Currently only MQA (i.e. h_kv == 1) is supported");
+    TORCH_CHECK(d_qk == 512, "Only head_size_k == 512 (V4.1) is supported");
+    TORCH_CHECK(d_v == 512, "Only head_size_v == 512 is supported");
     TORCH_CHECK(h_q % n_wv_group == 0, "h_q %% n_wv_group != 0");
     TORCH_CHECK(is_rope_neox_style == false, "Only `is_rope_neox_style == False` is supported");
     TORCH_CHECK(use_tma_aligned_col_major_sf == true, "`use_tma_aligned_col_major_sf` must be True");
@@ -118,7 +123,7 @@ static std::vector<at::Tensor> fused_norm_rope_attn_rope_cast_fwd(
     
     TORCH_CHECK(d_v % (num_per_channels * 4) == 0); // 4 is the number of uint8 in uint32, since `use_packed_ue8m0` is `True`
     at::Tensor out_fp8 = torch::empty({s_q, n_wv_group, wv_group_size * d_v}, opts.dtype(torch::kFloat8_e4m3fn));
-    uint32_t out_sf_scale_gran = 32; // Since the weight is per-32 scaled and deep_gemm.einsum requires A and B to have the same scale granularity, the output sf is always stored in a per-32 scaled format, although it will be actually per-128 scaled when num_per_channels is 128
+    uint32_t out_sf_scale_gran = 32; // Since the weight is per-32 scaled and deep_gemm.einsum requires A and B to have the same scale granularity, the output sf is always stored in a per-32 scaled format (num_per_channels is always 32)
     at::Tensor out_sf = allocate_scale_factor(s_q, wv_group_size * d_v, out_sf_scale_gran, opts, n_wv_group).transpose(0, 1);   // [s_q, n_wv_group, wv_group_size * d_v / (out_sf_scale_gran*4)]
     at::Tensor max_logits = torch::empty({s_q, h_q}, opts.dtype(torch::kFloat));
     at::Tensor lse = torch::empty({s_q, h_q}, opts.dtype(torch::kFloat));
@@ -145,6 +150,7 @@ static std::vector<at::Tensor> fused_norm_rope_attn_rope_cast_fwd(
         (float*)max_logits.data_ptr(),
         (float*)lse.data_ptr(),
 
+        SparseAttnFwdMode::Prefill,
         arch.num_sms,
         at::cuda::getCurrentCUDAStream().stream(),
 
@@ -168,18 +174,20 @@ static std::vector<at::Tensor> fused_norm_rope_attn_rope_cast_fwd(
         (uint32_t)int64_stride_to_int(out_sf.stride(2))
     };
 
-    TORCH_CHECK(h_q == 64 || h_q == 128, "Only h_q == 64 or 128 is supported for fused_norm_rope_attn_rope_cast_fwd, got ", h_q);
     DISPATCH_NUM_HEADS(h_q, H_Q, ([&]() {
         DISPATCH_BOOLEAN_FLAG(enable_q_norm, ENABLE_Q_NORM, ([&]() {
-            sm100::prefill::fused_norm_rope_attn_rope_cast_fwd::core_attn::run_fused_norm_rope_attn_rope_cast_fwd_kernel<Config{SparseAttnFwdMode::Prefill, ModelType::V4, ModelType::V4, H_Q, ENABLE_Q_NORM}>(params);
+            sm100::prefill::fused_norm_rope_attn_rope_cast_fwd::core_attn::run_fused_norm_rope_attn_rope_cast_fwd_kernel<Config{SparseAttnFwdMode::Prefill, ModelType::V41, ModelType::V41, H_Q, ENABLE_Q_NORM}>(params);
         }));
     }));
 
     return {out_fp8, out_sf, max_logits, lse};
+#else
+    TORCH_CHECK(false, "fused_norm_rope_attn_rope_cast_fwd is only supported on CUDA GPUs.");
+#endif
 }
 
 
-static std::vector<at::Tensor> fused_norm_rope_attn_rope_cast_decode(
+std::vector<at::Tensor> fused_norm_rope_attn_rope_cast_decode(
     const at::Tensor &q,        // [s_q, h_q, d_qk]
     const at::Tensor &kv,       // [num_blocks, page_block_size, h_kv, bytes_per_token], paged quantized KV cache
     const at::Tensor &indices,  // [s_q, topk]
@@ -195,7 +203,7 @@ static std::vector<at::Tensor> fused_norm_rope_attn_rope_cast_decode(
     const at::Tensor &token_positions,  // [s_q]
     bool is_rope_neox_style,
     uint32_t rope_dim,
-    const at::Tensor &cos_sin_cache,    // [*, rope_dim]
+    const at::Tensor &cos_sin_cache,    // [num_positions, rope_dim]
 
     uint32_t n_wv_group,
     uint32_t num_per_channels,
@@ -203,6 +211,7 @@ static std::vector<at::Tensor> fused_norm_rope_attn_rope_cast_decode(
     bool round_sf,
     bool use_packed_ue8m0
 ) {
+#ifdef FLASH_MLA_IS_BUILD_ON_CUDA
     Arch arch = Arch();
     TORCH_CHECK(arch.is_sm100f(), "Fused Norm + RoPE + Core Attn + RoPE + Cast (fused_norm_rope_attn_rope_cast_decode) is only supported on SM100f architectures.");
 
@@ -240,7 +249,7 @@ static std::vector<at::Tensor> fused_norm_rope_attn_rope_cast_decode(
     TORCH_CHECK(s_q > 0);
     TORCH_CHECK(h_q == 64 || h_q == 128, "Only h_q == 64 or 128 is supported for fused_norm_rope_attn_rope_cast_decode, got ", h_q);
     TORCH_CHECK(h_kv == 1, "Currently only MQA (i.e. h_kv == 1) is supported");
-    TORCH_CHECK(d_qk == 512, "Only head_size_k == 512 (V4 / V4.1) is supported");
+    TORCH_CHECK(d_qk == 512, "Only head_size_k == 512 (V4.1) is supported");
     TORCH_CHECK(d_v == 512, "Only head_size_v == 512 is supported");
     TORCH_CHECK(topk > 0);
     TORCH_CHECK(h_q % n_wv_group == 0, "h_q %% n_wv_group != 0");
@@ -298,7 +307,7 @@ static std::vector<at::Tensor> fused_norm_rope_attn_rope_cast_decode(
     KU_CHECK_CONTIGUOUS(token_positions);
     KU_CHECK_CONTIGUOUS(cos_sin_cache);
 
-    // The formats of `kv` and `extra_kv` (V4 / V4.1 / V4.1 fp4, see KVCacheFormat), detected by bytes_per_token
+    // The formats of `kv` and `extra_kv` (V4.1 or V4.1 fp4, see KVCacheFormat), detected by bytes_per_token
     ModelType model_type = detect_kv_cache_format_for_headdim_512(kv.size(3));
     ModelType extra_model_type = have_extra_kvcache ? detect_kv_cache_format_for_headdim_512(extra_kv->size(3)) : model_type;
     TORCH_CHECK(model_type != ModelType::V41_FP4, "The fp4 KV cache is only supported as extra_kv");
@@ -327,7 +336,7 @@ static std::vector<at::Tensor> fused_norm_rope_attn_rope_cast_decode(
 
     TORCH_CHECK(d_v % (num_per_channels * 4) == 0); // 4 is the number of uint8 in uint32, since `use_packed_ue8m0` is `True`
     at::Tensor out_fp8 = torch::empty({s_q, n_wv_group, wv_group_size * d_v}, opts.dtype(torch::kFloat8_e4m3fn));
-    uint32_t out_sf_scale_gran = 32; // Since the weight is per-32 scaled and deep_gemm.einsum requires A and B to have the same scale granularity, the output sf is always stored in a per-32 scaled format, although it will be actually per-128 scaled when num_per_channels is 128
+    uint32_t out_sf_scale_gran = 32; // Since the weight is per-32 scaled and deep_gemm.einsum requires A and B to have the same scale granularity, the output sf is always stored in a per-32 scaled format (num_per_channels is always 32)
     at::Tensor out_sf = allocate_scale_factor(s_q, wv_group_size * d_v, out_sf_scale_gran, opts, n_wv_group).transpose(0, 1);   // [s_q, n_wv_group, wv_group_size * d_v / (out_sf_scale_gran*4)]
     at::Tensor lse = torch::empty({s_q, h_q}, opts.dtype(torch::kFloat));
     KU_CHECK_CONTIGUOUS(out_fp8);
@@ -363,6 +372,7 @@ static std::vector<at::Tensor> fused_norm_rope_attn_rope_cast_decode(
         have_extra_kvcache ? int64_stride_to_int(extra_kv->stride(1)) : 0,
         0,                                              // stride_extra_indices_b is unused since b == 1
         have_extra_kvcache ? int64_stride_to_int(extra_indices->stride(0)) : 0,
+        get_num_sms(),
         at::cuda::getCurrentCUDAStream().stream(),
 
         false,      // enable_split_kv: split-KV is not supported by this kernel
@@ -396,26 +406,26 @@ static std::vector<at::Tensor> fused_norm_rope_attn_rope_cast_decode(
         DISPATCH_BOOLEAN_FLAG(enable_q_norm, ENABLE_Q_NORM, ([&]() {
             if (extra_model_type == ModelType::V41_FP4) {
                 sm100::prefill::fused_norm_rope_attn_rope_cast_fwd::core_attn::run_fused_norm_rope_attn_rope_cast_fwd_kernel<Config{SparseAttnFwdMode::Decode, ModelType::V41, ModelType::V41_FP4, H_Q, ENABLE_Q_NORM}>(params);
-            } else if (model_type == ModelType::V4) {
-                sm100::prefill::fused_norm_rope_attn_rope_cast_fwd::core_attn::run_fused_norm_rope_attn_rope_cast_fwd_kernel<Config{SparseAttnFwdMode::Decode, ModelType::V4, ModelType::V4, H_Q, ENABLE_Q_NORM}>(params);
-            } else if (model_type == ModelType::V41) {
-                sm100::prefill::fused_norm_rope_attn_rope_cast_fwd::core_attn::run_fused_norm_rope_attn_rope_cast_fwd_kernel<Config{SparseAttnFwdMode::Decode, ModelType::V41, ModelType::V41, H_Q, ENABLE_Q_NORM}>(params);
             } else {
-                TORCH_CHECK(false, "Unsupported model_type: ", get_dynamic_enum_name(model_type));
+                sm100::prefill::fused_norm_rope_attn_rope_cast_fwd::core_attn::run_fused_norm_rope_attn_rope_cast_fwd_kernel<Config{SparseAttnFwdMode::Decode, ModelType::V41, ModelType::V41, H_Q, ENABLE_Q_NORM}>(params);
             }
         }));
     }));
 
     return {out_fp8, out_sf, lse};
+#else
+    TORCH_CHECK(false, "fused_norm_rope_attn_rope_cast_decode is only supported on CUDA GPUs.");
+#endif
 }
 
 
-static std::vector<at::Tensor> permute_q_b_proj(
+std::vector<at::Tensor> permute_q_b_proj(
     const at::Tensor &q_b_proj,
     const at::Tensor &scale_factors,
     int h_q,
     int d_q
 ) {
+#ifdef FLASH_MLA_IS_BUILD_ON_CUDA
     KU_CHECK_NDIM(q_b_proj, 2);
     KU_CHECK_NDIM(scale_factors, 2);
 
@@ -466,15 +476,19 @@ static std::vector<at::Tensor> permute_q_b_proj(
     sm100::prefill::fused_norm_rope_attn_rope_cast_fwd::permute_q_b_proj::run_permute_q_b_proj_kernel(params);
 
     return {q_b_proj_permuted, scale_factors_permuted};
+#else
+    TORCH_CHECK(false, "permute_q_b_proj is only supported on CUDA GPUs.");
+#endif
 }
 
 
-static std::vector<at::Tensor> permute_wv_proj(
+std::vector<at::Tensor> permute_wv_proj(
     const at::Tensor &wv_proj,
     const at::Tensor &scale_factors,
     int wv_group_size,
     int d_o
 ) {
+#ifdef FLASH_MLA_IS_BUILD_ON_CUDA
     KU_CHECK_NDIM(wv_proj, 3);
     KU_CHECK_NDIM(scale_factors, 3);
 
@@ -491,7 +505,7 @@ static std::vector<at::Tensor> permute_wv_proj(
     int input_gran = wv_group_size * d_o / (4 * scale_factors.size(2));
     int output_gran = 32;   // Fixed to 32, otherwise permution between chunk (which has 32 elements) will be impossible
     TORCH_CHECK(input_gran == 32, "input scale granularity must be 32, got ", input_gran);
-    TORCH_CHECK((wv_group_size * d_o) % (input_gran * 4) == 0, "q_lora_rank must be divisible by gran * 4");
+    TORCH_CHECK((wv_group_size * d_o) % (input_gran * 4) == 0, "wv_group_size * d_o must be divisible by the input scale granularity * 4");
     KU_CHECK_SHAPE(scale_factors, n_wv_group, d_proj_out, (wv_group_size * d_o) / input_gran / 4);
 
     KU_CHECK_LAST_DIM_CONTIGUOUS(wv_proj);
@@ -530,6 +544,9 @@ static std::vector<at::Tensor> permute_wv_proj(
     sm100::prefill::fused_norm_rope_attn_rope_cast_fwd::permute_wv_proj::run_permute_wv_proj_kernel(params);
 
     return {wv_proj_permuted, scale_factors_permuted};
+#else
+    TORCH_CHECK(false, "permute_wv_proj is only supported on CUDA GPUs.");
+#endif
 }
 
 

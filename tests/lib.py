@@ -1,18 +1,36 @@
 import dataclasses
-import os
 import enum
-from typing import List, Optional
+import functools
+from typing import Tuple, List, Optional, overload
 import random
 
 import argparse
 import torch
 import kernelkit as kk
+if kk.is_on_ascend_platform():
+    import torch_npu    # noqa: F401  (importing torch_npu registers the NPU backend of torch)
+
 import flash_mla
 
 import quant
 
+
+@functools.lru_cache(maxsize=1)
+@kk.requires_platform(kk.Platform.CUDA)
+def get_current_compute_capability() -> Tuple[int, int]:
+    cc_major, cc_minor = torch.cuda.get_device_capability()
+    return (cc_major, cc_minor)
+
+def device_synchronize():
+    if kk.is_on_cuda_platform():
+        torch.cuda.synchronize()
+    elif kk.is_on_ascend_platform():
+        torch.npu.synchronize()
+    else:
+        assert False, "Unknown platform"
+
 class TestTarget(enum.Enum):
-    FWD = 0
+    SPARSE_FWD = 0
     DECODE = 1
 
 @dataclasses.dataclass
@@ -25,14 +43,14 @@ class ExtraTestParamForDecode:
     block_size: int = 64
     extra_block_size: Optional[int] = None
     have_extra_topk_length: bool = False
-    kvcache_layout: Optional["quant.KVCacheLayout"] = None          # Must be specified for d_qk == 512 to distinguish V4 / V41 / V41_FP4
-    extra_kvcache_layout: Optional["quant.KVCacheLayout"] = None    # None: same as kvcache_layout
+    kvcache_layout: Optional[quant.KVCacheLayout] = None   # Layout of the main KV cache. Defaults to V41 fp8 (the only supported main-cache format)
+    extra_kvcache_layout: Optional[quant.KVCacheLayout] = None   # Layout of the extra KV cache. None: the same as kvcache_layout
 
 @dataclasses.dataclass
 class TestParam:
     s_q: int
     s_kv: int
-    topk: int
+    topk: Optional[int] = None
     h_q: int = 128
     h_kv: int = 1
     d_qk: int = 512
@@ -43,9 +61,45 @@ class TestParam:
     num_runs: int = 10
     have_attn_sink: bool = False
     have_topk_length: bool = False
+    k_amplifier_portion: float = 0.0
+    k_amplifier_ratio: float = 1.0
     decode: Optional[ExtraTestParamForDecode] = None
-    k_amplifier_portion: float = 0.0        # Amplify a portion of the KV tokens to create a more skewed attention distribution
-    k_amplifier_ratio: float = 1.0          # Amplification ratio for the amplified KV tokens
+
+    def can_run_on_and_clamp(self, test_target: TestTarget) -> bool:
+        if kk.is_on_ascend_platform():
+            if test_target == TestTarget.SPARSE_FWD:
+                return self.h_q == 64 and self.d_qk == 512
+            elif test_target == TestTarget.DECODE:
+                assert self.decode is not None
+                if self.h_q != 64 or self.d_qk != 512:
+                    return False
+                if self.decode.block_size == 1 or self.decode.extra_block_size == 1:
+                    return False
+                if self.decode.kvcache_layout != quant.KVCacheLayout.V41_FP8Sparse:
+                    return False
+                if self.decode.extra_kvcache_layout not in (None, quant.KVCacheLayout.V41_FP8Sparse, quant.KVCacheLayout.V41_FP4Sparse):
+                    return False
+                return True
+            else:
+                raise RuntimeError(f"Unknown test_target: {test_target}")
+        elif kk.is_on_cuda_platform():
+            cc_major, cc_minor = get_current_compute_capability()
+            if cc_major != 10:
+                return False    # Only sm100a / sm103a is supported
+            if self.h_q not in (64, 128) or self.d_qk != 512:
+                return False
+
+            if test_target == TestTarget.SPARSE_FWD:
+                if self.topk < 128:
+                    self.topk = 128
+                return True
+            elif test_target == TestTarget.DECODE:
+                assert self.decode is not None
+                return True
+            else:
+                raise RuntimeError(f"Unknown test_target: {test_target}")
+        else:
+            raise RuntimeError("Unknown platform")
 
 @dataclasses.dataclass
 class RawTestParamForDecode:
@@ -70,34 +124,47 @@ class RawTestParamForDecode:
     block_size: int = 64
     extra_block_size: Optional[int] = None
     have_extra_topk_length: bool = False
-    kvcache_layout: Optional["quant.KVCacheLayout"] = None
-    extra_kvcache_layout: Optional["quant.KVCacheLayout"] = None
-    d_qk: int = 576      # Q/K head dim (= dv + RoPE dim)
+    d_qk: int = 512      # Q/K head dim (= dv + RoPE dim)
     d_v: int = 512     # V head dim
+    kvcache_layout: Optional[quant.KVCacheLayout] = None
+    extra_kvcache_layout: Optional[quant.KVCacheLayout] = None
     check_correctness: bool = True
     num_runs: int = 10
     seed: int = -1
 
     def to_test_param(self) -> TestParam:
         return TestParam(
-            self.s_q, self.s_kv, self.topk, self.h_q, self.h_kv, self.d_qk, self.d_v,
-            self.seed, self.check_correctness,
-            self.is_all_indices_invalid,
-            self.num_runs,
-            self.enable_attn_sink,
-            self.have_topk_length,
-            decode = ExtraTestParamForDecode(
-                self.b, self.is_varlen, self.have_zero_seqlen_k,
-                self.extra_s_k, self.extra_topk,
-                self.block_size, self.extra_block_size, self.have_extra_topk_length,
-                self.kvcache_layout, self.extra_kvcache_layout
+            s_q=self.s_q,
+            s_kv=self.s_kv,
+            topk=self.topk,
+            h_q=self.h_q,
+            h_kv=self.h_kv,
+            d_qk=self.d_qk,
+            d_v=self.d_v,
+            seed=self.seed,
+            check_correctness=self.check_correctness,
+            is_all_indices_invalid=self.is_all_indices_invalid,
+            num_runs=self.num_runs,
+            have_attn_sink=self.enable_attn_sink,
+            have_topk_length=self.have_topk_length,
+            decode=ExtraTestParamForDecode(
+                b=self.b,
+                is_varlen=self.is_varlen,
+                have_zero_seqlen_k=self.have_zero_seqlen_k,
+                extra_s_k=self.extra_s_k,
+                extra_topk=self.extra_topk,
+                block_size=self.block_size,
+                extra_block_size=self.extra_block_size,
+                have_extra_topk_length=self.have_extra_topk_length,
+                kvcache_layout=self.kvcache_layout,
+                extra_kvcache_layout=self.extra_kvcache_layout,
             )
         )
-    
+
+
 @dataclasses.dataclass
 class Testcase:
     p: TestParam
-    dOut: torch.Tensor  # [s_q, h_q, d_v]
     q: torch.Tensor     # [s_q, h_q, d_qk]
     kv: torch.Tensor    # [s_kv, h_kv, d_qk]
     indices: torch.Tensor   # [s_q, h_kv, topk]
@@ -130,15 +197,12 @@ def generate_testcase(t: TestParam) -> Testcase:
     kk.set_random_seed(t.seed)
     q = torch.randn((t.s_q, t.h_q, t.d_qk), dtype=torch.bfloat16)/10 + (random.random()-0.5)/10
     kv = torch.randn((t.s_kv, t.h_kv, t.d_qk), dtype=torch.bfloat16)/10 + (random.random()-0.5)/10
-    do = torch.randn((t.s_q, t.h_q, t.d_v), dtype=torch.bfloat16)/10 + (random.random()-0.5)/10
 
     q.clamp_(-10, 10)
     kv.clamp_(-10, 10)
-    do.clamp_(-10, 10)
     
     invalid_indices_candidate = [-2147483648, -123456, -1, t.s_kv, 114514, 1919810, 2147480000, 2147483647]
     indices = _randperm_batch(t.s_q, torch.full((t.s_q, ), t.s_kv, dtype=torch.int32), t.topk, invalid_indices_candidate).view(t.s_q, t.h_kv, t.topk)
-
     if t.is_all_indices_invalid:
         all_indices_invalid_mask = torch.randn(t.s_q, device='cpu') < -2
         indices[all_indices_invalid_mask[:, None, None].broadcast_to(indices.shape)] = random.choice(invalid_indices_candidate)
@@ -161,17 +225,17 @@ def generate_testcase(t: TestParam) -> Testcase:
         kv[selected_indices] *= amplifier_coeffs.unsqueeze(-1).unsqueeze(-1)
 
     q = kk.non_contiguousify(q)
-    kv = kk.non_contiguousify(kv)
-    do = kk.non_contiguousify(do)
+    if not kk.is_on_ascend_platform():
+        # Ascend requires `kv` to be contiguous
+        kv = kk.non_contiguousify(kv)
     indices = kk.non_contiguousify(indices)
 
     return Testcase(
         p=t,
-        dOut=do,
         q=q,
         kv=kv,
         indices=indices,
-        sm_scale=0.5,   # Otherwise dK is too small compared to dV
+        sm_scale=0.5,
         attn_sink=attn_sink,
         topk_length=topk_length
     )
@@ -186,7 +250,7 @@ class KVScope:
     abs_indices: torch.Tensor
     indices_in_kvcache: torch.Tensor
     topk_length: Optional[torch.Tensor]
-    kvcache_layout: Optional["quant.KVCacheLayout"] = None
+    kvcache_layout: Optional[quant.KVCacheLayout]
     blocked_k_quantized: Optional[torch.Tensor] = None
 
     def quant_and_dequant_(self):
@@ -196,14 +260,7 @@ class KVScope:
         """
         kvcache_layout = self.kvcache_layout
         if kvcache_layout is None:
-            if self.t.d_qk == 576:
-                kvcache_layout = quant.KVCacheLayout.V32_FP8Sparse
-            elif self.t.d_qk == 512:
-                assert self.abs_indices is not None
-                kvcache_layout = quant.KVCacheLayout.V4_FP8Sparse
-            else:
-                assert False
-            self.kvcache_layout = kvcache_layout
+            kvcache_layout = quant.KVCacheLayout.V41_FP8Sparse
         self.blocked_k_quantized = quant.quantize_k_cache(self.blocked_k, kvcache_layout)
         blocked_k_dequantized = quant.dequantize_k_cache(self.blocked_k_quantized, kvcache_layout)
         self.blocked_k = blocked_k_dequantized
@@ -214,24 +271,7 @@ class KVScope:
         """
         assert self.blocked_k_quantized is not None, "Please call `quant_and_dequant_` first before calling `get_kvcache_for_flash_mla`"
         return self.blocked_k_quantized
-    
-    def apply_perm(self, perm: torch.Tensor) -> "KVScope":
-        """
-        Apply a batch permutation to this KVScope. Used for batch-invariance test
-        """
-        new_kvscope = KVScope(
-            self.t,
-            self.cache_seqlens[perm],
-            self.block_table[perm],
-            self.blocked_k,
-            self.abs_indices[perm],
-            self.indices_in_kvcache[perm],
-            self.topk_length[perm] if self.topk_length is not None else None,
-            self.kvcache_layout,
-            self.blocked_k_quantized
-        )
-        return new_kvscope
-    
+
 @dataclasses.dataclass
 class TestcaseForDecode:
     p: TestParam
@@ -248,6 +288,7 @@ def generate_testcase_for_decode(t: TestParam) -> TestcaseForDecode:
 
     q = torch.randn((t.decode.b, t.s_q, t.h_q, t.d_qk))
     q.clamp_(min=-1.0, max=1.0)
+    q = kk.non_contiguousify(q)
 
     attn_sink = None
     if t.have_attn_sink:
@@ -256,7 +297,7 @@ def generate_testcase_for_decode(t: TestParam) -> TestcaseForDecode:
         attn_sink[inf_mask > 0.5] = float("inf")
         attn_sink[inf_mask < -0.5] = float("-inf")
 
-    def generate_one_k_scope(s_k: int, block_size: int, topk: int, is_varlen: bool, have_zero_seqlen: bool, is_all_indices_invalid: bool, have_topk_length: bool, kvcache_layout: Optional[quant.KVCacheLayout] = None) -> KVScope:
+    def generate_one_k_scope(s_k: int, block_size: int, topk: int, is_varlen: bool, have_zero_seqlen: bool, is_all_indices_invalid: bool, have_topk_length: bool, kvcache_layout: Optional[quant.KVCacheLayout]) -> KVScope:
         b = t.decode.b  # type: ignore
         cache_seqlens_cpu = torch.full((b,), s_k, dtype=torch.int32, device='cpu')
         if is_varlen:
@@ -269,20 +310,22 @@ def generate_testcase_for_decode(t: TestParam) -> TestcaseForDecode:
 
         max_seqlen_alignment = 4 * block_size
         max_seqlen_pad = max(kk.cdiv(int(cache_seqlens_cpu.max().item()), max_seqlen_alignment), 1) * max_seqlen_alignment
-        cache_seqlens = cache_seqlens_cpu.cuda()
+        cache_seqlens = cache_seqlens_cpu.to(torch.get_default_device())
 
         assert max_seqlen_pad % block_size == 0
         block_table = torch.arange(b * max_seqlen_pad // block_size, dtype=torch.int32).view(b, max_seqlen_pad // block_size)
         block_table = block_table.view(-1)[torch.randperm(block_table.numel())].view(b, -1)
 
-        blocked_k = kk.gen_non_contiguous_randn_tensor((block_table.numel(), block_size, t.h_kv, t.d_qk)) / 10
+        # NOTE On torch_npu, dividing a bf16 tensor by a Python scalar materialises a full-size fp32
+        # intermediate inside the op (5x the tensor size, measured) -> OOM for multi-GiB caches.
+        blocked_k = torch.randn((block_table.numel(), block_size, t.h_kv, t.d_qk)) * 0.1
         blocked_k.clamp_(min=-1.0, max=1.0)
     
         abs_indices = torch.empty((b, t.s_q, topk), dtype=torch.int32)
         if is_all_indices_invalid:
             abs_indices.fill_(-1)
         else:
-            abs_indices[:] = _randperm_batch(b*t.s_q, cache_seqlens.repeat_interleave(t.s_q), topk, [-1]).view(b, t.s_q, topk)
+            abs_indices = _randperm_batch(b*t.s_q, cache_seqlens.repeat_interleave(t.s_q), topk, [-1]).view(b, t.s_q, topk)
         indices_in_kvcache = quant.abs_indices2indices_in_kvcache(abs_indices, block_table, block_size)
 
         topk_length = torch.randint(0, topk+1, (b, ), dtype=torch.int32, device=q.device) if have_topk_length else None
@@ -293,7 +336,7 @@ def generate_testcase_for_decode(t: TestParam) -> TestcaseForDecode:
             indices_in_kvcache_masked[torch.arange(0, topk).view(1, 1, topk).broadcast_to(b, t.s_q, topk) >= (topk_length.view(b, 1, 1) if have_topk_length else topk)] = -1
         else:
             indices_in_kvcache_masked = indices_in_kvcache
-        
+
         blocked_k = blocked_k.view(-1, t.h_kv, t.d_qk)
         nonused_indices_mask = torch.ones(blocked_k.size(0)*blocked_k.size(1), dtype=torch.bool, device='cpu')
         nonused_indices_mask[indices_in_kvcache_masked] = False
@@ -316,12 +359,11 @@ def generate_testcase_for_decode(t: TestParam) -> TestcaseForDecode:
         kv_scope1 = generate_one_k_scope(t.decode.extra_s_k, t.decode.extra_block_size, t.decode.extra_topk, t.decode.is_varlen, t.decode.have_zero_seqlen_k, t.is_all_indices_invalid, t.decode.have_extra_topk_length, extra_layout)
         kv_scope1.quant_and_dequant_()
     else:
-        assert t.decode.extra_block_size is None and t.decode.extra_s_k is None and not t.decode.have_extra_topk_length
+        assert t.decode.extra_block_size is None and t.decode.extra_s_k is None and t.decode.have_extra_topk_length == False
         kv_scope1 = None
     
     sm_scale = t.d_qk ** -0.55
 
-    q = kk.non_contiguousify(q)
     return TestcaseForDecode(t, q, attn_sink, sm_scale, kv_scope0, kv_scope1)
 
 
@@ -329,26 +371,59 @@ def run_flash_mla_sparse_fwd(p: TestParam, t: Testcase):
     return flash_mla.flash_mla_sparse_fwd(
         t.q, t.kv, t.indices,
         sm_scale=t.sm_scale,
+        d_v=p.d_v,
         attn_sink=t.attn_sink,
         topk_length=t.topk_length
     )
 
-def run_flash_mla_decode(p: TestParam, t: TestcaseForDecode, tile_scheduler_metadata, num_splits):
+def run_flash_mla_decode(p: TestParam, t: TestcaseForDecode, tile_scheduler_metadata, num_splits, bsz_start: int = 0, bsz_end: Optional[int] = None):
     assert p.decode is not None
-    return flash_mla.flash_mla_with_kvcache(
-        t.q,
+    b = bsz_end-bsz_start if bsz_end is not None else p.decode.b
+    s_q = p.s_q
+    squeeze_s_q_with_b = s_q != 1 and kk.is_on_ascend_platform()   # The Ascend decoding kernel only supports s_q=1, so we "squeeze" the s_q dimension and the batch_size dimension into one
+
+    @overload
+    def squeeze(t: None) -> None: ...
+    @overload
+    def squeeze(t: torch.Tensor) -> torch.Tensor: ...
+    def squeeze(t: Optional[torch.Tensor]):
+        # `t` is expected to have shape `[b, s_q, ...]` and will be reshaped as `[b*s_q, 1, ...]`, if `squeeze_s_q_with_b` is True
+        if t is None or not squeeze_s_q_with_b:
+            return t
+        return t.reshape(b*s_q, 1, *t.shape[2:])
+    
+    @overload
+    def repeat_b_by_s_q(t: None) -> None: ...
+    @overload
+    def repeat_b_by_s_q(t: torch.Tensor) -> torch.Tensor: ...
+    def repeat_b_by_s_q(t: Optional[torch.Tensor]):
+        # `t` is expected to have shape `[b, ...]` and will be reshaped as `[b*s_q, ...]`, if `squeeze_s_q_with_b` is True
+        if t is None or not squeeze_s_q_with_b:
+            return t
+        return t.repeat_interleave(p.s_q, dim=0)
+    
+    out, lse = flash_mla.flash_mla_with_kvcache(
+        squeeze(t.q[bsz_start: bsz_end]),
         t.kv_scope.get_kvcache_for_flash_mla(),
-        None, None, p.d_v,
+        None, None,
+        p.d_v,
         tile_scheduler_metadata, num_splits,
 
-        t.sm_scale, False, True,
-        t.kv_scope.indices_in_kvcache,
-        t.attn_sink,
-        t.extra_kv_scope.get_kvcache_for_flash_mla() if t.extra_kv_scope is not None else None,
-        t.extra_kv_scope.indices_in_kvcache if t.extra_kv_scope is not None else None,
-        t.kv_scope.topk_length,
-        t.extra_kv_scope.topk_length if t.extra_kv_scope is not None and t.extra_kv_scope.topk_length is not None else None
+        softmax_scale=t.sm_scale,
+        causal=False,
+        is_fp8_kvcache=True,
+        indices=squeeze(t.kv_scope.indices_in_kvcache[bsz_start : bsz_end]),
+        attn_sink=t.attn_sink,
+        extra_k_cache=t.extra_kv_scope.get_kvcache_for_flash_mla() if t.extra_kv_scope is not None else None,
+        extra_indices_in_kvcache=squeeze(t.extra_kv_scope.indices_in_kvcache[bsz_start: bsz_end] if t.extra_kv_scope is not None else None),
+        topk_length=repeat_b_by_s_q(t.kv_scope.topk_length[bsz_start: bsz_end] if t.kv_scope.topk_length is not None else None),
+        extra_topk_length=repeat_b_by_s_q(t.extra_kv_scope.topk_length[bsz_start: bsz_end] if t.extra_kv_scope is not None and t.extra_kv_scope.topk_length is not None else None)
     )
+
+    if squeeze_s_q_with_b:
+        out = out.reshape(b, s_q, *out.shape[2:])
+        lse = lse.reshape(b, s_q, p.h_q).transpose(1, 2).contiguous()
+    return out, lse
 
 
 @dataclasses.dataclass
@@ -356,23 +431,25 @@ class FlopsAndMemVolStatistics:
     """
     FLOPs and memory volume statistics for prefilling
     """
+    num_valid_indices: int
     fwd_flop: float
-    fwd_mem_vol: float
-    fwd_prefill_with_fp8_out_mem_vol: float = 0.0   # Like `fwd_mem_vol`, but with the output stored as FP8 instead of bf16
+    fwd_prefill_mem_vol: float
+    fwd_prefill_with_fp8_out_mem_vol: float
 
 def count_flop_and_mem_vol(p: TestParam, t: Testcase) -> FlopsAndMemVolStatistics:
     total_topk = (p.s_q*p.topk) if t.topk_length is None else t.topk_length.sum().item()
     indices_valid_mask = (t.indices >= 0) & (t.indices < p.s_kv)
     if t.topk_length is not None:
         indices_valid_mask &= (torch.arange(p.topk)[None, None, :].broadcast_to(p.s_q, p.h_kv, p.topk)) < t.topk_length[:, None, None]
-    num_valid_indices = indices_valid_mask.sum().item()
+    num_valid_indices = int(indices_valid_mask.sum().item())
 
     fwd_flop = 2 * total_topk * p.h_q * (p.d_qk + p.d_v)
-    fwd_mem_vol = num_valid_indices*p.d_qk*2 + p.s_q*p.h_q*(p.d_qk+p.d_v)*2
+    fwd_prefill_mem_vol = num_valid_indices*p.d_qk*2 + p.s_q*p.h_q*(p.d_qk+p.d_v)*2
     return FlopsAndMemVolStatistics(
+        num_valid_indices,
         fwd_flop,
-        fwd_mem_vol,
-        fwd_mem_vol - p.s_q*p.h_q*p.d_v,    # The FP8 output only stores d_v bytes per element (and no separate SF traffic is counted)
+        fwd_prefill_mem_vol,
+        fwd_prefill_mem_vol - p.s_q*p.h_q*p.d_v,    # The FP8 output only stores d_v bytes per element (and no separate SF traffic is counted)
     )
 
 @dataclasses.dataclass
@@ -406,13 +483,14 @@ def count_flop_and_mem_vol_for_decode(p: TestParam, t: TestcaseForDecode) -> Flo
         return num_unique_tokens
 
     num_attended_tokens = get_num_attended_tokens(t.kv_scope) + (get_num_attended_tokens(t.extra_kv_scope) if t.extra_kv_scope is not None else 0)
-    num_retrieved_tokens = get_num_retrieved_tokens(t.kv_scope) + (get_num_retrieved_tokens(t.extra_kv_scope) if t.extra_kv_scope is not None else 0)
+    def kv_bytes(kv_scope: KVScope) -> int:
+        layout = kv_scope.kvcache_layout or quant.KVCacheLayout.V41_FP8Sparse
+        return get_num_retrieved_tokens(kv_scope) * layout.get_bytes_per_token()
 
     compute_flop = 2 * p.h_q * num_attended_tokens * (p.d_qk + p.d_v)
-    kv_token_size = 656 if p.d_qk == 576 else 576   # Assume FP8 KV Cache
     mem_vol = sum([
         2 * b * p.s_q * p.h_q * p.d_qk, # Q
-        num_retrieved_tokens * kv_token_size,   # K
+        kv_bytes(t.kv_scope) + (kv_bytes(t.extra_kv_scope) if t.extra_kv_scope is not None else 0),   # K
         2 * b * p.s_q * p.h_q * p.d_v, # O
     ])
     return FlopsAndMemVolStatisticsForDecode(
@@ -420,9 +498,7 @@ def count_flop_and_mem_vol_for_decode(p: TestParam, t: TestcaseForDecode) -> Flo
         mem_vol
     )
 
-def is_no_cooldown() -> bool:
-    return os.environ.get('NO_COOLDOWN', '').lower() in ['1', 'yes', 'y']
-
+    
 def stick_unit_test_args(parser: argparse.ArgumentParser):
     parser.add_argument("-nc", "--no-cooldown", action="store_true", help="Don't call time.sleep() before performance testcases")
     parser.add_argument("-rf", "--run-to-finish", action="store_true", help="Don't exit when a testcase is failed")
