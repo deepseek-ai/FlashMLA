@@ -12,37 +12,38 @@ using Params = sm100::prefill::fused_norm_rope_attn_rope_cast_fwd::core_attn::Pa
 using DecodeParams = sm100::prefill::fused_norm_rope_attn_rope_cast_fwd::core_attn::ParamT<SparseAttnFwdMode::Decode>;
 using Config = sm100::prefill::fused_norm_rope_attn_rope_cast_fwd::core_attn::Config;
 
-static at::Tensor allocate_scale_factor(uint32_t batch_size, uint32_t hidden_dim, uint32_t scale_gran, const at::TensorOptions &opts, std::optional<uint32_t> extra_dim = std::nullopt) {
+static Tensor allocate_scale_factor(uint32_t batch_size, uint32_t hidden_dim, uint32_t scale_gran, const Tensor &like, std::optional<uint32_t> extra_dim = std::nullopt) {
     // Allocate a scale factor tensor, which should have shape ([extra_dim], batch_size, hidden_dim / (scale_gran*4))
     // Meet DeepGEMM's SF requirement under use_tma_aligned_col_major_sf == True, round_sf == True, and use_packed_ue8m0 == True
-    TORCH_CHECK(hidden_dim % (scale_gran*4) == 0);
+    STD_TORCH_CHECK(hidden_dim % (scale_gran*4) == 0);
     uint32_t sf_align_requirement = 16u / sizeof(int32_t);
     uint32_t aligned_batch_size_for_sf = (batch_size + sf_align_requirement - 1) / sf_align_requirement * sf_align_requirement;
     uint32_t leading_dim = extra_dim.value_or(1);
-    at::Tensor sf = torch::empty({leading_dim, hidden_dim / (scale_gran * 4), aligned_batch_size_for_sf}, opts.dtype(torch::kInt32));
+    Tensor sf = torch::stable::new_empty(like, {leading_dim, hidden_dim / (scale_gran * 4), aligned_batch_size_for_sf}, ScalarType::Int);
     KU_CHECK_CONTIGUOUS(sf);
-    sf = sf.transpose(1, 2).slice(1, 0, batch_size);   // [leading_dim, batch_size, hidden_dim / (scale_gran*4)], int32
+    sf = torch::stable::transpose(sf, 1, 2);
+    sf = torch::stable::narrow(sf, 1, 0, batch_size);   // [leading_dim, batch_size, hidden_dim / (scale_gran*4)], int32
     if (!extra_dim.has_value())
-        sf = sf.squeeze(0);
+        sf = torch::stable::squeeze(sf, 0);
     return sf;
 }
 
 #endif  // FLASH_MLA_IS_BUILD_ON_CUDA
 
-std::vector<at::Tensor> fused_norm_rope_attn_rope_cast_fwd(
-    const at::Tensor &q,
-    const at::Tensor &kv,
-    const at::Tensor &indices,
+std::vector<Tensor> fused_norm_rope_attn_rope_cast_fwd(
+    const Tensor &q,
+    const Tensor &kv,
+    const Tensor &indices,
     double sm_scale,
     int64_t d_v,
-    const std::optional<at::Tensor> &attn_sink,
-    const std::optional<at::Tensor> &topk_length,
+    const std::optional<Tensor> &attn_sink,
+    const std::optional<Tensor> &topk_length,
     bool enable_q_norm,
     double rms_norm_eps,
-    const at::Tensor &token_positions,
+    const Tensor &token_positions,
     bool is_rope_neox_style,
     int64_t rope_dim,
-    const at::Tensor &cos_sin_cache,
+    const Tensor &cos_sin_cache,
 
     int64_t n_wv_group,
     int64_t num_per_channels,
@@ -53,7 +54,7 @@ std::vector<at::Tensor> fused_norm_rope_attn_rope_cast_fwd(
 #ifdef FLASH_MLA_IS_BUILD_ON_CUDA
     Arch arch = Arch();
     bool is_sm100f = arch.is_sm100f();
-    TORCH_CHECK(is_sm100f, "Fused Norm + RoPE + Core Attn + RoPE + Cast (fused_norm_rope_attn_rope_cast_fwd) is only supported on SM100f architectures.");
+    STD_TORCH_CHECK(is_sm100f, "Fused Norm + RoPE + Core Attn + RoPE + Cast (fused_norm_rope_attn_rope_cast_fwd) is only supported on SM100f architectures.");
 
     KU_CHECK_NDIM(q, 3);
     KU_CHECK_NDIM(kv, 3);
@@ -69,19 +70,19 @@ std::vector<at::Tensor> fused_norm_rope_attn_rope_cast_fwd(
     int h_kv = kv.size(1);
     int d_qk = q.size(2);
     int topk = indices.size(2);
-    TORCH_CHECK(n_wv_group > 0, "n_wv_group must be positive");
+    STD_TORCH_CHECK(n_wv_group > 0, "n_wv_group must be positive");
     uint32_t wv_group_size = static_cast<uint32_t>(h_q / n_wv_group);
 
     // Metadata sanity check
-    TORCH_CHECK(h_q == 64 || h_q == 128, "Only h_q == 64 or 128 is supported for fused_norm_rope_attn_rope_cast_fwd, got ", h_q);
-    TORCH_CHECK(h_kv == 1, "Currently only MQA (i.e. h_kv == 1) is supported");
-    TORCH_CHECK(d_qk == 512, "Only head_size_k == 512 (V4.1) is supported");
-    TORCH_CHECK(d_v == 512, "Only head_size_v == 512 is supported");
-    TORCH_CHECK(h_q % n_wv_group == 0, "h_q %% n_wv_group != 0");
-    TORCH_CHECK(is_rope_neox_style == false, "Only `is_rope_neox_style == False` is supported");
-    TORCH_CHECK(use_tma_aligned_col_major_sf == true, "`use_tma_aligned_col_major_sf` must be True");
-    TORCH_CHECK(round_sf == true, "`round_sf` must be True");
-    TORCH_CHECK(use_packed_ue8m0 == true, "`use_packed_ue8m0` must be True");
+    STD_TORCH_CHECK(h_q == 64 || h_q == 128, "Only h_q == 64 or 128 is supported for fused_norm_rope_attn_rope_cast_fwd, got ", h_q);
+    STD_TORCH_CHECK(h_kv == 1, "Currently only MQA (i.e. h_kv == 1) is supported");
+    STD_TORCH_CHECK(d_qk == 512, "Only head_size_k == 512 (V4.1) is supported");
+    STD_TORCH_CHECK(d_v == 512, "Only head_size_v == 512 is supported");
+    STD_TORCH_CHECK(h_q % n_wv_group == 0, "h_q %% n_wv_group != 0");
+    STD_TORCH_CHECK(is_rope_neox_style == false, "Only `is_rope_neox_style == False` is supported");
+    STD_TORCH_CHECK(use_tma_aligned_col_major_sf == true, "`use_tma_aligned_col_major_sf` must be True");
+    STD_TORCH_CHECK(round_sf == true, "`round_sf` must be True");
+    STD_TORCH_CHECK(use_packed_ue8m0 == true, "`use_packed_ue8m0` must be True");
 
     KU_CHECK_DEVICE(q);
     KU_CHECK_DEVICE(kv);
@@ -91,13 +92,13 @@ std::vector<at::Tensor> fused_norm_rope_attn_rope_cast_fwd(
     KU_CHECK_DEVICE(token_positions);
     KU_CHECK_DEVICE(cos_sin_cache);
     
-    KU_CHECK_DTYPE(q, torch::kBFloat16);
-    KU_CHECK_DTYPE(kv, torch::kBFloat16);
-    KU_CHECK_DTYPE(indices, torch::kInt32);
-    KU_CHECK_DTYPE(attn_sink, torch::kFloat32);
-    KU_CHECK_DTYPE(topk_length, torch::kInt32);
-    KU_CHECK_DTYPE(token_positions, torch::kInt32);
-    KU_CHECK_DTYPE(cos_sin_cache, torch::kFloat32);
+    KU_CHECK_DTYPE(q, ScalarType::BFloat16);
+    KU_CHECK_DTYPE(kv, ScalarType::BFloat16);
+    KU_CHECK_DTYPE(indices, ScalarType::Int);
+    KU_CHECK_DTYPE(attn_sink, ScalarType::Float);
+    KU_CHECK_DTYPE(topk_length, ScalarType::Int);
+    KU_CHECK_DTYPE(token_positions, ScalarType::Int);
+    KU_CHECK_DTYPE(cos_sin_cache, ScalarType::Float);
     
     KU_CHECK_SHAPE(q, s_q, h_q, d_qk);
     KU_CHECK_SHAPE(kv, s_kv, h_kv, d_qk);
@@ -109,7 +110,7 @@ std::vector<at::Tensor> fused_norm_rope_attn_rope_cast_fwd(
     
     KU_CHECK_LAST_DIM_CONTIGUOUS(q);
     // q is in the permuted layout (see permute_q_b_proj), so the kernel assumes that the h_q*d_qk elements of one token are contiguous (only q.stride(0) is used by the kernel)
-    TORCH_CHECK(q.stride(1) == d_qk, "q must be contiguous within each token (i.e. q.stride(1) == d_qk), since q is in the permuted layout, got q.stride(1) = ", q.stride(1));
+    STD_TORCH_CHECK(q.stride(1) == d_qk, "q must be contiguous within each token (i.e. q.stride(1) == d_qk), since q is in the permuted layout, got q.stride(1) = ", q.stride(1));
     KU_CHECK_LAST_DIM_CONTIGUOUS(kv);
     KU_CHECK_LAST_DIM_CONTIGUOUS(indices);
     KU_CHECK_LAST_DIM_CONTIGUOUS(attn_sink);
@@ -117,19 +118,18 @@ std::vector<at::Tensor> fused_norm_rope_attn_rope_cast_fwd(
     KU_CHECK_CONTIGUOUS(token_positions);
     KU_CHECK_CONTIGUOUS(cos_sin_cache);
 
-    TORCH_CHECK(num_per_channels == 32, "num_per_channels must be 32, got ", num_per_channels);
+    STD_TORCH_CHECK(num_per_channels == 32, "num_per_channels must be 32, got ", num_per_channels);
 
-    at::cuda::CUDAGuard device_guard{(char)q.get_device()};
-    auto opts = q.options();
+    torch::stable::accelerator::DeviceGuard device_guard(q.get_device_index());
     
-    TORCH_CHECK(d_v % (num_per_channels * 4) == 0); // 4 is the number of uint8 in uint32, since `use_packed_ue8m0` is `True`
-    at::Tensor out_fp8 = torch::empty({s_q, n_wv_group, wv_group_size * d_v}, opts.dtype(torch::kFloat8_e4m3fn));
+    STD_TORCH_CHECK(d_v % (num_per_channels * 4) == 0); // 4 is the number of uint8 in uint32, since `use_packed_ue8m0` is `True`
+    Tensor out_fp8 = torch::stable::new_empty(q, {s_q, n_wv_group, wv_group_size * d_v}, ScalarType::Float8_e4m3fn);
     uint32_t out_sf_scale_gran = 32; // Since the weight is per-32 scaled and deep_gemm.einsum requires A and B to have the same scale granularity, the output sf is always stored in a per-32 scaled format (num_per_channels is always 32)
-    at::Tensor out_sf = allocate_scale_factor(s_q, wv_group_size * d_v, out_sf_scale_gran, opts, n_wv_group).transpose(0, 1);   // [s_q, n_wv_group, wv_group_size * d_v / (out_sf_scale_gran*4)]
-    at::Tensor max_logits = torch::empty({s_q, h_q}, opts.dtype(torch::kFloat));
-    at::Tensor lse = torch::empty({s_q, h_q}, opts.dtype(torch::kFloat));
+    Tensor out_sf = torch::stable::transpose(allocate_scale_factor(s_q, wv_group_size * d_v, out_sf_scale_gran, q, n_wv_group), 0, 1);   // [s_q, n_wv_group, wv_group_size * d_v / (out_sf_scale_gran*4)]
+    Tensor max_logits = torch::stable::new_empty(q, {s_q, h_q}, ScalarType::Float);
+    Tensor lse = torch::stable::new_empty(q, {s_q, h_q}, ScalarType::Float);
     KU_CHECK_CONTIGUOUS(out_fp8);
-    TORCH_CHECK(out_sf.stride(0) == 1);
+    STD_TORCH_CHECK(out_sf.stride(0) == 1);
     KU_CHECK_CONTIGUOUS(max_logits);
     KU_CHECK_CONTIGUOUS(lse);
 
@@ -153,7 +153,7 @@ std::vector<at::Tensor> fused_norm_rope_attn_rope_cast_fwd(
 
         SparseAttnFwdMode::Prefill,
         arch.num_sms,
-        at::cuda::getCurrentCUDAStream().stream(),
+        kerutils::get_current_stream<stream_t>(q),
 
         enable_q_norm,
         static_cast<float>(rms_norm_eps),
@@ -183,28 +183,28 @@ std::vector<at::Tensor> fused_norm_rope_attn_rope_cast_fwd(
 
     return {out_fp8, out_sf, max_logits, lse};
 #else
-    TORCH_CHECK(false, "fused_norm_rope_attn_rope_cast_fwd is only supported on CUDA GPUs.");
+    STD_TORCH_CHECK(false, "fused_norm_rope_attn_rope_cast_fwd is only supported on CUDA GPUs.");
 #endif
 }
 
 
-std::vector<at::Tensor> fused_norm_rope_attn_rope_cast_decode(
-    const at::Tensor &q,        // [s_q, h_q, d_qk]
-    const at::Tensor &kv,       // [num_blocks, page_block_size, h_kv, bytes_per_token], paged quantized KV cache
-    const at::Tensor &indices,  // [s_q, topk]
+std::vector<Tensor> fused_norm_rope_attn_rope_cast_decode(
+    const Tensor &q,        // [s_q, h_q, d_qk]
+    const Tensor &kv,       // [num_blocks, page_block_size, h_kv, bytes_per_token], paged quantized KV cache
+    const Tensor &indices,  // [s_q, topk]
     double sm_scale,
     int64_t d_v,
-    const std::optional<at::Tensor> &attn_sink,         // [h_q]
-    const std::optional<at::Tensor> &topk_length,       // [s_q]
-    const std::optional<at::Tensor> &extra_kv,          // [extra_num_blocks, extra_page_block_size, h_kv, bytes_per_token]
-    const std::optional<at::Tensor> &extra_indices,     // [s_q, extra_topk]
-    const std::optional<at::Tensor> &extra_topk_length, // [s_q]
+    const std::optional<Tensor> &attn_sink,         // [h_q]
+    const std::optional<Tensor> &topk_length,       // [s_q]
+    const std::optional<Tensor> &extra_kv,          // [extra_num_blocks, extra_page_block_size, h_kv, bytes_per_token]
+    const std::optional<Tensor> &extra_indices,     // [s_q, extra_topk]
+    const std::optional<Tensor> &extra_topk_length, // [s_q]
     bool enable_q_norm,
     double rms_norm_eps,
-    const at::Tensor &token_positions,  // [s_q]
+    const Tensor &token_positions,  // [s_q]
     bool is_rope_neox_style,
     int64_t rope_dim,
-    const at::Tensor &cos_sin_cache,    // [num_positions, rope_dim]
+    const Tensor &cos_sin_cache,    // [num_positions, rope_dim]
 
     int64_t n_wv_group,
     int64_t num_per_channels,
@@ -214,7 +214,7 @@ std::vector<at::Tensor> fused_norm_rope_attn_rope_cast_decode(
 ) {
 #ifdef FLASH_MLA_IS_BUILD_ON_CUDA
     Arch arch = Arch();
-    TORCH_CHECK(arch.is_sm100f(), "Fused Norm + RoPE + Core Attn + RoPE + Cast (fused_norm_rope_attn_rope_cast_decode) is only supported on SM100f architectures.");
+    STD_TORCH_CHECK(arch.is_sm100f(), "Fused Norm + RoPE + Core Attn + RoPE + Cast (fused_norm_rope_attn_rope_cast_decode) is only supported on SM100f architectures.");
 
     KU_CHECK_NDIM(q, 3);
     KU_CHECK_NDIM(kv, 4);
@@ -247,26 +247,26 @@ std::vector<at::Tensor> fused_norm_rope_attn_rope_cast_decode(
     }
 
     // Metadata sanity check
-    TORCH_CHECK(s_q > 0);
-    TORCH_CHECK(h_q == 64 || h_q == 128, "Only h_q == 64 or 128 is supported for fused_norm_rope_attn_rope_cast_decode, got ", h_q);
-    TORCH_CHECK(h_kv == 1, "Currently only MQA (i.e. h_kv == 1) is supported");
-    TORCH_CHECK(d_qk == 512, "Only head_size_k == 512 (V4.1) is supported");
-    TORCH_CHECK(d_v == 512, "Only head_size_v == 512 is supported");
-    TORCH_CHECK(topk > 0);
-    TORCH_CHECK(n_wv_group > 0 && h_q % n_wv_group == 0, "n_wv_group <= 0 or h_q %% n_wv_group != 0");
+    STD_TORCH_CHECK(s_q > 0);
+    STD_TORCH_CHECK(h_q == 64 || h_q == 128, "Only h_q == 64 or 128 is supported for fused_norm_rope_attn_rope_cast_decode, got ", h_q);
+    STD_TORCH_CHECK(h_kv == 1, "Currently only MQA (i.e. h_kv == 1) is supported");
+    STD_TORCH_CHECK(d_qk == 512, "Only head_size_k == 512 (V4.1) is supported");
+    STD_TORCH_CHECK(d_v == 512, "Only head_size_v == 512 is supported");
+    STD_TORCH_CHECK(topk > 0);
+    STD_TORCH_CHECK(n_wv_group > 0 && h_q % n_wv_group == 0, "n_wv_group <= 0 or h_q %% n_wv_group != 0");
     uint32_t wv_group_size = static_cast<uint32_t>(h_q / n_wv_group);
 
     if (have_extra_kvcache) {
-        TORCH_CHECK(extra_indices.has_value(), "extra_indices must be provided when extra_kv is provided");
+        STD_TORCH_CHECK(extra_indices.has_value(), "extra_indices must be provided when extra_kv is provided");
     } else {
-        TORCH_CHECK(!extra_indices.has_value(), "extra_indices must not be provided when extra_kv is not provided");
-        TORCH_CHECK(!extra_topk_length.has_value(), "extra_topk_length must not be provided when extra_kv is not provided");
+        STD_TORCH_CHECK(!extra_indices.has_value(), "extra_indices must not be provided when extra_kv is not provided");
+        STD_TORCH_CHECK(!extra_topk_length.has_value(), "extra_topk_length must not be provided when extra_kv is not provided");
     }
 
-    TORCH_CHECK(is_rope_neox_style == false, "Only `is_rope_neox_style == False` is supported");
-    TORCH_CHECK(use_tma_aligned_col_major_sf == true, "`use_tma_aligned_col_major_sf` must be True");
-    TORCH_CHECK(round_sf == true, "`round_sf` must be True");
-    TORCH_CHECK(use_packed_ue8m0 == true, "`use_packed_ue8m0` must be True");
+    STD_TORCH_CHECK(is_rope_neox_style == false, "Only `is_rope_neox_style == False` is supported");
+    STD_TORCH_CHECK(use_tma_aligned_col_major_sf == true, "`use_tma_aligned_col_major_sf` must be True");
+    STD_TORCH_CHECK(round_sf == true, "`round_sf` must be True");
+    STD_TORCH_CHECK(use_packed_ue8m0 == true, "`use_packed_ue8m0` must be True");
 
     // Check device
     KU_CHECK_DEVICE(q);
@@ -281,23 +281,23 @@ std::vector<at::Tensor> fused_norm_rope_attn_rope_cast_decode(
     KU_CHECK_DEVICE(cos_sin_cache);
 
     // Check data type
-    KU_CHECK_DTYPE(q, torch::kBFloat16);
-    TORCH_CHECK(kv.dtype() == torch::kFloat8_e4m3fn || kv.dtype() == torch::kInt8 || kv.dtype() == torch::kUInt8, "kv must have dtype fp8_e4m3fn, int8 or uint8");
+    KU_CHECK_DTYPE(q, ScalarType::BFloat16);
+    STD_TORCH_CHECK(kv.scalar_type() == ScalarType::Float8_e4m3fn || kv.scalar_type() == ScalarType::Char || kv.scalar_type() == ScalarType::Byte, "kv must have dtype fp8_e4m3fn, int8 or uint8");
     if (have_extra_kvcache) {
-        TORCH_CHECK(extra_kv->dtype() == torch::kFloat8_e4m3fn || extra_kv->dtype() == torch::kInt8 || extra_kv->dtype() == torch::kUInt8, "extra_kv must have dtype fp8_e4m3fn, int8 or uint8");
+        STD_TORCH_CHECK(extra_kv->scalar_type() == ScalarType::Float8_e4m3fn || extra_kv->scalar_type() == ScalarType::Char || extra_kv->scalar_type() == ScalarType::Byte, "extra_kv must have dtype fp8_e4m3fn, int8 or uint8");
     }
-    KU_CHECK_DTYPE(indices, torch::kInt32);
-    KU_CHECK_DTYPE(attn_sink, torch::kFloat32);
-    KU_CHECK_DTYPE(topk_length, torch::kInt32);
-    KU_CHECK_DTYPE(extra_indices, torch::kInt32);
-    KU_CHECK_DTYPE(extra_topk_length, torch::kInt32);
-    KU_CHECK_DTYPE(token_positions, torch::kInt32);
-    KU_CHECK_DTYPE(cos_sin_cache, torch::kFloat32);
+    KU_CHECK_DTYPE(indices, ScalarType::Int);
+    KU_CHECK_DTYPE(attn_sink, ScalarType::Float);
+    KU_CHECK_DTYPE(topk_length, ScalarType::Int);
+    KU_CHECK_DTYPE(extra_indices, ScalarType::Int);
+    KU_CHECK_DTYPE(extra_topk_length, ScalarType::Int);
+    KU_CHECK_DTYPE(token_positions, ScalarType::Int);
+    KU_CHECK_DTYPE(cos_sin_cache, ScalarType::Float);
 
     // Check layout
     KU_CHECK_LAST_DIM_CONTIGUOUS(q);
     // q is in the permuted layout (see permute_q_b_proj), so the kernel assumes that the h_q*d_qk elements of one token are contiguous (only q.stride(0) is used by the kernel)
-    TORCH_CHECK(q.stride(1) == d_qk, "q must be contiguous within each token (i.e. q.stride(1) == d_qk), since q is in the permuted layout, got q.stride(1) = ", q.stride(1));
+    STD_TORCH_CHECK(q.stride(1) == d_qk, "q must be contiguous within each token (i.e. q.stride(1) == d_qk), since q is in the permuted layout, got q.stride(1) = ", q.stride(1));
     KU_CHECK_LAST_DIM_CONTIGUOUS(kv);
     KU_CHECK_LAST_DIM_CONTIGUOUS(indices);
     KU_CHECK_CONTIGUOUS(attn_sink);
@@ -311,16 +311,16 @@ std::vector<at::Tensor> fused_norm_rope_attn_rope_cast_decode(
     // The formats of `kv` and `extra_kv` (V4.1 or V4.1 fp4, see KVCacheFormat), detected by bytes_per_token
     ModelType model_type = detect_kv_cache_format_for_headdim_512(kv.size(3));
     ModelType extra_model_type = have_extra_kvcache ? detect_kv_cache_format_for_headdim_512(extra_kv->size(3)) : model_type;
-    TORCH_CHECK(model_type != ModelType::V41_FP4, "The fp4 KV cache is only supported as extra_kv");
-    TORCH_CHECK(is_valid_kv_format_pair(model_type, extra_model_type), "extra_kv must have the format of kv, or the V4.1 fp4 format when kv has the V4.1 format, got ",
+    STD_TORCH_CHECK(model_type != ModelType::V41_FP4, "The fp4 KV cache is only supported as extra_kv");
+    STD_TORCH_CHECK(is_valid_kv_format_pair(model_type, extra_model_type), "extra_kv must have the format of kv, or the V4.1 fp4 format when kv has the V4.1 format, got ",
         get_dynamic_enum_name(model_type), " and ", get_dynamic_enum_name(extra_model_type));
     KU_CHECK_SHAPE(kv, num_blocks, page_block_size, h_kv, kv_cache_bytes_per_token(model_type));
     KU_CHECK_SHAPE(extra_kv, extra_num_blocks, extra_page_block_size, h_kv, kv_cache_bytes_per_token(extra_model_type));
-    TORCH_CHECK(kv.stride(1) == kv_cache_bytes_per_token(model_type), "The whole block must be contiguous for the paged KV cache");
+    STD_TORCH_CHECK(kv.stride(1) == kv_cache_bytes_per_token(model_type), "The whole block must be contiguous for the paged KV cache");
     if (have_extra_kvcache) {
-        TORCH_CHECK(extra_kv->stride(1) == kv_cache_bytes_per_token(extra_model_type), "The whole block must be contiguous for the paged extra KV cache");
+        STD_TORCH_CHECK(extra_kv->stride(1) == kv_cache_bytes_per_token(extra_model_type), "The whole block must be contiguous for the paged extra KV cache");
     }
-    TORCH_CHECK(num_per_channels == 32, "num_per_channels must be 32, got ", num_per_channels);
+    STD_TORCH_CHECK(num_per_channels == 32, "num_per_channels must be 32, got ", num_per_channels);
 
     // Check shape
     KU_CHECK_SHAPE(q, s_q, h_q, d_qk);
@@ -332,16 +332,15 @@ std::vector<at::Tensor> fused_norm_rope_attn_rope_cast_decode(
     KU_CHECK_SHAPE(token_positions, s_q);
     KU_CHECK_SHAPE(cos_sin_cache, cos_sin_cache.size(0), rope_dim);
 
-    at::cuda::CUDAGuard device_guard{(char)q.get_device()};
-    auto opts = q.options();
+    torch::stable::accelerator::DeviceGuard device_guard(q.get_device_index());
 
-    TORCH_CHECK(d_v % (num_per_channels * 4) == 0); // 4 is the number of uint8 in uint32, since `use_packed_ue8m0` is `True`
-    at::Tensor out_fp8 = torch::empty({s_q, n_wv_group, wv_group_size * d_v}, opts.dtype(torch::kFloat8_e4m3fn));
+    STD_TORCH_CHECK(d_v % (num_per_channels * 4) == 0); // 4 is the number of uint8 in uint32, since `use_packed_ue8m0` is `True`
+    Tensor out_fp8 = torch::stable::new_empty(q, {s_q, n_wv_group, wv_group_size * d_v}, ScalarType::Float8_e4m3fn);
     uint32_t out_sf_scale_gran = 32; // Since the weight is per-32 scaled and deep_gemm.einsum requires A and B to have the same scale granularity, the output sf is always stored in a per-32 scaled format (num_per_channels is always 32)
-    at::Tensor out_sf = allocate_scale_factor(s_q, wv_group_size * d_v, out_sf_scale_gran, opts, n_wv_group).transpose(0, 1);   // [s_q, n_wv_group, wv_group_size * d_v / (out_sf_scale_gran*4)]
-    at::Tensor lse = torch::empty({s_q, h_q}, opts.dtype(torch::kFloat));
+    Tensor out_sf = torch::stable::transpose(allocate_scale_factor(s_q, wv_group_size * d_v, out_sf_scale_gran, q, n_wv_group), 0, 1);   // [s_q, n_wv_group, wv_group_size * d_v / (out_sf_scale_gran*4)]
+    Tensor lse = torch::stable::new_empty(q, {s_q, h_q}, ScalarType::Float);
     KU_CHECK_CONTIGUOUS(out_fp8);
-    TORCH_CHECK(out_sf.stride(0) == 1);
+    STD_TORCH_CHECK(out_sf.stride(0) == 1);
     KU_CHECK_CONTIGUOUS(lse);
 
     SparseAttnDecodeParams base_params = {
@@ -374,7 +373,7 @@ std::vector<at::Tensor> fused_norm_rope_attn_rope_cast_decode(
         0,                                              // stride_extra_indices_b is unused since b == 1
         have_extra_kvcache ? int64_stride_to_int(extra_indices->stride(0)) : 0,
         get_num_sms(),
-        at::cuda::getCurrentCUDAStream().stream(),
+        kerutils::get_current_stream<stream_t>(q),
 
         false,      // enable_split_kv: split-KV is not supported by this kernel
         // The remaining split-KV related fields are zero-initialized
@@ -415,14 +414,14 @@ std::vector<at::Tensor> fused_norm_rope_attn_rope_cast_decode(
 
     return {out_fp8, out_sf, lse};
 #else
-    TORCH_CHECK(false, "fused_norm_rope_attn_rope_cast_decode is only supported on CUDA GPUs.");
+    STD_TORCH_CHECK(false, "fused_norm_rope_attn_rope_cast_decode is only supported on CUDA GPUs.");
 #endif
 }
 
 
-std::vector<at::Tensor> permute_q_b_proj(
-    const at::Tensor &q_b_proj,
-    const at::Tensor &scale_factors,
+std::vector<Tensor> permute_q_b_proj(
+    const Tensor &q_b_proj,
+    const Tensor &scale_factors,
     int64_t h_q,
     int64_t d_q
 ) {
@@ -434,25 +433,25 @@ std::vector<at::Tensor> permute_q_b_proj(
     int q_lora_rank = q_b_proj.size(1);
 
     int gran = q_lora_rank / (4 * scale_factors.size(1));
-    TORCH_CHECK(gran == 32 || gran == 128, "gran must be 32 or 128, got ", gran);
-    TORCH_CHECK(q_lora_rank % (gran * 4) == 0, "q_lora_rank must be divisible by gran * 4");
+    STD_TORCH_CHECK(gran == 32 || gran == 128, "gran must be 32 or 128, got ", gran);
+    STD_TORCH_CHECK(q_lora_rank % (gran * 4) == 0, "q_lora_rank must be divisible by gran * 4");
 
     KU_CHECK_DEVICE(q_b_proj);
     KU_CHECK_DEVICE(scale_factors);
 
-    KU_CHECK_DTYPE(q_b_proj, torch::kFloat8_e4m3fn);
-    KU_CHECK_DTYPE(scale_factors, torch::kInt32);
+    KU_CHECK_DTYPE(q_b_proj, ScalarType::Float8_e4m3fn);
+    KU_CHECK_DTYPE(scale_factors, ScalarType::Int);
 
     KU_CHECK_SHAPE(q_b_proj, h_q_d_q, q_lora_rank);
     KU_CHECK_SHAPE(scale_factors, h_q_d_q, q_lora_rank / gran / 4);
 
     KU_CHECK_LAST_DIM_CONTIGUOUS(q_b_proj);
-    TORCH_CHECK(scale_factors.stride(0) == 1, "scale_factors must be contiguous on the first dimension");
+    STD_TORCH_CHECK(scale_factors.stride(0) == 1, "scale_factors must be contiguous on the first dimension");
 
-    at::cuda::CUDAGuard device_guard{(char)q_b_proj.get_device()};
+    torch::stable::accelerator::DeviceGuard device_guard(q_b_proj.get_device_index());
 
-    at::Tensor q_b_proj_permuted = torch::empty_like(q_b_proj);
-    at::Tensor scale_factors_permuted = allocate_scale_factor(h_q_d_q, q_lora_rank, gran, q_b_proj.options());
+    Tensor q_b_proj_permuted = torch::stable::empty_like(q_b_proj);
+    Tensor scale_factors_permuted = allocate_scale_factor(h_q_d_q, q_lora_rank, gran, q_b_proj);
     KU_CHECK_CONTIGUOUS(q_b_proj_permuted);
 
     sm100::prefill::fused_norm_rope_attn_rope_cast_fwd::permute_q_b_proj::Params params = {
@@ -471,21 +470,21 @@ std::vector<at::Tensor> permute_q_b_proj(
         (int32_t*)scale_factors_permuted.data_ptr(),
         (uint64_t)scale_factors_permuted.stride(1),
         
-        at::cuda::getCurrentCUDAStream().stream(),
+        kerutils::get_current_stream<stream_t>(q_b_proj),
     };
 
     sm100::prefill::fused_norm_rope_attn_rope_cast_fwd::permute_q_b_proj::run_permute_q_b_proj_kernel(params);
 
     return {q_b_proj_permuted, scale_factors_permuted};
 #else
-    TORCH_CHECK(false, "permute_q_b_proj is only supported on CUDA GPUs.");
+    STD_TORCH_CHECK(false, "permute_q_b_proj is only supported on CUDA GPUs.");
 #endif
 }
 
 
-std::vector<at::Tensor> permute_wv_proj(
-    const at::Tensor &wv_proj,
-    const at::Tensor &scale_factors,
+std::vector<Tensor> permute_wv_proj(
+    const Tensor &wv_proj,
+    const Tensor &scale_factors,
     int64_t wv_group_size,
     int64_t d_o
 ) {
@@ -496,8 +495,8 @@ std::vector<at::Tensor> permute_wv_proj(
     KU_CHECK_DEVICE(wv_proj);
     KU_CHECK_DEVICE(scale_factors);
     
-    KU_CHECK_DTYPE(wv_proj, torch::kFloat8_e4m3fn);
-    KU_CHECK_DTYPE(scale_factors, torch::kInt32);
+    KU_CHECK_DTYPE(wv_proj, ScalarType::Float8_e4m3fn);
+    KU_CHECK_DTYPE(scale_factors, ScalarType::Int);
     
     int n_wv_group = wv_proj.size(0);
     int d_proj_out = wv_proj.size(1);
@@ -505,17 +504,17 @@ std::vector<at::Tensor> permute_wv_proj(
 
     int input_gran = wv_group_size * d_o / (4 * scale_factors.size(2));
     int output_gran = 32;   // Fixed to 32, otherwise permution between chunk (which has 32 elements) will be impossible
-    TORCH_CHECK(input_gran == 32, "input scale granularity must be 32, got ", input_gran);
-    TORCH_CHECK((wv_group_size * d_o) % (input_gran * 4) == 0, "wv_group_size * d_o must be divisible by the input scale granularity * 4");
+    STD_TORCH_CHECK(input_gran == 32, "input scale granularity must be 32, got ", input_gran);
+    STD_TORCH_CHECK((wv_group_size * d_o) % (input_gran * 4) == 0, "wv_group_size * d_o must be divisible by the input scale granularity * 4");
     KU_CHECK_SHAPE(scale_factors, n_wv_group, d_proj_out, (wv_group_size * d_o) / input_gran / 4);
 
     KU_CHECK_LAST_DIM_CONTIGUOUS(wv_proj);
-    TORCH_CHECK(scale_factors.stride(1) == 1, "scale_factors must be contiguous on the second dimension");
+    STD_TORCH_CHECK(scale_factors.stride(1) == 1, "scale_factors must be contiguous on the second dimension");
 
-    at::cuda::CUDAGuard device_guard{(char)wv_proj.get_device()};
+    torch::stable::accelerator::DeviceGuard device_guard(wv_proj.get_device_index());
 
-    at::Tensor wv_proj_permuted = torch::empty_like(wv_proj);
-    at::Tensor scale_factors_permuted = allocate_scale_factor(d_proj_out, wv_group_size * d_o, output_gran, wv_proj.options(), n_wv_group);
+    Tensor wv_proj_permuted = torch::stable::empty_like(wv_proj);
+    Tensor scale_factors_permuted = allocate_scale_factor(d_proj_out, wv_group_size * d_o, output_gran, wv_proj, n_wv_group);
     KU_CHECK_CONTIGUOUS(wv_proj_permuted);
 
     sm100::prefill::fused_norm_rope_attn_rope_cast_fwd::permute_wv_proj::Params params = {
@@ -539,23 +538,23 @@ std::vector<at::Tensor> permute_wv_proj(
         (uint64_t)scale_factors_permuted.stride(0),
         (uint64_t)scale_factors_permuted.stride(2),
         
-        at::cuda::getCurrentCUDAStream().stream(),
+        kerutils::get_current_stream<stream_t>(wv_proj),
     };
 
     sm100::prefill::fused_norm_rope_attn_rope_cast_fwd::permute_wv_proj::run_permute_wv_proj_kernel(params);
 
     return {wv_proj_permuted, scale_factors_permuted};
 #else
-    TORCH_CHECK(false, "permute_wv_proj is only supported on CUDA GPUs.");
+    STD_TORCH_CHECK(false, "permute_wv_proj is only supported on CUDA GPUs.");
 #endif
 }
 
 
 #ifdef FLASH_MLA_IS_BUILD_ON_CUDA
-TORCH_LIBRARY_IMPL(flash_mla, CUDA, m) {
-    m.impl("fused_norm_rope_attn_rope_cast_fwd", &fused_norm_rope_attn_rope_cast_fwd);
-    m.impl("fused_norm_rope_attn_rope_cast_decode", &fused_norm_rope_attn_rope_cast_decode);
-    m.impl("permute_q_b_proj", &permute_q_b_proj);
-    m.impl("permute_wv_proj", &permute_wv_proj);
+STABLE_TORCH_LIBRARY_IMPL(flash_mla, CUDA, m) {
+    m.impl("fused_norm_rope_attn_rope_cast_fwd", TORCH_BOX(&fused_norm_rope_attn_rope_cast_fwd));
+    m.impl("fused_norm_rope_attn_rope_cast_decode", TORCH_BOX(&fused_norm_rope_attn_rope_cast_decode));
+    m.impl("permute_q_b_proj", TORCH_BOX(&permute_q_b_proj));
+    m.impl("permute_wv_proj", TORCH_BOX(&permute_wv_proj));
 }
 #endif

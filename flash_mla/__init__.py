@@ -4,7 +4,7 @@ from pathlib import Path
 
 import torch
 
-# Loading the extension runs its static TORCH_LIBRARY registrations. The glob
+# Loading the extension runs its static STABLE_TORCH_LIBRARY registrations. The glob
 # accepts either platform build and both CPython-specific and abi3 suffixes.
 _so_files = [
     *Path(__file__).parent.glob("cuda*.so"),

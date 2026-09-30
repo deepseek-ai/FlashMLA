@@ -7,7 +7,8 @@ from setuptools import setup, find_packages
 
 THIS_DIR = Path(__file__).resolve().parent
 
-# The dispatcher API of the extension. The fused kernels live in their own translation unit.
+# Stable dispatcher API shared by both build platforms. The fused kernels live
+# in their own translation unit.
 API_SOURCES = [
     "csrc/api/api.cpp",
     "csrc/api/sparse_prefill.cpp",
@@ -25,6 +26,13 @@ EXT_NAME_ASCEND = "flash_mla.npu"
 # family-specific one (sm_100f) because the kernels use `cvt` with `.scaled::n2::ue8m0`, and
 # sm_103a additionally enables better code generation for `exp`.
 CUDA_ARCHS = ["sm_100a", "sm_103a"]
+
+# Build against PyTorch's stable C++ ABI. PyTorch 2.13 is the first release
+# whose stable accelerator API exposes backend-native stream handles, allowing
+# the same host wrapper to serve CUDA and PrivateUse1 (Ascend).
+STABLE_ABI_FLAGS = [
+    "-DTORCH_TARGET_VERSION=0x020d000000000000",  # PyTorch >= 2.13
+]
 
 # Head counts (H_Q) the fused core_attn kernel is instantiated for: 128 (2-CTA cluster) and 64
 HEADS_FOR_FUSED_CORE_ATTN = (64, 128)
@@ -152,6 +160,7 @@ def build_on_cuda_platform():
                 # The host-side (`.cpp`) translation units are not compiled by nvcc, so `__CUDACC__`
                 # is not defined and neither kerutils' nor our own platform switch is set automatically.
                 "cxx": [
+                    *STABLE_ABI_FLAGS,
                     "-O3",
                     "-std=c++20",
                     "-DNDEBUG",
@@ -159,7 +168,7 @@ def build_on_cuda_platform():
                     "-DFLASH_MLA_IS_BUILD_ON_CUDA",
                     "-DKERUTILS_IS_BUILD_ON_CUDA",
                 ],
-                "nvcc": get_nvcc_thread_args() + [
+                "nvcc": get_nvcc_thread_args() + STABLE_ABI_FLAGS + [
                     "-O3",
                     "-std=c++20",
                     "-Wno-deprecated-declarations",
@@ -193,8 +202,8 @@ def build_on_cuda_platform():
                 f"-L{Path(CUDA_HOME) / 'targets' / 'sbsa-linux' / 'lib' / 'stubs'}",
                 "-lcuda",
             ],
-            # Registration uses TORCH_LIBRARY and does not need the Python C
-            # API, so one extension can serve every CPython >= 3.10.
+            # Registration uses STABLE_TORCH_LIBRARY and does not need the
+            # Python C API, so one extension serves every CPython >= 3.10.
             py_limited_api=True,
         )
     ]
@@ -204,8 +213,6 @@ def build_on_cuda_platform():
 
 def build_on_ascend_platform():
     from torch.utils.cpp_extension import BuildExtension, CppExtension
-
-    import torch_npu
 
     arch = os.environ.get("ASCEND_NPU_ARCH", "dav-3510")
     asc_home = os.environ.get("ASCEND_HOME_PATH", "/usr/local/Ascend/ascend-toolkit/latest")
@@ -232,13 +239,13 @@ def build_on_ascend_platform():
             ],
             extra_compile_args={
                 "cxx": [
+                    *STABLE_ABI_FLAGS,
                     "-Ofast",
                     "-std=c++20",
                     f"--npu-arch={arch}",
                     "-DFLASH_MLA_IS_BUILD_ON_ASCEND",
                     "-isystem", str(Path(asc_home) / "aarch64-linux" / "include"),  # `-isystem` suppresses warnings
                     "-isystem", str(Path(asc_home) / "aarch64-linux" / "asc" / "include"),
-                    "-isystem", str(Path(torch_npu.__file__).parent / "include"),
                     "-mllvm", "-enable-hiipu-vf-loop-unroll",
                     "--cce-res-usage",
                     # Otherwise some `__simd_callee__` are incorrectly marked as "function 'XXX' is not needed and will not be emitted"
@@ -257,14 +264,14 @@ def build_on_ascend_platform():
                 THIS_DIR / "csrc" / "3rdparty" / "kerutils" / "include",
             ],
             libraries=[
-                "torch_npu",
+                # common.h calls aclrtGetDevice/aclrtGetDeviceInfo directly.
+                "ascendcl",
             ],
             library_dirs=[
-                str(Path(torch_npu.__file__).parent / "lib"),
                 str(Path(asc_home) / "aarch64-linux" / "lib64"),
             ],
-            # Registration uses TORCH_LIBRARY and does not need the Python C
-            # API, so one extension can serve every CPython >= 3.10.
+            # Registration uses STABLE_TORCH_LIBRARY and does not need the
+            # Python C API, so one extension serves every CPython >= 3.10.
             py_limited_api=True,
         )
     ]

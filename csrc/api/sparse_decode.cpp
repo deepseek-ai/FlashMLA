@@ -73,7 +73,7 @@ protected:
     void run_(const SparseAttnDecodeParams &params, const std::vector<FeatureT> &required_features) override {
         dispatch_kv_formats(SupportedKVFormats{}, params.model_type, params.extra_model_type, [&]<ModelType MODEL_TYPE, ModelType EXTRA_MODEL_TYPE>() {
             DISPATCH_BOOLEAN_FLAG(params.enable_split_kv, ENABLE_SPLIT_KV, ([&]() {
-                TORCH_CHECK(params.h_q == 64, "Unsupported h_q: ", params.h_q);
+                STD_TORCH_CHECK(params.h_q == 64, "Unsupported h_q: ", params.h_q);
                 using sm100::decode::sparse::head64::Config;
                 sm100::decode::sparse::head64::run_flash_splitkv_mla_fp8_sparse_kernel<Config{MODEL_TYPE, EXTRA_MODEL_TYPE, ENABLE_SPLIT_KV}>(params);
             }));
@@ -168,18 +168,18 @@ protected:
 #endif  // FLASH_MLA_IS_BUILD_ON_ASCEND
 
 
-static std::tuple<at::Tensor, at::Tensor, std::optional<at::Tensor>, std::optional<at::Tensor>>
+static std::tuple<Tensor, Tensor, std::optional<Tensor>, std::optional<Tensor>>
 sparse_decode_fwd(
-    const at::Tensor &q,   // [b, s_q, h_q, d_qk]
-    const at::Tensor &kv,   // [num_blocks, page_block_size, h_k, bytes_per_token]
-    const at::Tensor &indices,    // [b, s_q, topk]
-    const std::optional<at::Tensor> &topk_length,   // [b]
-    const std::optional<at::Tensor> &attn_sink, // [h_q]
-    std::optional<at::Tensor> tile_scheduler_metadata,   // num_sm_parts x (DecodingSchedMetaSize/4)
-    std::optional<at::Tensor> num_splits,                // batch_size + 1
-    const std::optional<at::Tensor> &extra_kv,
-    const std::optional<at::Tensor> &extra_indices,
-    const std::optional<at::Tensor> &extra_topk_length,
+    const Tensor &q,   // [b, s_q, h_q, d_qk]
+    const Tensor &kv,   // [num_blocks, page_block_size, h_k, bytes_per_token]
+    const Tensor &indices,    // [b, s_q, topk]
+    const std::optional<Tensor> &topk_length,   // [b]
+    const std::optional<Tensor> &attn_sink, // [h_q]
+    std::optional<Tensor> tile_scheduler_metadata,   // num_sm_parts x (DecodingSchedMetaSize/4)
+    std::optional<Tensor> num_splits,                // batch_size + 1
+    const std::optional<Tensor> &extra_kv,
+    const std::optional<Tensor> &extra_indices,
+    const std::optional<Tensor> &extra_topk_length,
     int64_t d_v,
     double sm_scale,
     bool enable_batch_invariant
@@ -187,7 +187,7 @@ sparse_decode_fwd(
 #ifdef FLASH_MLA_IS_BUILD_ON_CUDA
     // Check the architecture
     Arch arch = Arch();
-    TORCH_CHECK(arch.is_sm100f(), "Sparse Attention Decode Kernel (sparse_decode_fwd) is only supported on SM100f architectures.");
+    STD_TORCH_CHECK(arch.is_sm100f(), "Sparse Attention Decode Kernel (sparse_decode_fwd) is only supported on SM100f architectures.");
 #endif
     KU_CHECK_NDIM(q, 4);
     KU_CHECK_NDIM(kv, 4);
@@ -224,19 +224,19 @@ sparse_decode_fwd(
 #endif
 
     // metadata sanity check
-    TORCH_CHECK(b > 0);
-    TORCH_CHECK(s_q > 0);
-    TORCH_CHECK(h_q > 0);
-    TORCH_CHECK(h_kv == 1, "Currently only MQA (i.e. h_kv == 1) is supported for sparse decoding");
-    TORCH_CHECK(d_qk == 512, "Only head_size_k == 512 is supported for sparse decoding");
-    TORCH_CHECK(d_v == 512, "Only head_size_v == 512 is supported for sparse decoding");
-    TORCH_CHECK(topk > 0);
+    STD_TORCH_CHECK(b > 0);
+    STD_TORCH_CHECK(s_q > 0);
+    STD_TORCH_CHECK(h_q > 0);
+    STD_TORCH_CHECK(h_kv == 1, "Currently only MQA (i.e. h_kv == 1) is supported for sparse decoding");
+    STD_TORCH_CHECK(d_qk == 512, "Only head_size_k == 512 is supported for sparse decoding");
+    STD_TORCH_CHECK(d_v == 512, "Only head_size_v == 512 is supported for sparse decoding");
+    STD_TORCH_CHECK(topk > 0);
 
     if (have_extra_kcache) {
-        TORCH_CHECK(extra_indices.has_value(), "extra_indices_in_kvcache must be provided when extra_kcache is provided for sparse attention");
+        STD_TORCH_CHECK(extra_indices.has_value(), "extra_indices_in_kvcache must be provided when extra_kcache is provided for sparse attention");
     } else {
-        TORCH_CHECK(!extra_indices.has_value(), "extra_indices_in_kvcache must not be provided when extra_k_cache is not provided");
-        TORCH_CHECK(!extra_topk_length.has_value(), "extra_topk_length must not be provided when extra_k_cache is not provided");
+        STD_TORCH_CHECK(!extra_indices.has_value(), "extra_indices_in_kvcache must not be provided when extra_k_cache is not provided");
+        STD_TORCH_CHECK(!extra_topk_length.has_value(), "extra_topk_length must not be provided when extra_k_cache is not provided");
     }
 
     // Check device
@@ -252,18 +252,18 @@ sparse_decode_fwd(
     KU_CHECK_DEVICE(extra_topk_length);
 
     // Check data type
-    KU_CHECK_DTYPE(q, torch::kBFloat16);
-    TORCH_CHECK(kv.dtype() == torch::kFloat8_e4m3fn || kv.dtype() == torch::kInt8 || kv.dtype() == torch::kUInt8, "key must have dtype fp8_e4m3fn, int8 or uint8");
+    KU_CHECK_DTYPE(q, ScalarType::BFloat16);
+    STD_TORCH_CHECK(kv.scalar_type() == ScalarType::Float8_e4m3fn || kv.scalar_type() == ScalarType::Char || kv.scalar_type() == ScalarType::Byte, "key must have dtype fp8_e4m3fn, int8 or uint8");
     if (extra_kv.has_value()) {
-        TORCH_CHECK(extra_kv->dtype() == torch::kFloat8_e4m3fn || extra_kv->dtype() == torch::kInt8 || extra_kv->dtype() == torch::kUInt8, "extra k cache must have dtype fp8_e4m3fn, int8 or uint8");
+        STD_TORCH_CHECK(extra_kv->scalar_type() == ScalarType::Float8_e4m3fn || extra_kv->scalar_type() == ScalarType::Char || extra_kv->scalar_type() == ScalarType::Byte, "extra k cache must have dtype fp8_e4m3fn, int8 or uint8");
     }
-    KU_CHECK_DTYPE(indices, torch::kInt32);
-    KU_CHECK_DTYPE(topk_length, torch::kInt32);
-    KU_CHECK_DTYPE(attn_sink, torch::kFloat32);
-    KU_CHECK_DTYPE(tile_scheduler_metadata, torch::kInt32);
-    KU_CHECK_DTYPE(num_splits, torch::kInt32);
-    KU_CHECK_DTYPE(extra_indices, torch::kInt32);
-    KU_CHECK_DTYPE(extra_topk_length, torch::kInt32);
+    KU_CHECK_DTYPE(indices, ScalarType::Int);
+    KU_CHECK_DTYPE(topk_length, ScalarType::Int);
+    KU_CHECK_DTYPE(attn_sink, ScalarType::Float);
+    KU_CHECK_DTYPE(tile_scheduler_metadata, ScalarType::Int);
+    KU_CHECK_DTYPE(num_splits, ScalarType::Int);
+    KU_CHECK_DTYPE(extra_indices, ScalarType::Int);
+    KU_CHECK_DTYPE(extra_topk_length, ScalarType::Int);
 
     // Check layout
     KU_CHECK_LAST_DIM_CONTIGUOUS(q);
@@ -284,13 +284,13 @@ sparse_decode_fwd(
     // The formats of `kv` and `extra_kv`
     ModelType model_type = detect_kv_cache_format_for_headdim_512(kv.size(3));
     ModelType extra_model_type = have_extra_kcache ? detect_kv_cache_format_for_headdim_512(extra_kv->size(3)) : model_type;
-    TORCH_CHECK(model_type != ModelType::V41_FP4, "The fp4 KV cache is only supported as extra_kv");
-    TORCH_CHECK(is_valid_kv_format_pair(model_type, extra_model_type), "invalid kv format pair, ", get_dynamic_enum_name(model_type), " and ", get_dynamic_enum_name(extra_model_type));
+    STD_TORCH_CHECK(model_type != ModelType::V41_FP4, "The fp4 KV cache is only supported as extra_kv");
+    STD_TORCH_CHECK(is_valid_kv_format_pair(model_type, extra_model_type), "invalid kv format pair, ", get_dynamic_enum_name(model_type), " and ", get_dynamic_enum_name(extra_model_type));
     KU_CHECK_SHAPE(kv, num_blocks, page_block_size, h_kv, kv_cache_bytes_per_token(model_type));
     KU_CHECK_SHAPE(extra_kv, extra_num_blocks, extra_page_block_size, h_kv, kv_cache_bytes_per_token(extra_model_type));
-    TORCH_CHECK(kv.stride(1) == kv_cache_bytes_per_token(model_type), "The whole block must be contiguous when is_fp8_cache is True for kv cache");
+    STD_TORCH_CHECK(kv.stride(1) == kv_cache_bytes_per_token(model_type), "The whole block must be contiguous when is_fp8_cache is True for kv cache");
     if (have_extra_kcache) {
-        TORCH_CHECK(extra_kv->stride(1) == kv_cache_bytes_per_token(extra_model_type), "The whole block must be contiguous when is_fp8_cache is True for extra kv cache");
+        STD_TORCH_CHECK(extra_kv->stride(1) == kv_cache_bytes_per_token(extra_model_type), "The whole block must be contiguous when is_fp8_cache is True for extra kv cache");
     }
     KU_CHECK_SHAPE(indices, b, s_q, topk);
     KU_CHECK_SHAPE(topk_length, b);
@@ -298,13 +298,9 @@ sparse_decode_fwd(
     KU_CHECK_SHAPE(extra_indices, b, s_q, extra_topk);
     KU_CHECK_SHAPE(extra_topk_length, b);
 
-#ifdef FLASH_MLA_IS_BUILD_ON_CUDA
-    at::cuda::CUDAGuard device_guard{(char)q.get_device()};
-#endif
-    auto opts = q.options();
-
-    at::Tensor out = torch::empty({b, s_q, h_q, d_v}, opts);
-    at::Tensor lse = torch::empty({b, s_q, h_q}, opts.dtype(at::kFloat));
+    torch::stable::accelerator::DeviceGuard device_guard(q.get_device_index());
+    Tensor out = torch::stable::new_empty(q, {b, s_q, h_q, d_v});
+    Tensor lse = torch::stable::new_empty(q, {b, s_q, h_q}, ScalarType::Float);
 
     std::vector<SparseDecodeFeatures> features;
     if (h_q == 64) {
@@ -312,7 +308,7 @@ sparse_decode_fwd(
     } else if (h_q == 128) {
         features.push_back(SparseDecodeFeatures::HEAD_128);
     } else {
-        TORCH_CHECK(false, "Unsupported h_q: ", h_q);
+        STD_TORCH_CHECK(false, "Unsupported h_q: ", h_q);
     }
     if (have_attn_sink) {
         features.push_back(SparseDecodeFeatures::ATTN_SINK);
@@ -374,18 +370,18 @@ sparse_decode_fwd(
         have_extra_kcache ? int64_stride_to_int(extra_indices->stride(0)) : 0,
         have_extra_kcache ? int64_stride_to_int(extra_indices->stride(1)) : 0,
         get_num_sms(),
-        get_current_stream(),
+        kerutils::get_current_stream<stream_t>(q),
 
         enable_split_kv,
     };
 
 #ifdef FLASH_MLA_IS_BUILD_ON_CUDA
-    at::Tensor o_accum, lse_accum;
+    Tensor o_accum, lse_accum;
     if (enable_split_kv) {
         // Get MLA metadata if necessary
         if (!tile_scheduler_metadata.has_value()) {
-            tile_scheduler_metadata = torch::empty({impl_meta.num_sm_parts, sizeof(DecodingSchedMeta)/4}, opts.dtype(torch::kInt32));
-            num_splits = torch::empty({b+1}, opts.dtype(torch::kInt32));
+            tile_scheduler_metadata = torch::stable::new_empty(q, {impl_meta.num_sm_parts, sizeof(DecodingSchedMeta)/4}, ScalarType::Int);
+            num_splits = torch::stable::new_empty(q, {b+1}, ScalarType::Int);
             KU_CHECK_CONTIGUOUS(tile_scheduler_metadata);
             KU_CHECK_CONTIGUOUS(num_splits);
 
@@ -399,31 +395,31 @@ sparse_decode_fwd(
                 ku::get_optional_tensor_ptr<int>(topk_length),
                 ku::get_optional_tensor_ptr<int>(extra_topk_length),
                 (DecodingSchedMeta*)tile_scheduler_metadata->data_ptr(),
-                num_splits->data_ptr<int>(),
-                get_current_stream()
+                num_splits->mutable_data_ptr<int>(),
+                kerutils::get_current_stream<stream_t>(q)
             };
             smxx::decode::run_get_decoding_sched_meta_kernel(get_sched_meta_params);
         }
         KU_CHECK_DEVICE(tile_scheduler_metadata);
         KU_CHECK_DEVICE(num_splits);
-        KU_CHECK_DTYPE(tile_scheduler_metadata, torch::kInt32);
-        KU_CHECK_DTYPE(num_splits, torch::kInt32);
+        KU_CHECK_DTYPE(tile_scheduler_metadata, ScalarType::Int);
+        KU_CHECK_DTYPE(num_splits, ScalarType::Int);
         KU_CHECK_CONTIGUOUS(tile_scheduler_metadata);
         KU_CHECK_CONTIGUOUS(num_splits);
         KU_CHECK_SHAPE(tile_scheduler_metadata, impl_meta.num_sm_parts, sizeof(DecodingSchedMeta)/4);
         KU_CHECK_SHAPE(num_splits, b+1);
         // Stick the metadata pointers to `params`
         params.tile_scheduler_metadata_ptr = (DecodingSchedMeta*)tile_scheduler_metadata->data_ptr();
-        params.num_splits_ptr = num_splits->data_ptr<int>();
+        params.num_splits_ptr = num_splits->mutable_data_ptr<int>();
         params.num_sm_parts = impl_meta.num_sm_parts;
         // Allocate intermediate buffers for split-KV
         const int total_num_splits = b + params.num_sm_parts;
-        lse_accum = torch::empty({total_num_splits, s_q, h_q}, opts.dtype(at::kFloat));
-        o_accum = torch::empty({total_num_splits, s_q, h_q, d_v}, opts.dtype(at::kFloat));
+        lse_accum = torch::stable::new_empty(q, {total_num_splits, s_q, h_q}, ScalarType::Float);
+        o_accum = torch::stable::new_empty(q, {total_num_splits, s_q, h_q, d_v}, ScalarType::Float);
         KU_CHECK_CONTIGUOUS(lse_accum);
         KU_CHECK_CONTIGUOUS(o_accum);
-        params.lse_accum = lse_accum.data_ptr<float>();
-        params.o_accum = o_accum.data_ptr<float>();
+        params.lse_accum = lse_accum.mutable_data_ptr<float>();
+        params.o_accum = o_accum.mutable_data_ptr<float>();
         params.stride_lse_accum_split = int64_stride_to_int(lse_accum.stride(0));
         params.stride_lse_accum_s_q = int64_stride_to_int(lse_accum.stride(1));
         params.stride_o_accum_split = int64_stride_to_int(o_accum.stride(0));
@@ -441,17 +437,18 @@ sparse_decode_fwd(
 
     delete impl;
 
-    return {out, lse.transpose(1, 2), tile_scheduler_metadata, num_splits};
+    Tensor transposed_lse = torch::stable::transpose(lse, 1, 2);
+    return {out, transposed_lse, tile_scheduler_metadata, num_splits};
 }
 
 #ifdef FLASH_MLA_IS_BUILD_ON_CUDA
-TORCH_LIBRARY_IMPL(flash_mla, CUDA, m) {
-    m.impl("sparse_decode_fwd", &sparse_decode_fwd);
+STABLE_TORCH_LIBRARY_IMPL(flash_mla, CUDA, m) {
+    m.impl("sparse_decode_fwd", TORCH_BOX(&sparse_decode_fwd));
 }
 #endif
 
 #ifdef FLASH_MLA_IS_BUILD_ON_ASCEND
-TORCH_LIBRARY_IMPL(flash_mla, PrivateUse1, m) {
-    m.impl("sparse_decode_fwd", &sparse_decode_fwd);
+STABLE_TORCH_LIBRARY_IMPL(flash_mla, PrivateUse1, m) {
+    m.impl("sparse_decode_fwd", TORCH_BOX(&sparse_decode_fwd));
 }
 #endif
