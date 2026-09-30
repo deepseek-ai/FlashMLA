@@ -9,7 +9,7 @@
 #include <utility>
 #include <vector>
 
-#include <torch/extension.h>
+#include <torch/types.h>
 #include <kerutils/supplemental/torch_tensors.h>
 
 #include "cuda_kernels/kv_cache_format.h"

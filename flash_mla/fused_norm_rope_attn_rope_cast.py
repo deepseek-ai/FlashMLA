@@ -1,12 +1,8 @@
-import os
 from typing import Optional, Tuple
 
 import torch
 
-if os.path.exists("/dev/davinci_manager"):
-    from flash_mla import npu as _backend
-else:
-    from flash_mla import cuda as _backend
+_backend = torch.ops.flash_mla
 
 
 def prefill(

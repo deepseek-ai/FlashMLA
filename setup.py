@@ -7,7 +7,7 @@ from setuptools import setup, find_packages
 
 THIS_DIR = Path(__file__).resolve().parent
 
-# The pybind11 API of the extension. The fused kernels live in their own translation unit.
+# The dispatcher API of the extension. The fused kernels live in their own translation unit.
 API_SOURCES = [
     "csrc/api/api.cpp",
     "csrc/api/sparse_prefill.cpp",
@@ -193,6 +193,9 @@ def build_on_cuda_platform():
                 f"-L{Path(CUDA_HOME) / 'targets' / 'sbsa-linux' / 'lib' / 'stubs'}",
                 "-lcuda",
             ],
+            # Registration uses TORCH_LIBRARY and does not need the Python C
+            # API, so one extension can serve every CPython >= 3.10.
+            py_limited_api=True,
         )
     ]
 
@@ -260,6 +263,9 @@ def build_on_ascend_platform():
                 str(Path(torch_npu.__file__).parent / "lib"),
                 str(Path(asc_home) / "aarch64-linux" / "lib64"),
             ],
+            # Registration uses TORCH_LIBRARY and does not need the Python C
+            # API, so one extension can serve every CPython >= 3.10.
+            py_limited_api=True,
         )
     ]
 
@@ -311,6 +317,7 @@ def main():
         packages=find_packages(include=["flash_mla"]),
         ext_modules=ext_modules,
         cmdclass={"build_ext": build_ext},
+        options={"bdist_wheel": {"py_limited_api": "cp310"}},
     )
 
 

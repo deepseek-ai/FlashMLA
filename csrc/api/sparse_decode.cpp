@@ -175,13 +175,13 @@ sparse_decode_fwd(
     const at::Tensor &indices,    // [b, s_q, topk]
     const std::optional<at::Tensor> &topk_length,   // [b]
     const std::optional<at::Tensor> &attn_sink, // [h_q]
-    std::optional<at::Tensor> &tile_scheduler_metadata,   // num_sm_parts x (DecodingSchedMetaSize/4)
-    std::optional<at::Tensor> &num_splits,                // batch_size + 1
+    std::optional<at::Tensor> tile_scheduler_metadata,   // num_sm_parts x (DecodingSchedMetaSize/4)
+    std::optional<at::Tensor> num_splits,                // batch_size + 1
     const std::optional<at::Tensor> &extra_kv,
     const std::optional<at::Tensor> &extra_indices,
     const std::optional<at::Tensor> &extra_topk_length,
-    int d_v,
-    float sm_scale,
+    int64_t d_v,
+    double sm_scale,
     bool enable_batch_invariant
 ) {
 #ifdef FLASH_MLA_IS_BUILD_ON_CUDA
@@ -345,8 +345,8 @@ sparse_decode_fwd(
 #endif
 
     SparseAttnDecodeParams params = {
-        b, s_q, h_q, h_kv, d_qk, d_v,
-        sm_scale, sm_scale * LOG_2_E,
+        b, s_q, h_q, h_kv, d_qk, static_cast<int>(d_v),
+        static_cast<float>(sm_scale), static_cast<float>(sm_scale * LOG_2_E),
         num_blocks, page_block_size, topk,
         model_type, extra_model_type,
 
@@ -444,22 +444,14 @@ sparse_decode_fwd(
     return {out, lse.transpose(1, 2), tile_scheduler_metadata, num_splits};
 }
 
-void register_sparse_decode(pybind11::module_& m) {
-    namespace py = pybind11;
-    m.def("sparse_decode_fwd",
-        &sparse_decode_fwd,
-        "Run Sparse Attention Decode Forward",
-        py::arg("q"),
-        py::arg("kv"),
-        py::arg("indices"),
-        py::arg("topk_length"),
-        py::arg("attn_sink"),
-        py::arg("tile_scheduler_metadata"),
-        py::arg("num_splits"),
-        py::arg("extra_kv"),
-        py::arg("extra_indices"),
-        py::arg("extra_topk_length"),
-        py::arg("d_v"),
-        py::arg("sm_scale"),
-        py::arg("enable_batch_invariant") = false);
+#ifdef FLASH_MLA_IS_BUILD_ON_CUDA
+TORCH_LIBRARY_IMPL(flash_mla, CUDA, m) {
+    m.impl("sparse_decode_fwd", &sparse_decode_fwd);
 }
+#endif
+
+#ifdef FLASH_MLA_IS_BUILD_ON_ASCEND
+TORCH_LIBRARY_IMPL(flash_mla, PrivateUse1, m) {
+    m.impl("sparse_decode_fwd", &sparse_decode_fwd);
+}
+#endif

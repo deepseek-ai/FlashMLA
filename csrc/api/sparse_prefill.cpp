@@ -94,8 +94,8 @@ static std::vector<at::Tensor> sparse_prefill_fwd(
     const at::Tensor &q,
     const at::Tensor &kv,
     const at::Tensor &indices,
-    float sm_scale,
-    int d_v,
+    double sm_scale,
+    int64_t d_v,
     const std::optional<at::Tensor> &attn_sink,
     const std::optional<at::Tensor> &topk_length
 ) {
@@ -158,8 +158,8 @@ static std::vector<at::Tensor> sparse_prefill_fwd(
     KU_CHECK_CONTIGUOUS(lse);
 
     SparseAttnFwdParams params = {
-        s_q, s_kv, h_q, h_kv, d_qk, d_v, topk,
-        sm_scale, sm_scale * LOG_2_E,
+        s_q, s_kv, h_q, h_kv, d_qk, static_cast<int>(d_v), topk,
+        static_cast<float>(sm_scale), static_cast<float>(sm_scale * LOG_2_E),
 
         (bf16*)q.data_ptr(),
         (bf16*)kv.data_ptr(),
@@ -225,8 +225,14 @@ static std::vector<at::Tensor> sparse_prefill_fwd(
     return {out, max_logits, lse};
 }
 
-void register_sparse_prefill(pybind11::module_& m) {
-    m.def("sparse_prefill_fwd",
-        &sparse_prefill_fwd,
-        "Run Sparse Attention Prefill Forward");
+#ifdef FLASH_MLA_IS_BUILD_ON_CUDA
+TORCH_LIBRARY_IMPL(flash_mla, CUDA, m) {
+    m.impl("sparse_prefill_fwd", &sparse_prefill_fwd);
 }
+#endif
+
+#ifdef FLASH_MLA_IS_BUILD_ON_ASCEND
+TORCH_LIBRARY_IMPL(flash_mla, PrivateUse1, m) {
+    m.impl("sparse_prefill_fwd", &sparse_prefill_fwd);
+}
+#endif

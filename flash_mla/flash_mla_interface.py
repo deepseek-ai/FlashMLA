@@ -1,13 +1,9 @@
-import os
 from typing import Optional, Tuple
 import dataclasses
 
 import torch
 
-if os.path.exists("/dev/davinci_manager"):
-    from flash_mla import npu as _backend
-else:
-    from flash_mla import cuda as _backend
+_backend = torch.ops.flash_mla
 
 @dataclasses.dataclass
 class FlashMLASchedMeta:
@@ -76,6 +72,8 @@ def flash_mla_with_kvcache(
     enable_batch_invariant: bool = False
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
+    Run sparse attention decode forward.
+
     Arguments:
         q: (batch_size, seq_len_q, num_heads_q, head_dim). bfloat16. `head_dim` must be 512 and
                 `num_heads_q` must be 64 or 128.
@@ -248,6 +246,7 @@ def _flash_attn_varlen_forward(
     softmax_scale: Optional[float] = None,
     is_varlen: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Run dense attention prefill forward (CUTLASS FMHA)."""
     qo_total_len, num_qo_heads, head_dim_qk = q.shape
     head_dim_vo = v.shape[-1]
 
@@ -301,6 +300,7 @@ def _flash_attn_varlen_backward(
     softmax_scale: Optional[float] = None,
     is_varlen: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Run dense attention prefill backward (CUTLASS FMHA)."""
     qo_total_len, num_qo_heads, head_dim_qk = q.shape
     kv_total_len, num_kv_heads, head_dim_vo = v.shape
 
