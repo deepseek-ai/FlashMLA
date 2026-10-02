@@ -9,6 +9,13 @@ if os.path.exists("/dev/davinci_manager"):
 else:
     from flash_mla import cuda as _backend
 
+
+def _check_argument(condition: bool, message: str, error_type=ValueError) -> None:
+    """Validate public API inputs even when Python assertions are disabled."""
+    if not condition:
+        raise error_type(message)
+
+
 @dataclasses.dataclass
 class FlashMLASchedMeta:
     """
@@ -125,12 +132,19 @@ def flash_mla_with_kvcache(
     """
     sched_meta = tile_scheduler_metadata
     indices_in_kvcache = indices
-    assert isinstance(sched_meta, FlashMLASchedMeta), "tile_scheduler_metadata must be of type FlashMLASchedMeta"
-    assert num_splits is None, "num_splits must be None"
+    _check_argument(
+        isinstance(sched_meta, FlashMLASchedMeta),
+        "tile_scheduler_metadata must be of type FlashMLASchedMeta",
+        TypeError,
+    )
+    _check_argument(num_splits is None, "num_splits must be None")
 
-    assert indices_in_kvcache is not None, "Sparse attention is required: `indices` must be provided"
-    assert not causal, "causal must be False when sparse attention is enabled"
-    assert is_fp8_kvcache, "is_fp8_kvcache must be True, since only sparse attention with a quantized KV cache is supported"
+    _check_argument(indices_in_kvcache is not None, "Sparse attention is required: `indices` must be provided")
+    _check_argument(not causal, "causal must be False when sparse attention is enabled")
+    _check_argument(
+        is_fp8_kvcache,
+        "is_fp8_kvcache must be True, since only sparse attention with a quantized KV cache is supported",
+    )
 
     topk = indices_in_kvcache.shape[-1]
     extra_k_page_block_size = extra_k_cache.shape[1] if extra_k_cache is not None else None
@@ -160,18 +174,18 @@ def flash_mla_with_kvcache(
     else:
         # Check whether the input arguments are consistent with sched_meta
         helper_msg = " Your input arguments are inconsistent with sched_meta. Please make sure the input arguments are consistent across different invocations of flash_mla_with_kvcache on the same sched_meta."
-        assert sched_meta.config is not None
-        assert sched_meta.config.b == q.shape[0], "sched_meta.config.b must be equal to batch_size." + helper_msg
-        assert sched_meta.config.s_q == q.shape[1], "sched_meta.config.s_q must be equal to seq_len_q." + helper_msg
-        assert sched_meta.config.h_q == q.shape[2], "sched_meta.config.h_q must be equal to num_heads_q." + helper_msg
-        assert sched_meta.config.page_block_size == k_cache.shape[1], "sched_meta.config.page_block_size must be equal to page_block_size." + helper_msg
-        assert sched_meta.config.h_k == k_cache.shape[2], "sched_meta.config.h_k must be equal to num_heads_k." + helper_msg
-        assert sched_meta.config.causal == causal, "sched_meta.config.causal must be equal to causal." + helper_msg
-        assert sched_meta.config.is_fp8_kvcache == is_fp8_kvcache, "sched_meta.config.is_fp8_kvcache must be equal to is_fp8_kvcache." + helper_msg
-        assert sched_meta.config.enable_batch_invariant == enable_batch_invariant, "sched_meta.config.enable_batch_invariant must be equal to enable_batch_invariant." + helper_msg
-        assert sched_meta.config.topk == topk, "sched_meta.config.topk must be equal to the last dim of indices_in_kvcache." + helper_msg
-        assert sched_meta.config.extra_page_block_size == extra_k_page_block_size, "sched_meta.config.extra_page_block_size must be equal to the page_block_size of extra_k_cache." + helper_msg
-        assert sched_meta.config.extra_topk == extra_topk, "sched_meta.config.extra_topk must be equal to the last dim of extra_indices_in_kvcache." + helper_msg
+        _check_argument(sched_meta.config is not None, "initialized sched_meta has no config", RuntimeError)
+        _check_argument(sched_meta.config.b == q.shape[0], "sched_meta.config.b must be equal to batch_size." + helper_msg)
+        _check_argument(sched_meta.config.s_q == q.shape[1], "sched_meta.config.s_q must be equal to seq_len_q." + helper_msg)
+        _check_argument(sched_meta.config.h_q == q.shape[2], "sched_meta.config.h_q must be equal to num_heads_q." + helper_msg)
+        _check_argument(sched_meta.config.page_block_size == k_cache.shape[1], "sched_meta.config.page_block_size must be equal to page_block_size." + helper_msg)
+        _check_argument(sched_meta.config.h_k == k_cache.shape[2], "sched_meta.config.h_k must be equal to num_heads_k." + helper_msg)
+        _check_argument(sched_meta.config.causal == causal, "sched_meta.config.causal must be equal to causal." + helper_msg)
+        _check_argument(sched_meta.config.is_fp8_kvcache == is_fp8_kvcache, "sched_meta.config.is_fp8_kvcache must be equal to is_fp8_kvcache." + helper_msg)
+        _check_argument(sched_meta.config.enable_batch_invariant == enable_batch_invariant, "sched_meta.config.enable_batch_invariant must be equal to enable_batch_invariant." + helper_msg)
+        _check_argument(sched_meta.config.topk == topk, "sched_meta.config.topk must be equal to the last dim of indices_in_kvcache." + helper_msg)
+        _check_argument(sched_meta.config.extra_page_block_size == extra_k_page_block_size, "sched_meta.config.extra_page_block_size must be equal to the page_block_size of extra_k_cache." + helper_msg)
+        _check_argument(sched_meta.config.extra_topk == extra_topk, "sched_meta.config.extra_topk must be equal to the last dim of extra_indices_in_kvcache." + helper_msg)
 
     out, lse, new_tile_scheduler_metadata, new_num_splits = _backend.sparse_decode_fwd(
         q, k_cache, indices_in_kvcache, topk_length, attn_sink,
@@ -446,8 +460,11 @@ def flash_attn_varlen_func(
         The backward pass supports only `num_qo_heads == num_kv_heads` (no GQA), and it requires the
         same dtypes and head dims as the forward pass.
     """
-    assert dropout_p == 0.0, "dropout is not supported, `dropout_p` must be 0.0"
-    assert not deterministic, "the `deterministic` flag is not supported: the deterministic backward mode is not implemented and dq is not guaranteed to be bitwise reproducible"
+    _check_argument(dropout_p == 0.0, "dropout is not supported, `dropout_p` must be 0.0")
+    _check_argument(
+        not deterministic,
+        "the `deterministic` flag is not supported: the deterministic backward mode is not implemented and dq is not guaranteed to be bitwise reproducible",
+    )
     return FlashAttnVarlenFunc.apply(
         q, k, v,
         cu_seqlens_qo, cu_seqlens_kv, max_seqlen_qo, max_seqlen_kv,
@@ -493,8 +510,11 @@ def flash_attn_varlen_qkvpacked_func(
         - out: [total_tokens, num_heads, head_dim_vo], bfloat16
         - lse: [total_tokens, num_heads], float32, natural log, contiguous on the seqlen dim
     """
-    assert dropout_p == 0.0, "dropout is not supported, `dropout_p` must be 0.0"
-    assert not deterministic, "the `deterministic` flag is not supported: the deterministic backward mode is not implemented and dq is not guaranteed to be bitwise reproducible"
+    _check_argument(dropout_p == 0.0, "dropout is not supported, `dropout_p` must be 0.0")
+    _check_argument(
+        not deterministic,
+        "the `deterministic` flag is not supported: the deterministic backward mode is not implemented and dq is not guaranteed to be bitwise reproducible",
+    )
     return FlashAttnVarlenFunc.apply(
         qkv[:, :, :head_dim_qk], qkv[:, :, head_dim_qk:head_dim_qk * 2], qkv[:, :, head_dim_qk * 2:],
         cu_seqlens, cu_seqlens, max_seqlen, max_seqlen,
@@ -543,8 +563,11 @@ def flash_attn_varlen_kvpacked_func(
         - out: [total_qo_tokens, num_qo_heads, head_dim_vo], bfloat16
         - lse: [total_qo_tokens, num_qo_heads], float32, natural log, contiguous on the seqlen dim
     """
-    assert dropout_p == 0.0, "dropout is not supported, `dropout_p` must be 0.0"
-    assert not deterministic, "the `deterministic` flag is not supported: the deterministic backward mode is not implemented and dq is not guaranteed to be bitwise reproducible"
+    _check_argument(dropout_p == 0.0, "dropout is not supported, `dropout_p` must be 0.0")
+    _check_argument(
+        not deterministic,
+        "the `deterministic` flag is not supported: the deterministic backward mode is not implemented and dq is not guaranteed to be bitwise reproducible",
+    )
     return FlashAttnVarlenFunc.apply(
         q, kv[:, :, :head_dim_qk], kv[:, :, head_dim_qk:],
         cu_seqlens_qo, cu_seqlens_kv, max_seqlen_qo, max_seqlen_kv,
