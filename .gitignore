@@ -10,3 +10,4 @@ compile_commands.json
 .cache
 /dev
 /.clangd
+/profiling

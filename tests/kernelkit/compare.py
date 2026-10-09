@@ -1,37 +1,50 @@
-from typing import List
+from typing import overload, Literal, List, Union
 
 import torch
 
+from .platform import is_on_ascend_platform
+
 def check_is_bitwise_equal_comparator(ans: torch.Tensor, ref: torch.Tensor, result: torch.Tensor):
     """
-    Return if two tensors are bitwise equal
-    Return a bool if avoid_sync is False, else return a tensor
+    Test if two tensors are bitwise equal
+    Store the result in `result`, which should be a scalar tensor
     """
-    assert ans.shape == ref.shape, "Shape mismatch"
+    assert ans.shape == ref.shape, f"Shape mismatch: {ans.shape} vs {ref.shape}"
+    assert ans.dtype == ref.dtype, f"Dtype mismatch: {ans.dtype} vs {ref.dtype}"
     torch.all(torch.eq(ans, ref), out=result)
 
 def check_is_bitwise_equal(name: str, ans: torch.Tensor, ref: torch.Tensor, quiet: bool = False) -> bool:
+    """
+    Return if two tensors are bitwise equal
+    """
+    assert ans.shape == ref.shape, f"Shape mismatch: {ans.shape} vs {ref.shape}"
+    assert ans.dtype == ref.dtype, f"Dtype mismatch: {ans.dtype} vs {ref.dtype}"
     is_bitwise_equal = torch.equal(ans, ref)
     if not quiet and not is_bitwise_equal:
         print(f"`{name}` mismatch: not bitwise equal. Mismatch count: {(ans != ref).sum().item()} out of {ans.numel()}")
     return is_bitwise_equal
 
-def get_cos_diff(ans: torch.Tensor, ref: torch.Tensor) -> float:
+def get_cos_diff(ans: torch.Tensor, ref: torch.Tensor, dtype: torch.dtype = torch.double) -> float:
     """
     Calculate the cosine diff between two tensors
-    Return a float if avoid_sync is False, else return a tensor
     """
-    ans, ref = ans.double(), ref.double()
-    if (ref*ref).sum().item() < 1e-12:
+    if is_on_ascend_platform() and dtype == torch.double:
+        # Ascend NPU doesn't support float64
+        ans = ans.cpu()
+        ref = ref.cpu()
+    ans, ref = ans.to(dtype), ref.to(dtype)
+    ref_sqr_sum = (ref*ref).sum().item()
+    ans_sqr_sum = (ans*ans).sum().item()
+    if ref_sqr_sum < 1e-12:
         return 0
-    denominator = (ans*ans + ref*ref).sum().item()
+    denominator = ref_sqr_sum + ans_sqr_sum
     sim = 2 * (ans*ref).sum().item() / denominator
     return 1 - sim
 
-def check_is_allclose(name: str, ans: torch.Tensor, ref: torch.Tensor, abs_tol: float = 1e-5, rel_tol: float = 1e-2, cos_diff_tol: float = 1e-7, quiet: bool = False) -> bool:
+def check_is_allclose(name: str, ans: torch.Tensor, ref: torch.Tensor, abs_tol: float = 1e-5, rel_tol: float = 1e-2, cos_diff_tol: float = 1e-7, quiet: bool = False, dtype_for_cos_diff_calc: torch.dtype = torch.double) -> bool:
     """
     Check if two tensors are close enough
-    Return a bool if avoid_sync is False, else return a tensor
+    Return a bool
     """
     assert ans.shape == ref.shape, f"`{name}` Shape mismatch: {ans.shape} vs {ref.shape}"
     assert ans.dtype == ref.dtype, f"`{name}` Dtype mismatch: {ans.dtype} vs {ref.dtype}"
@@ -59,7 +72,7 @@ def check_is_allclose(name: str, ans: torch.Tensor, ref: torch.Tensor, abs_tol: 
     anomalies_check_passed &= deal_with_anomalies(float("-inf"))
     anomalies_check_passed &= deal_with_anomalies(float("nan"))
 
-    cos_diff = get_cos_diff(ans, ref)
+    cos_diff = get_cos_diff(ans, ref, dtype_for_cos_diff_calc)
     raw_abs_err = torch.abs(ans-ref)
     raw_rel_err = raw_abs_err / (torch.abs(ref)+(1e-6))
     rel_err = raw_rel_err.masked_fill(raw_abs_err<abs_tol, 0)
@@ -71,8 +84,8 @@ def check_is_allclose(name: str, ans: torch.Tensor, ref: torch.Tensor, abs_tol: 
 
     if not pass_mask.all():
         report_err(f"`{name}` mismatch")
-        max_abs_err_pos: int = torch.argmax(abs_err, keepdim=True).item()
-        max_rel_err_pos: int = torch.argmax(rel_err, keepdim=True).item()
+        max_abs_err_pos: int = torch.argmax(abs_err).item()
+        max_rel_err_pos: int = torch.argmax(rel_err).item()
         def get_pos_in_tensor(t: torch.Tensor, pos: int) -> List[int]:
             result = []
             for size in t.shape[::-1]:

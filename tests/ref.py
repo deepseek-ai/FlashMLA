@@ -16,26 +16,29 @@ def _merge_two_lse(lse0: torch.Tensor, lse1: Optional[torch.Tensor], s_q: int, h
             dim=0
         )
         
-def ref_sparse_attn_fwd(p: TestParam, t: Testcase) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+def ref_sparse_attn_fwd(p: TestParam, t: Testcase, rms_norm_scale_factor: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Returns:
-    - o: [s_q, h_q, dv]
-    - o_fp32: [s_q, h_q, dv]
+    - o: [s_q, h_q, dv], bfloat16
+    - o_fp32: [s_q, h_q, dv], float32
     - max_logits: [s_q, h_q]
     - lse: [s_q, h_q]
     """
     indices = t.indices.clone().squeeze(1)
     if t.topk_length is not None:
         mask = torch.arange(p.topk, device=t.topk_length.device).unsqueeze(0).broadcast_to(p.s_q, p.topk) >= t.topk_length.unsqueeze(1)   # [s_q, topk]
-        indices[mask] = -1
+        indices.masked_fill_(mask, -1)
     invalid_mask = (indices < 0) | (indices >= p.s_kv)    # [s_q, topk]
-    indices[invalid_mask] = 0
+    indices.masked_fill_(invalid_mask, 0)
 
     q = t.q.float()
     gathered_kv = t.kv.index_select(dim=0, index=indices.flatten()).reshape(p.s_q, p.topk, p.d_qk).float()   # [s_q, topk, d_qk]
     P = (q @ gathered_kv.transpose(1, 2))   # [s_q, h_q, topk]
-    P *= t.sm_scale
-    P[invalid_mask.unsqueeze(1).broadcast_to(P.shape)] = float("-inf")
+    if rms_norm_scale_factor is not None:
+        P *= t.sm_scale * rms_norm_scale_factor.unsqueeze(-1)
+    else:
+        P *= t.sm_scale
+    P.masked_fill_(invalid_mask.unsqueeze(1).broadcast_to(P.shape), float("-inf"))
 
     orig_lse = torch.logsumexp(P, dim=-1)   # [s_q, h_q]
     max_logits = P.max(dim=-1).values   # [s_q, h_q]
@@ -43,18 +46,21 @@ def ref_sparse_attn_fwd(p: TestParam, t: Testcase) -> Tuple[torch.Tensor, torch.
     lse_for_o = _merge_two_lse(orig_lse, t.attn_sink, p.s_q, p.h_q)
     if not torch.is_inference_mode_enabled():
         lse_for_o = lse_for_o.clone()
-    lse_for_o[lse_for_o == float("-inf")] = float("+inf")   # So that corresponding O will be 0
+    lse_for_o.masked_fill_(lse_for_o == float("-inf"), float("+inf"))   # So that corresponding O will be 0
     s_for_o = torch.exp(P - lse_for_o.unsqueeze(-1))
     out = s_for_o @ gathered_kv[..., :p.d_v]   # [s_q, h_q, dv]
 
+    if not torch.is_inference_mode_enabled():
+        orig_lse = orig_lse.clone()
     lonely_q_mask = orig_lse == float("-inf")   # [s_q, h_q]
-    orig_lse[lonely_q_mask] = float("+inf")
+    orig_lse.masked_fill_(lonely_q_mask, float("+inf"))
     return (out.to(torch.bfloat16), out, max_logits, orig_lse)
 
 
 def ref_sparse_attn_decode(
     p: TestParam,
-    t: TestcaseForDecode
+    t: TestcaseForDecode,
+    rms_norm_scale_factor: Optional[torch.Tensor] = None   # [b, s_q, h_q]
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     A reference implementation of sparse decoding attention in PyTorch
@@ -80,10 +86,13 @@ def ref_sparse_attn_decode(
         invalid_mask = torch.cat([invalid_mask, invalid_mask1], dim=2)   # [b, s_q, topk+extra_topk]
 
     gathered_kv = gathered_kv.view(b*p.s_q, -1, p.d_qk).float()
-    gathered_kv[gathered_kv != gathered_kv] = 0.0
+    gathered_kv.masked_fill_(gathered_kv != gathered_kv, 0.0)
     q = t.q.float().view(b*p.s_q, p.h_q, p.d_qk)
     attn_weight = q @ gathered_kv.transpose(-1, -2)  # [t.b*t.s_q, t.h_q, topk+extra_topk]
-    attn_weight *= t.sm_scale
+    if rms_norm_scale_factor is not None:
+        attn_weight *= t.sm_scale * rms_norm_scale_factor.view(b*p.s_q, p.h_q).unsqueeze(-1)
+    else:
+        attn_weight *= t.sm_scale
     attn_weight[invalid_mask.view(b*p.s_q, 1, -1).broadcast_to(b*p.s_q, p.h_q, invalid_mask.size(-1))] = float("-inf")
     lse = attn_weight.logsumexp(dim=-1)  # [t.b*t.s_q, t.h_q]
     attn_weight = torch.exp(attn_weight - lse.unsqueeze(-1))

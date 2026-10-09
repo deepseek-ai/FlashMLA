@@ -69,7 +69,7 @@ FlashMLA's algorithm and scheduling are inspired by [FlashAttention](https://git
 ```bibtex
 @misc{flashmla2025,
       title={FlashMLA: Efficient MLA decoding kernels},
-      author={Jiashi Li, Shengyu Liu},
+      author={Jiashi Li and Shengyu Liu and Yuanhang Sun},
       year={2025},
       publisher = {GitHub},
       howpublished = {\url{https://github.com/deepseek-ai/FlashMLA}},
