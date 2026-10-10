@@ -17,6 +17,9 @@ This repository contains the following implementations:
 
 - Dense attention for the decoding stage with BF16 KV cache
 
+**Attention Warp Interleave Kernels**
+
+- Added an optimized BF16 Warp Interleave kernel for dense decode, sparse decode and sparse prefill on 810E and M890. The kernel partitions all warps into two warp groups and interleaves their execution to overlap softmax computation with QK/PV GEMM operations. 
 
 #### Test & benchmark MLA decoding (Sparse & Dense):
 
