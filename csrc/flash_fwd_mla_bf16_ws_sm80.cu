@@ -1,6 +1,8 @@
 // Warp-specialized SM80 MLA kernel - BF16 template instantiation
 #include "flash_fwd_mla_kernel_sm80.h"   // for combine kernel (must be first)
 #include "flash_fwd_mla_kernel_sm80_ws.h"
+#include <stdexcept>
+#include <string>
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -36,6 +38,16 @@ void mha_fwd_splitkv_mla_ws<cutlass::bfloat16_t, 576>::run(Flash_fwd_mla_params 
     // kNWarpsS=4 → 4 consumer + 4 producer (default)
     // kNWarpsS=2 → 2 consumer + 6 producer
     using Kernel_traits = Flash_fwd_kernel_traits_mla_ws<576, 32, 32, 8, 4, cutlass::bfloat16_t, 512>;
+    // sm86 note: needs ~113 KB of shared memory, more than the 99 KB opt-in limit of sm_86. The 8-warp 2Mx4N PV tiling is
+    // hard-wired to BlockM=32, so there is no minimal fix; fail with a clear error instead of exit(1) from CHECK_CUDA.
+    int dev = 0, max_optin = 0;
+    cudaGetDevice(&dev);
+    cudaDeviceGetAttribute(&max_optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev);
+    if (sizeof(flash::SharedStorageMLA_WS<Kernel_traits>) > (size_t)max_optin) {
+        throw std::runtime_error("legacy warp-specialized sm80 MLA kernel needs " +
+                                 std::to_string(sizeof(flash::SharedStorageMLA_WS<Kernel_traits>)) +
+                                 " B of shared memory, device allows " + std::to_string(max_optin) + " B");
+    }
     run_flash_splitkv_fwd_mla_ws<Kernel_traits, flash::SharedStorageMLA_WS<Kernel_traits>>(params, stream);
 }
 

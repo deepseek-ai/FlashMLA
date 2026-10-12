@@ -33,7 +33,8 @@ def flash_mla_with_kvcache(
     num_splits: torch.Tensor,
     softmax_scale: Optional[float] = None,
     causal: bool = False,
-    warp_spec: bool = True,
+    warp_spec: bool = False,
+    impl: str = "legacy",
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Arguments:
@@ -46,12 +47,20 @@ def flash_mla_with_kvcache(
         num_splits: (batch_size + 1), torch.int32, returned by get_mla_metadata.
         softmax_scale: float. The scale of QK^T before applying softmax. Default to 1 / sqrt(head_dim).
         causal: bool. Whether to apply causal attention mask.
-        warp_spec: bool. Use warp-specialized SM80 kernel (only affects SM80).
+        warp_spec: bool. Use warp-specialized SM80 kernel (only affects SM80; does not fit in sm_86 shared memory).
+        impl: "legacy" (fork's sm80 kernel; BlockM=16 fallback on sm_86), "legacy_ws" (same as warp_spec=True).
+            "v2" (new sm86 kernel) is not merged into this branch yet.
 
     Returns:
         out: (batch_size, seq_len_q, num_heads_q, head_dim_v).
         softmax_lse: (batch_size, num_heads_q, seq_len_q), torch.float32.
     """
+    if impl == "legacy_ws":
+        warp_spec = True
+    elif impl == "legacy":
+        pass
+    else:
+        raise NotImplementedError(f"impl={impl!r} is not available in this build (use 'legacy' or 'legacy_ws')")
     if softmax_scale is None:
         softmax_scale = q.shape[-1] ** (-0.5)
     out, softmax_lse = flash_mla_cuda.fwd_kvcache_mla(

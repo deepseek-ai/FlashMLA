@@ -228,6 +228,16 @@ def append_nvcc_threads(nvcc_extra_args):
     return nvcc_extra_args + ["--threads", nvcc_threads]
 
 
+def _glob_sources(subdir, patterns=("*.cu", "*.cpp")):
+    """Sorted, repo-relative paths of every source in csrc/<subdir> (empty when the directory does not exist yet)."""
+    root = Path(__file__).resolve().parent
+    d = root / "csrc" / subdir
+    out = []
+    for pat in patterns:
+        out += [p.relative_to(root).as_posix() for p in d.glob(pat)]
+    return sorted(out)
+
+
 def get_sources():
     sources = [
         "csrc/flash_api.cpp",
@@ -241,7 +251,15 @@ def get_sources():
         if not DISABLE_FP16:
             sources.append("csrc/flash_fwd_mla_fp16_sm90.cu")
 
+    # New sm86 kernels: every csrc/sm86/*.cu|*.cpp is picked up automatically (no setup.py edit needed to add files).
+    # Drop `_sm90`-suffixed files in Ampere builds, they would not compile for sm_86.
+    sources += [s for s in _glob_sources("sm86") if not (AMPERE_ONLY and "_sm90" in s)]
     return sources
+
+
+def get_fused_sources():
+    """Sources of the separate `flash_mla_fused_cuda` extension (decode prologue, quantize-on-write): csrc/fused/*.cu|*.cpp."""
+    return _glob_sources("fused")
 
 
 def get_features_args():
@@ -277,6 +295,25 @@ else:
     else:
         cxx_args = ["-O3", "-std=c++17", "-DNDEBUG", "-Wno-deprecated-declarations"]
 
+nvcc_args = append_nvcc_threads(
+    [
+        "-O0" if DEBUG_BUILD else "-O3",
+        "-std=c++17",
+        "-D_USE_MATH_DEFINES",
+        "-Wno-deprecated-declarations",
+        "-U__CUDA_NO_HALF_OPERATORS__",
+        "-U__CUDA_NO_HALF_CONVERSIONS__",
+        "-U__CUDA_NO_HALF2_OPERATORS__",
+        "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
+        "--expt-relaxed-constexpr",
+        "--expt-extended-lambda",
+    ]
+    + ([] if DEBUG_BUILD else ["-DNDEBUG", "--use_fast_math"])
+    + (["-g", "-G", "-lineinfo"] if DEBUG_BUILD else (["-lineinfo"] if LINEINFO else []))
+    + ["--ptxas-options=-v" + ("" if AMPERE_ONLY else ",--register-usage-level=10")]
+    + cc_flag
+) + get_features_args()
+
 ext_modules = []
 ext_modules.append(
     CUDAExtension(
@@ -284,24 +321,7 @@ ext_modules.append(
         sources=get_sources(),
         extra_compile_args={
             "cxx": cxx_args + get_features_args(),
-            "nvcc": append_nvcc_threads(
-                [
-                    "-O0" if DEBUG_BUILD else "-O3",
-                    "-std=c++17",
-                    "-D_USE_MATH_DEFINES",
-                    "-Wno-deprecated-declarations",
-                    "-U__CUDA_NO_HALF_OPERATORS__",
-                    "-U__CUDA_NO_HALF_CONVERSIONS__",
-                    "-U__CUDA_NO_HALF2_OPERATORS__",
-                    "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
-                    "--expt-relaxed-constexpr",
-                    "--expt-extended-lambda",
-                ]
-                + ([] if DEBUG_BUILD else ["-DNDEBUG", "--use_fast_math"])
-                + (["-g", "-G", "-lineinfo"] if DEBUG_BUILD else (["-lineinfo"] if LINEINFO else []))
-                + ["--ptxas-options=-v" + ("" if AMPERE_ONLY else ",--register-usage-level=10")]
-                + cc_flag
-            ) + get_features_args(),
+            "nvcc": nvcc_args,
         },
         include_dirs=[
             Path(this_dir) / "csrc",
@@ -309,6 +329,25 @@ ext_modules.append(
         ],
     )
 )
+
+# Separate extension for the fused decode prologue / quantize-on-write kernels (csrc/fused), so it never has to touch
+# csrc/flash_api.cpp. Built only when csrc/fused has sources. Python: `import flash_mla_fused_cuda`.
+if get_fused_sources():
+    ext_modules.append(
+        CUDAExtension(
+            name="flash_mla_fused_cuda",
+            sources=get_fused_sources(),
+            extra_compile_args={
+                "cxx": cxx_args + get_features_args(),
+                "nvcc": nvcc_args,
+            },
+            include_dirs=[
+                Path(this_dir) / "csrc",
+                Path(this_dir) / "csrc" / "fused",
+                Path(this_dir) / "csrc" / "cutlass" / "include",
+            ],
+        )
+    )
 
 
 try:
