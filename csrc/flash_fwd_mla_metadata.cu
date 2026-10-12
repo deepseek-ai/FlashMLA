@@ -11,6 +11,10 @@
 //   num_splits[i]              = number of splits of all batch elements < i (prefix sum), num_splits[b] = total.
 // A CTA whose range is empty gets begin_idx = b (the main kernels return immediately).
 
+#include <cstdio>
+#include <cstdlib>
+#include <cuda_runtime.h>
+
 #include "static_switch.h"
 #include "flash_mla.h"
 
