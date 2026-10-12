@@ -337,7 +337,10 @@ mla_decode_kernel(const __grid_constant__ Flash_fwd_mla_params params) {
     if (begin_idx >= params.b) return;
 
     if constexpr (PIPE) {
-        if (tid < C::kGroups) mbar_init(bar_u32 + tid * 8, 128);   // S-exchange barrier of M-group `tid`: 128 thread arrivals / phase
+        if (tid == 0) {   // S-exchange barrier of each M-group: 128 thread arrivals per phase
+#pragma unroll
+            for (int gi = 0; gi < C::kGroups; ++gi) mbar_init(bar_u32 + gi * 8, 128);
+        }
         __syncthreads();
     }
     if constexpr (SPEC) {
