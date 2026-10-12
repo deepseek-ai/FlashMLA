@@ -18,9 +18,9 @@
 #include "static_switch.h"
 #include "flash_mla.h"
 
-static constexpr int kMetaThreads = 1024;
 static constexpr int kMaxBatchMeta = 12000;   // (b + 1) ints of dynamic smem must stay below 48 KB
 
+template <int kMetaThreads>
 __global__ void __launch_bounds__(kMetaThreads)
 get_mla_metadata_kernel(__grid_constant__ const Mla_metadata_params params) {
     extern __shared__ int C[];                       // exclusive prefix of costs, C[b] = total
@@ -150,6 +150,10 @@ void get_mla_metadata_func(Mla_metadata_params &params, cudaStream_t stream) {
     FLASH_ASSERT(params.batch_size < kMaxBatchMeta);
     FLASH_ASSERT(params.block_size_n > 0 && params.num_sm_parts > 0);
     const size_t smem = (size_t)(params.batch_size + 1) * sizeof(int);
-    get_mla_metadata_kernel<<<1, kMetaThreads, smem, stream>>>(params);
+    if (params.batch_size <= 128) {   // small batches: a small block starts and synchronises faster
+        get_mla_metadata_kernel<128><<<1, 128, smem, stream>>>(params);
+    } else {
+        get_mla_metadata_kernel<1024><<<1, 1024, smem, stream>>>(params);
+    }
     CHECK_CUDA_KERNEL_LAUNCH();
 }

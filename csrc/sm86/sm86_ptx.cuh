@@ -30,6 +30,28 @@ __device__ __forceinline__ void ldsm_x4_trans(uint32_t (&r)[4], uint32_t addr) {
                  : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(addr) : "memory");
 }
 
+// ---- mbarrier (sm_80+): spin with test_wait (try_wait needs sm_90) ----
+__device__ __forceinline__ void mbar_init(uint32_t addr, int count) {
+    asm volatile("mbarrier.init.shared.b64 [%0], %1;\n" ::"r"(addr), "r"(count) : "memory");
+}
+__device__ __forceinline__ void mbar_arrive(uint32_t addr) {
+    uint64_t st;
+    asm volatile("mbarrier.arrive.shared.b64 %0, [%1];\n" : "=l"(st) : "r"(addr) : "memory");
+}
+__device__ __forceinline__ bool mbar_test_wait_parity(uint32_t addr, uint32_t parity) {
+    uint32_t ok;
+    asm volatile("{\n.reg .pred p;\nmbarrier.test_wait.parity.shared.b64 p, [%1], %2;\nselp.u32 %0, 1, 0, p;\n}\n"
+                 : "=r"(ok) : "r"(addr), "r"(parity) : "memory");
+    return ok != 0;
+}
+__device__ __forceinline__ void mbar_wait(uint32_t addr, uint32_t parity) {
+    while (!mbar_test_wait_parity(addr, parity)) {}
+}
+// Arrive on `addr` when all cp.async issued so far by this thread have landed (pending count is not incremented).
+__device__ __forceinline__ void cp_async_mbar_arrive_noinc(uint32_t addr) {
+    asm volatile("cp.async.mbarrier.arrive.noinc.shared.b64 [%0];\n" ::"r"(addr) : "memory");
+}
+
 __device__ __forceinline__ void bar_sync(int id, int nthreads) {
     asm volatile("bar.sync %0, %1;\n" ::"r"(id), "r"(nthreads) : "memory");
 }

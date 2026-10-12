@@ -10,7 +10,8 @@
 namespace mla_sm86 {
 
 struct Plan {
-    int bm, nt, ns, minb;   // rows per CTA, tokens per KV tile, cp.async stages, CTAs per SM
+    int bm, nt, ns, minb;   // rows per CTA, tokens per KV tile, smem ring stages, CTAs per SM
+    bool spec;              // false: v2a (all warps cp.async + CTA barrier); true: v2b (producer warp + mbarriers)
 };
 
 // Config selection by the number of rows M = s_q * h_q / h_k (shared by the kernel launcher and the metadata builder).
@@ -20,9 +21,10 @@ inline Plan pick_plan(int M, int page_size) {
     p.nt = 16;
     p.ns = 4;
     p.minb = 1;
-    if (const char *e = std::getenv("FLASH_MLA_SM86_CFG")) {   // "bm,nt,ns[,minb]" for tuning sweeps
-        int bm, nt, ns, mb = 1;
-        if (std::sscanf(e, "%d,%d,%d,%d", &bm, &nt, &ns, &mb) >= 3) { p.bm = bm; p.nt = nt; p.ns = ns; p.minb = mb; }
+    p.spec = false;
+    if (const char *e = std::getenv("FLASH_MLA_SM86_CFG")) {   // "bm,nt,ns[,minb[,spec]]" for tuning sweeps
+        int bm, nt, ns, mb = 1, sp = 0;
+        if (std::sscanf(e, "%d,%d,%d,%d,%d", &bm, &nt, &ns, &mb, &sp) >= 3) { p.bm = bm; p.nt = nt; p.ns = ns; p.minb = mb; p.spec = sp != 0; }
     }
     if (p.nt > page_size) p.nt = page_size;
     return p;
