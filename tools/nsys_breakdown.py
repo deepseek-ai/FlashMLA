@@ -5,7 +5,8 @@
 
 * kernels are summed per demangled name (count, total, mean, % of busy time);
 * "idle" = GPU time between consecutive kernels on the same stream (launch / dependency bubbles);
-* --nvtx RANGE keeps only kernels that start inside an NVTX range with that text (e.g. one decode step);
+* --nvtx RANGE keeps only kernels launched (CPU API call, matched by correlationId) inside an NVTX range with that text,
+  e.g. `--nvtx decode_step`; the count is then divided by the number of ranges in the report line;
 * --last N keeps only the last N kernels (steady state, skips warm-up).
 """
 import argparse
@@ -24,11 +25,17 @@ tabs = {r[0] for r in cur.execute("select name from sqlite_master where type='ta
 kn = "CUPTI_ACTIVITY_KIND_KERNEL"
 if kn not in tabs:
     raise SystemExit("no kernel table in " + a.db)
-rows = cur.execute(f"select k.start, k.end, k.streamId, coalesce(s.value, '?') from {kn} k "
-                   f"left join StringIds s on s.id = k.demangledName order by k.start").fetchall()
-if a.nvtx and "NVTX_EVENTS" in tabs:
+if a.nvtx and "NVTX_EVENTS" in tabs and "CUPTI_ACTIVITY_KIND_RUNTIME" in tabs:
+    # a kernel belongs to an NVTX range when the CPU-side API call that launched it (matched by correlationId; for graph
+    # nodes this is the cudaGraphLaunch call) lies inside the range
     rng = cur.execute("select start, end from NVTX_EVENTS where text = ? and end is not null", (a.nvtx,)).fetchall()
-    rows = [r for r in rows if any(s <= r[0] <= e for s, e in rng)]
+    rt = {c: s for c, s in cur.execute("select correlationId, start from CUPTI_ACTIVITY_KIND_RUNTIME")}
+    allrows = cur.execute(f"select k.start, k.end, k.streamId, coalesce(s.value, '?'), k.correlationId from {kn} k "
+                          f"left join StringIds s on s.id = k.demangledName order by k.start").fetchall()
+    rows = [r[:4] for r in allrows if r[4] in rt and any(s <= rt[r[4]] <= e for s, e in rng)]
+else:
+    rows = cur.execute(f"select k.start, k.end, k.streamId, coalesce(s.value, '?') from {kn} k "
+                       f"left join StringIds s on s.id = k.demangledName order by k.start").fetchall()
 if a.last:
     rows = rows[-a.last:]
 if not rows:

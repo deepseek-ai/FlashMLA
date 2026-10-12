@@ -299,7 +299,7 @@ class Data:
             else:
                 from flash_mla.kv_quant import quantize_kv, dequantize_kv  # reference implementation (SA)
                 kvq, sc = quantize_kv(torch.nan_to_num(kc.view(nblk, case.page, D)), case.kv)
-                self.kq.append(kvq.view(nblk, case.page, 1, -1))
+                self.kq.append(kvq)  # uint8 [nblk, page, 640], as in docs/kv_quant_format.md
                 self.kscale.append(sc)
                 self.kc.append(dequantize_kv(kvq, sc, case.kv, dt).view(nblk, case.page, 1, D) if check else None)
             del kc

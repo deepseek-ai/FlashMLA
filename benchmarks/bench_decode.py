@@ -52,6 +52,7 @@ class FlashMLAImpl:
         self.has_kw = any(p.kind == p.VAR_KEYWORD for p in params.values())
         self.params = params
         self.prealloc = True
+        self.use_ws = True
 
     def accepts(self, k):
         return self.has_kw or k in self.params
@@ -70,7 +71,11 @@ class FlashMLAImpl:
 
     def prepare(self, case, data):
         meta, nsplit = self.fm.get_mla_metadata(data.sl, case.s_q * case.h_q, 1)
-        return dict(meta=meta, nsplit=nsplit)
+        st = dict(meta=meta, nsplit=nsplit, ws=None)
+        # persistent workspace (partial O / LSE / combine counters) -> the call allocates nothing and is graph safe
+        if self.use_ws and self.accepts("workspace") and hasattr(self.fm, "alloc_mla_workspace") and self.impl_kw in (None, "v2"):
+            st["ws"] = self.fm.alloc_mla_workspace(case.b, case.s_q * case.h_q, 1, meta.shape[0])
+        return st
 
     def meta_fn(self, case, data):
         return lambda: self.fm.get_mla_metadata(data.sl, case.s_q * case.h_q, 1)
@@ -82,6 +87,8 @@ class FlashMLAImpl:
         if self.prealloc and self.accepts("out") and self.accepts("lse"):
             kw["out"] = torch.empty(case.b, case.s_q, case.h_q, DV, device="cuda", dtype=dtype_of(case.dtype))
             kw["lse"] = torch.empty(case.b, case.h_q, case.s_q, device="cuda", dtype=torch.float32)
+        if state.get("ws") is not None:
+            kw["workspace"] = state["ws"]
         if case.kv != "native":
             kw["kv_scale"] = data.kscale[layer]
             kc = data.kq[layer]
@@ -217,7 +224,8 @@ def main():
     ap.add_argument("--layers", type=int, default=27, help="layers captured per CUDA graph")
     ap.add_argument("--mem-gb", type=float, default=12.0, help="KV memory budget for the graph layers")
     ap.add_argument("--contiguous", action="store_true", help="contiguous block table instead of a random permutation")
-    ap.add_argument("--no-prealloc", action="store_true")
+    ap.add_argument("--no-prealloc", action="store_true", help="let the kernel allocate out/lse per call")
+    ap.add_argument("--no-workspace", action="store_true", help="do not pass a persistent workspace")
     ap.add_argument("--check", action="store_true", help="cos_diff vs an fp32 reference (NaN-pads the cache tail)")
     ap.add_argument("--no-smi", action="store_true")
     ap.add_argument("--seed", type=int, default=0)
@@ -246,6 +254,8 @@ def main():
             impl = make_impl(n.strip())
             if a.no_prealloc and hasattr(impl, "prealloc"):
                 impl.prealloc = False
+            if a.no_workspace and hasattr(impl, "use_ws"):
+                impl.use_ws = False
             impls.append(impl)
         except Exception as ex:
             print(f"[bench] impl {n} unavailable: {ex!r}", flush=True)

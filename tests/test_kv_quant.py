@@ -146,3 +146,25 @@ def test_cuda_write_path_codes_and_ties(kind):
     ref_q, ref_s = quantize_kv(x, kind)
     assert torch.equal(sc.view(-1)[:rows], ref_s) and (ref_s == 1.0).all()
     assert torch.equal(kvq.view(-1, ROW_BYTES)[:rows], ref_q)
+
+
+# --------------------------------------------------------------------------------------------------------------------------------
+# End-to-end accuracy gate (single decode layer: dequant-reference attention over the quantized cache vs the bf16 cache).
+# Thresholds ~2x the worst cos_diff measured by benchmarks/eval_kv_quant.py over {gauss, outlier, heavy} x ctx {1k, 4k, 16k} x
+# q sharpness {1, 4} x 3 seeds (docs/perf_log_sys.md section 6): fp8 worst 2.4e-03, int8 worst 2.6e-04.
+# The in-kernel dequant of the attention kernel must stay within these same bounds against the bf16 reference.
+# --------------------------------------------------------------------------------------------------------------------------------
+GATE_COS_DIFF = {"fp8": 5e-3, "int8": 5e-4}
+
+
+@pytest.mark.parametrize("kind", KINDS)
+@pytest.mark.parametrize("regime,sharp", [("gauss", 4.0), ("outlier", 1.0)])
+def test_end_to_end_accuracy_gate(kind, regime, sharp):
+    pytest.importorskip("flash_mla_fused_cuda")
+    import os
+    import sys
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "benchmarks"))
+    from eval_kv_quant import run_one
+    r = run_one(regime, 2048, sharp, 0, [kind])[kind]
+    assert r["cos_o"] < GATE_COS_DIFF[kind], r
+    assert r["cos_y"] < GATE_COS_DIFF[kind], r
