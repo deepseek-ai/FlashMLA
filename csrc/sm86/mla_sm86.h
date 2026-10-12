@@ -141,22 +141,28 @@ void mla_sm86_run(Flash_fwd_mla_params &params, cudaStream_t stream);
 template <typename T>
 void mla_sm86_run_q(Flash_fwd_mla_params &params, cudaStream_t stream);
 
-// Workspace layout (bytes) used by the split-KV partials.
+// Workspace layout (bytes).  The self-resetting combine counters sit at a FIXED offset 0 (kCounterBytes, independent of the
+// problem size) so that one zero-initialised workspace can be shared by calls with different batch sizes: nothing but the
+// counters ever writes there.  The fp32 partial O / LSE buffers follow.
+constexpr size_t kCounterBytes = 64 * 1024;
+constexpr int kMaxCounters = int(kCounterBytes / sizeof(int));
 struct WorkspaceLayout {
-    size_t oaccum_bytes, lseaccum_off, lseaccum_bytes, lsetmp_off, lsetmp_bytes, counters_off, counters_bytes, total;
+    size_t counters_off, counters_bytes, oaccum_off, oaccum_bytes, lseaccum_off, lseaccum_bytes, lsetmp_off, lsetmp_bytes, total;
 };
+inline int num_counters(int b, int M, int h_k) { return b * h_k * ((M + 15) / 16); }
 inline WorkspaceLayout workspace_layout(int b, int M, int h_k, int num_sm_parts) {
     auto up = [](size_t x) { return (x + 255) & ~size_t(255); };
     WorkspaceLayout w;
     const size_t slots = size_t(b) + size_t(num_sm_parts);
+    w.counters_off = 0;
+    w.counters_bytes = kCounterBytes;
+    w.oaccum_off = w.counters_off + w.counters_bytes;
     w.oaccum_bytes = slots * h_k * M * 512 * sizeof(float);
-    w.lseaccum_off = up(w.oaccum_bytes);
+    w.lseaccum_off = w.oaccum_off + up(w.oaccum_bytes);
     w.lseaccum_bytes = slots * h_k * M * sizeof(float);
     w.lsetmp_off = w.lseaccum_off + up(w.lseaccum_bytes);
     w.lsetmp_bytes = size_t(b) * h_k * M * sizeof(float);
-    w.counters_off = w.lsetmp_off + up(w.lsetmp_bytes);
-    w.counters_bytes = size_t(b) * h_k * ((M + 15) / 16) * sizeof(int);
-    w.total = w.counters_off + up(w.counters_bytes);
+    w.total = w.lsetmp_off + up(w.lsetmp_bytes);
     return w;
 }
 

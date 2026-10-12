@@ -307,5 +307,47 @@ def test_multi_kv_heads(h_k, h_q):
         assert cos_diff(lse[:, hk * gsz:(hk + 1) * gsz], ref_l) < COS_TOL
 
 
+# ---------------------------------------------------------------------------------------------
+# one workspace reused across different batch sizes / shapes (counters live at a fixed offset and stay zero)
+# ---------------------------------------------------------------------------------------------
+def test_workspace_reuse_across_shapes(monkeypatch):
+    monkeypatch.setenv("FLASH_MLA_SM86_FUSE", "8")
+    h_q = 16
+    calls = [(40, 1, False), (3, 1, False), (17, 2, True), (40, 1, False), (1, 1, False)]
+    need = 0
+    for (b, s_q, _) in calls:   # one zero-initialised buffer big enough for every call
+        parts = get_mla_metadata(torch.ones(b, dtype=torch.int32, device=DEV), s_q * h_q, 1)[0].shape[0]
+        need = max(need, get_mla_workspace_bytes(b, s_q * h_q, 1, parts))
+    ws = torch.zeros(need, dtype=torch.uint8, device=DEV)
+    for (b, s_q, causal) in calls:
+        seqlens = varlen_seqlens(b, 900, s_q, seed=b)
+        q, kv, bt, sl = make_inputs(b, s_q, h_q, seqlens, 64, torch.bfloat16)
+        md, ns = get_mla_metadata(sl, s_q * h_q, 1)
+        out = torch.empty(b, s_q, h_q, DV, dtype=torch.bfloat16, device=DEV)
+        lse = torch.empty(b, h_q, s_q, dtype=torch.float32, device=DEV)
+        flash_mla_with_kvcache(q, kv, bt, sl, DV, md, ns, causal=causal, out=out, lse=lse, workspace=ws)
+        torch.cuda.synchronize()
+        ref_o, ref_l = ref_mla(q, kv, bt, sl, h_q, causal)
+        assert cos_diff(out, ref_o) < COS_TOL and cos_diff(lse, ref_l) < COS_TOL, (b, s_q)
+
+
+# ---------------------------------------------------------------------------------------------
+# empty sequences inside a batch: output 0, lse +inf (like the reference)
+# ---------------------------------------------------------------------------------------------
+def test_zero_length_sequence():
+    b, s_q, h_q = 4, 1, 16
+    seqlens = [0, 37, 0, 700]
+    q, kv, bt, sl = make_inputs(b, s_q, h_q, [max(1, x) for x in seqlens], 64, torch.bfloat16)
+    sl = torch.tensor(seqlens, dtype=torch.int32, device=DEV)
+    md, ns = get_mla_metadata(sl, s_q * h_q, 1)
+    out, lse = flash_mla_with_kvcache(q, kv, bt, sl, DV, md, ns)
+    torch.cuda.synchronize()
+    assert not torch.isnan(out).any()
+    for i in (0, 2):
+        assert torch.all(out[i] == 0) and torch.all(torch.isinf(lse[i]))
+    ref_o, ref_l = ref_mla(q[[1, 3]], kv, bt[[1, 3]], sl[[1, 3]], h_q, False)
+    assert cos_diff(out[[1, 3]], ref_o) < COS_TOL and cos_diff(lse[[1, 3]], ref_l) < COS_TOL
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-x", "-q"] + __import__("sys").argv[1:]))

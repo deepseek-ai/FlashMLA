@@ -258,11 +258,13 @@ mha_fwd_kvcache_mla(
         TORCH_CHECK((size_t)(ws.numel() * ws.element_size()) >= lay.total, "workspace too small: need ", lay.total, " bytes");
         char *base = reinterpret_cast<char *>(ws.data_ptr());
         TORCH_CHECK(reinterpret_cast<uintptr_t>(base) % 256 == 0, "workspace must be 256-byte aligned");
-        params.oaccum_ptr = base;
+        params.oaccum_ptr = base + lay.oaccum_off;
         params.softmax_lseaccum_ptr = base + lay.lseaccum_off;
         params.workspace = base;
-        params.combine_counters = reinterpret_cast<int *>(base + lay.counters_off);
-        params.fuse_max_splits = mla_sm86::fuse_max_splits_default();
+        if (use_v2 && mla_sm86::num_counters(batch_size, seqlen_q, num_heads) <= mla_sm86::kMaxCounters) {
+            params.combine_counters = reinterpret_cast<int *>(base + lay.counters_off);   // must be zero on entry (self-resetting)
+            params.fuse_max_splits = mla_sm86::fuse_max_splits_default();
+        }
         if (!lse_direct && use_v2 && lse_.has_value()) params.softmax_lse_ptr = base + lay.lsetmp_off;   // staged, then copied into lse
     } else {
         softmax_lse_accum = torch::empty({batch_size + num_sm_parts, num_heads, seqlen_q}, opts.dtype(at::kFloat));
