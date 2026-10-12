@@ -1,85 +1,151 @@
-#include <cutlass/fast_math.h>
+// Tile-scheduler metadata for the persistent split-KV MLA decode kernels (parallel, device-side).
+//
+// Every batch element i costs  cost_i = max(1, ceil(seqlen_i / G)) + ov  "units" (G = scheduler granule in tokens,
+// ov = fixed per-segment overhead expressed in blocks).  The units of all batches form one line; the line is cut
+// into num_sm_parts equal ranges and range p becomes the work of persistent CTA p.  A range may start / end in the
+// middle of a batch element (split-KV).  All num_sm_parts ranges are located in parallel by binary search on the
+// prefix sums of the costs, instead of the single-thread serial loop of the original implementation.
+//
+// Output format is identical to the legacy kernels:
+//   tile_scheduler_metadata[p] = {begin_idx, begin_seqlen, end_idx, end_seqlen, begin_n_split_idx, 0, 0, 0}
+//   num_splits[i]              = number of splits of all batch elements < i (prefix sum), num_splits[b] = total.
+// A CTA whose range is empty gets begin_idx = b (the main kernels return immediately).
 
 #include "static_switch.h"
 #include "flash_mla.h"
 
-static constexpr int MaxBatchSize = 4096;
+static constexpr int kMetaThreads = 1024;
+static constexpr int kMaxBatchMeta = 12000;   // (b + 1) ints of dynamic smem must stay below 48 KB
 
-__global__ void
-#if __CUDA_ARCH__ >= 900
-__launch_bounds__(256, 1, 1)
-#else
-__launch_bounds__(256)
-#endif
+__global__ void __launch_bounds__(kMetaThreads)
 get_mla_metadata_kernel(__grid_constant__ const Mla_metadata_params params) {
-    int *seqlens_k_ptr = params.seqlens_k_ptr;
-    int *tile_scheduler_metadata_ptr = params.tile_scheduler_metadata_ptr;
-    int *num_splits_ptr = params.num_splits_ptr;
-    int batch_size = params.batch_size;
-    int block_size_n = params.block_size_n;
-    int fixed_overhead_num_blocks = params.fixed_overhead_num_blocks;
-    int num_sm_parts = params.num_sm_parts;
+    extern __shared__ int C[];                       // exclusive prefix of costs, C[b] = total
+    __shared__ int warp_sums[kMetaThreads / 32];
 
-    __shared__ int num_blocks_shared[MaxBatchSize];
-    __shared__ int num_splits_shared[MaxBatchSize];
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    const int b = params.batch_size;
+    const int G = params.block_size_n;
+    const int ov = params.fixed_overhead_num_blocks;
+    const int P = params.num_sm_parts;
+    const int *seqlens = params.seqlens_k_ptr;
 
-    int total_num_blocks = 0;
-    for (int i = threadIdx.x; i < batch_size; i += 32) {
-        int num_blocks = cutlass::ceil_div(seqlens_k_ptr[i], block_size_n);
-        total_num_blocks += num_blocks + fixed_overhead_num_blocks;
-        num_blocks_shared[i] = num_blocks;
+    auto cost_of = [&](int i) {
+        const int nb = (seqlens[i] + G - 1) / G;
+        return (nb > 0 ? nb : 1) + ov;
+    };
+
+    // ---- exclusive scan of the costs ----
+    const int per = (b + kMetaThreads - 1) / kMetaThreads;
+    int local = 0;
+    for (int k = 0; k < per; ++k) {
+        const int i = tid * per + k;
+        if (i < b) local += cost_of(i);
     }
-    for (int offset = 16; offset >= 1; offset /= 2) {
-        total_num_blocks += __shfl_xor_sync(uint32_t(-1), total_num_blocks, offset);
+    int v = local;
+#pragma unroll
+    for (int o = 1; o < 32; o <<= 1) {
+        const int y = __shfl_up_sync(0xffffffffu, v, o);
+        if (lane >= o) v += y;
     }
-    __syncwarp();
-
-    if (threadIdx.x == 0) {
-        int payload = cutlass::ceil_div(total_num_blocks, num_sm_parts) + fixed_overhead_num_blocks;
-
-        int now_idx = 0, now_block = 0, now_n_split_idx = 0, cum_num_splits = 0;
-        num_splits_shared[0] = 0;
-        for (int i = 0; i < num_sm_parts; ++i) {
-            int tile_scheduler_metadata0[4], tile_scheduler_metadata1;
-            tile_scheduler_metadata0[0] = now_idx;
-            tile_scheduler_metadata0[1] = now_block * block_size_n;
-            tile_scheduler_metadata1 = now_n_split_idx;
-            int remain_payload = payload;
-            while (now_idx < batch_size) {
-                int num_blocks = num_blocks_shared[now_idx];
-                int now_remain_blocks = num_blocks - now_block;
-                if (remain_payload >= now_remain_blocks + fixed_overhead_num_blocks) {
-                    cum_num_splits += now_n_split_idx + 1;
-                    num_splits_shared[now_idx + 1] = cum_num_splits;
-                    remain_payload -= now_remain_blocks + fixed_overhead_num_blocks;
-                    ++now_idx;
-                    now_block = 0;
-                    now_n_split_idx = 0;
-                } else {
-                    if (remain_payload - fixed_overhead_num_blocks > 0) {
-                        now_block += remain_payload - fixed_overhead_num_blocks;
-                        ++now_n_split_idx;
-                        remain_payload = 0;
-                    }
-                    break;
-                }
-            }
-            tile_scheduler_metadata0[2] = now_block > 0 ? now_idx : now_idx - 1;
-            tile_scheduler_metadata0[3] = now_block > 0 ? now_block * block_size_n : seqlens_k_ptr[now_idx - 1];
-            *reinterpret_cast<int4 *>(tile_scheduler_metadata_ptr + i * TileSchedulerMetaDataSize) = *reinterpret_cast<int4 *>(tile_scheduler_metadata0);
-            tile_scheduler_metadata_ptr[i * TileSchedulerMetaDataSize + 4] = tile_scheduler_metadata1;
+    if (lane == 31) warp_sums[warp] = v;
+    __syncthreads();
+    if (warp == 0) {
+        int w = lane < kMetaThreads / 32 ? warp_sums[lane] : 0;
+#pragma unroll
+        for (int o = 1; o < 32; o <<= 1) {
+            const int y = __shfl_up_sync(0xffffffffu, w, o);
+            if (lane >= o) w += y;
         }
-        FLASH_DEVICE_ASSERT(now_idx == batch_size && now_block == 0 && now_n_split_idx == 0);
+        if (lane < kMetaThreads / 32) warp_sums[lane] = w;
     }
-    __syncwarp();
+    __syncthreads();
+    const int total = warp_sums[kMetaThreads / 32 - 1];
+    int run = v - local + (warp > 0 ? warp_sums[warp - 1] : 0);
+    for (int k = 0; k < per; ++k) {
+        const int i = tid * per + k;
+        if (i < b) { C[i] = run; run += cost_of(i); }
+    }
+    if (tid == 0) C[b] = total;
+    __syncthreads();
 
-    for (int i = threadIdx.x; i <= batch_size; i += 32) {
-        num_splits_ptr[i] = num_splits_shared[i];
+    const int payload = (total + P - 1) / P;
+
+    // position of the first block unit >= x:  (batch index, block index inside the batch); (b, 0) if x >= total
+    auto locate = [&](int x, int &bi, int &blk) {
+        if (x >= total) { bi = b; blk = 0; return; }
+        int lo = 0, hi = b - 1;
+        while (lo < hi) {
+            const int mid = (lo + hi + 1) >> 1;
+            if (C[mid] <= x) lo = mid; else hi = mid - 1;
+        }
+        const int off = x - C[lo];
+        bi = lo;
+        blk = off < ov ? 0 : off - ov;
+    };
+
+    for (int p = tid; p < P; p += kMetaThreads) {
+        int bi, bblk, ei, eblk;
+        const long long lo_x = (long long)p * payload;
+        const long long hi_x = lo_x + payload;
+        locate(lo_x >= total ? total : (int)lo_x, bi, bblk);
+        locate(hi_x >= total ? total : (int)hi_x, ei, eblk);
+        int *out = params.tile_scheduler_metadata_ptr + p * TileSchedulerMetaDataSize;
+        int4 m0;
+        int m4 = 0;
+        const bool empty = (bi >= b) || (bi > ei) || (bi == ei && bblk >= eblk);
+        if (empty) {
+            m0 = make_int4(b, 0, b - 1, 0);
+        } else {
+            m0.x = bi;
+            m0.y = bblk * G;
+            if (eblk > 0) { m0.z = ei; m0.w = eblk * G; }
+            else          { m0.z = ei - 1; m0.w = seqlens[ei - 1]; }
+            m4 = p - (C[bi] + ov) / payload;
+        }
+        *reinterpret_cast<int4 *>(out) = m0;
+        *reinterpret_cast<int4 *>(out + 4) = make_int4(m4, 0, 0, 0);
     }
+
+    // ---- num_splits: splits_i = part(last unit) - part(first block unit) + 1; exclusive scan ----
+    int locl = 0;
+    for (int k = 0; k < per; ++k) {
+        const int i = tid * per + k;
+        if (i < b) locl += (C[i + 1] - 1) / payload - (C[i] + ov) / payload + 1;
+    }
+    v = locl;
+#pragma unroll
+    for (int o = 1; o < 32; o <<= 1) {
+        const int y = __shfl_up_sync(0xffffffffu, v, o);
+        if (lane >= o) v += y;
+    }
+    __syncthreads();
+    if (lane == 31) warp_sums[warp] = v;
+    __syncthreads();
+    if (warp == 0) {
+        int w = lane < kMetaThreads / 32 ? warp_sums[lane] : 0;
+#pragma unroll
+        for (int o = 1; o < 32; o <<= 1) {
+            const int y = __shfl_up_sync(0xffffffffu, w, o);
+            if (lane >= o) w += y;
+        }
+        if (lane < kMetaThreads / 32) warp_sums[lane] = w;
+    }
+    __syncthreads();
+    int run2 = v - locl + (warp > 0 ? warp_sums[warp - 1] : 0);
+    for (int k = 0; k < per; ++k) {
+        const int i = tid * per + k;
+        if (i < b) {
+            params.num_splits_ptr[i] = run2;
+            run2 += (C[i + 1] - 1) / payload - (C[i] + ov) / payload + 1;
+        }
+    }
+    if (tid == 0) params.num_splits_ptr[b] = warp_sums[kMetaThreads / 32 - 1];
 }
 
 void get_mla_metadata_func(Mla_metadata_params &params, cudaStream_t stream) {
-    FLASH_ASSERT(params.batch_size < MaxBatchSize);
-    get_mla_metadata_kernel<<<1, 32, 0, stream>>>(params);
+    FLASH_ASSERT(params.batch_size < kMaxBatchMeta);
+    FLASH_ASSERT(params.block_size_n > 0 && params.num_sm_parts > 0);
+    const size_t smem = (size_t)(params.batch_size + 1) * sizeof(int);
+    get_mla_metadata_kernel<<<1, kMetaThreads, smem, stream>>>(params);
     CHECK_CUDA_KERNEL_LAUNCH();
 }
