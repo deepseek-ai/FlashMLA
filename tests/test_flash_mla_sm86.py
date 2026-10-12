@@ -282,5 +282,30 @@ def test_legacy_crosscheck(h_q):
     assert cos_diff(o_new, o_old) < COS_TOL and cos_diff(l_new, l_old) < COS_TOL
 
 
+# ---------------------------------------------------------------------------------------------
+# num_heads_k > 1 (q heads are grouped contiguously per KV head)
+# ---------------------------------------------------------------------------------------------
+@pytest.mark.parametrize("h_k,h_q", [(2, 32), (2, 64), (4, 16)])
+def test_multi_kv_heads(h_k, h_q):
+    b, s_q, page = 4, 1, 64
+    seqlens = varlen_seqlens(b, 600, s_q, seed=9)
+    g = torch.Generator(device=DEV)
+    g.manual_seed(1)
+    max_sk = max(seqlens)
+    pages_per_seq = (max_sk + page - 1) // page
+    nb = b * pages_per_seq
+    q = torch.randn(b, s_q, h_q, D, device=DEV, generator=g).to(torch.bfloat16)
+    kv = torch.randn(nb, page, h_k, D, device=DEV, generator=g).to(torch.bfloat16)
+    bt = torch.randperm(nb, device=DEV, generator=g).to(torch.int32).view(b, pages_per_seq).contiguous()
+    sl = torch.tensor(seqlens, dtype=torch.int32, device=DEV)
+    md, ns = get_mla_metadata(sl, s_q * h_q // h_k, h_k)
+    out, lse = flash_mla_with_kvcache(q, kv, bt, sl, DV, md, ns)
+    gsz = h_q // h_k
+    for hk in range(h_k):
+        ref_o, ref_l = ref_mla(q[:, :, hk * gsz:(hk + 1) * gsz].contiguous(), kv[:, :, hk:hk + 1].contiguous(), bt, sl, gsz, False)
+        assert cos_diff(out[:, :, hk * gsz:(hk + 1) * gsz], ref_o) < COS_TOL
+        assert cos_diff(lse[:, hk * gsz:(hk + 1) * gsz], ref_l) < COS_TOL
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-x", "-q"] + __import__("sys").argv[1:]))

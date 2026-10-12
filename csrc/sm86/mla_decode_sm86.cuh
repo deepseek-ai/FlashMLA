@@ -638,7 +638,6 @@ mla_decode_kernel(const __grid_constant__ Flash_fwd_mla_params params) {
 //                       partial-O loads are issued before the LSE normalisation is known, one round for nsp <= 64.
 //   kWarp  (many rows): one warp per row (lane owns 4 float4 columns), 8 rows per CTA.
 // ---------------------------------------------------------------------------------------------------------
-constexpr int kCombineThreads = 512;
 constexpr int kCombineWarpThreads = 256;
 
 __device__ __forceinline__ bool combine_skip(const Flash_fwd_mla_params &params, int nsp) {
@@ -687,11 +686,11 @@ __device__ __forceinline__ void combine_store4(const Flash_fwd_mla_params &param
     *reinterpret_cast<uint2 *>(o) = pk;
 }
 
-template <typename T>
-__global__ void __launch_bounds__(kCombineThreads)
+template <typename T, int NG>
+__global__ void __launch_bounds__(NG * 32)
 mla_combine_wide_kernel(const __grid_constant__ Flash_fwd_mla_params params) {
     const int tid = threadIdx.x;
-    const int grp = tid >> 5, c = tid & 31;   // 16 split groups x 32 float4 columns
+    const int grp = tid >> 5, c = tid & 31;   // NG split groups x 32 float4 columns
     const int bidx = blockIdx.x >> 2, quarter = blockIdx.x & 3;
     const int M = params.seqlen_q;
     const int hs = params.h * M;
@@ -704,35 +703,35 @@ mla_combine_wide_kernel(const __grid_constant__ Flash_fwd_mla_params params) {
     FLASH_DEVICE_ASSERT(nsp <= kMaxSplits);
 
     __shared__ float sScale[kMaxSplits];
-    __shared__ float4 sAcc[16][32];
+    __shared__ float4 sAcc[NG][32];
 
     const int64_t sstride = (int64_t)hs * kDV;
     const float *oa = reinterpret_cast<const float *>(params.oaccum_ptr) + ((int64_t)split_offset * hs + hs_idx) * kDV + quarter * 128 + c * 4;
 
-    constexpr int kChunk = 4;   // splits per group per round: nsp <= 64 in one round
+    constexpr int kChunk = 64 / NG;   // splits per group per round: nsp <= 64 in one round
     float4 v[kChunk];
 #pragma unroll
     for (int u = 0; u < kChunk; ++u) {
-        const int sp = grp + 16 * u;
+        const int sp = grp + NG * u;
         v[u] = (sp < nsp) ? __ldcg(reinterpret_cast<const float4 *>(oa + (int64_t)sp * sstride)) : make_float4(0.f, 0.f, 0.f, 0.f);
     }
     if (tid < 32) combine_weights(params, tid, nsp, split_offset, hs, hs_idx, bidx, sScale, quarter == 0);
     __syncthreads();
 
     float4 acc = make_float4(0.f, 0.f, 0.f, 0.f);
-    for (int base = 0; base < nsp; base += 16 * kChunk) {
+    for (int base = 0; base < nsp; base += NG * kChunk) {
 #pragma unroll
         for (int u = 0; u < kChunk; ++u) {
-            const int sp = base + grp + 16 * u;
+            const int sp = base + grp + NG * u;
             if (sp < nsp) {
                 const float w = sScale[sp];
                 acc.x += w * v[u].x; acc.y += w * v[u].y; acc.z += w * v[u].z; acc.w += w * v[u].w;
             }
         }
-        if (base + 16 * kChunk < nsp) {
+        if (base + NG * kChunk < nsp) {
 #pragma unroll
             for (int u = 0; u < kChunk; ++u) {
-                const int sp = base + 16 * kChunk + grp + 16 * u;
+                const int sp = base + NG * kChunk + grp + NG * u;
                 v[u] = (sp < nsp) ? __ldcg(reinterpret_cast<const float4 *>(oa + (int64_t)sp * sstride)) : make_float4(0.f, 0.f, 0.f, 0.f);
             }
         }
@@ -742,7 +741,7 @@ mla_combine_wide_kernel(const __grid_constant__ Flash_fwd_mla_params params) {
     if (tid < 32) {
         float4 r = sAcc[0][tid];
 #pragma unroll
-        for (int g2 = 1; g2 < 16; ++g2) {
+        for (int g2 = 1; g2 < NG; ++g2) {
             const float4 a = sAcc[g2][tid];
             r.x += a.x; r.y += a.y; r.z += a.z; r.w += a.w;
         }
@@ -815,16 +814,20 @@ mla_combine_warp_kernel(const __grid_constant__ Flash_fwd_mla_params params) {
     for (int ci = 0; ci < 4; ++ci) combine_store4<T>(params, batch_idx, head_idx, row, ci * 128 + lane * 4, acc[ci]);
 }
 
+// combine launch policy (rows = b * h * M): few rows -> column-split "wide" kernels (the narrower, the more rows);
+// many rows -> one warp per row.  FLASH_MLA_SM86_COMBINE = wide16 | wide8 | wide4 | warp overrides.
 template <typename T>
 void launch_combine(Flash_fwd_mla_params &p, cudaStream_t stream) {
     const int rows = p.b * p.h * p.seqlen_q;
-    const char *mode = std::getenv("FLASH_MLA_SM86_COMBINE");   // "wide" | "warp" | unset = auto
-    const bool wide = mode ? (mode[0] == 'w' && mode[1] == 'i') : (rows <= 64);
-    if (wide) {
-        mla_combine_wide_kernel<T><<<rows * 4, kCombineThreads, 0, stream>>>(p);
-    } else {
-        mla_combine_warp_kernel<T><<<(rows + kCombineWarpThreads / 32 - 1) / (kCombineWarpThreads / 32), kCombineWarpThreads, 0, stream>>>(p);
-    }
+    const char *mode = std::getenv("FLASH_MLA_SM86_COMBINE");
+    int kind;   // 16 / 8 / 4 = split groups of the wide kernel, 0 = warp-per-row
+    if (mode && mode[0] == 'w' && mode[1] == 'a') kind = 0;
+    else if (mode && mode[0] == 'w') kind = std::atoi(mode + 4);
+    else kind = rows <= 16 ? 16 : (rows <= 32 ? 8 : (rows <= 96 ? 4 : 0));   // measured on sm_86 (b = 1, 2, 4 | 8+ at h_q = 16)
+    if (kind == 16) mla_combine_wide_kernel<T, 16><<<rows * 4, 512, 0, stream>>>(p);
+    else if (kind == 8) mla_combine_wide_kernel<T, 8><<<rows * 4, 256, 0, stream>>>(p);
+    else if (kind == 4) mla_combine_wide_kernel<T, 4><<<rows * 4, 128, 0, stream>>>(p);
+    else mla_combine_warp_kernel<T><<<(rows + kCombineWarpThreads / 32 - 1) / (kCombineWarpThreads / 32), kCombineWarpThreads, 0, stream>>>(p);
     CHECK_CUDA_KERNEL_LAUNCH();
 }
 
