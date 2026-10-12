@@ -20,7 +20,7 @@ namespace mla_sm86 {
 constexpr int kQRowBytes = 640;   // 512 B latent + 128 B rope
 constexpr int kQChunks = 40;      // 16-byte chunks per row
 
-template <typename T_, int KVQ_, int BM_, int NS_, int MINB_ = 1>
+template <typename T_, int KVQ_, int BM_, int NT_, int NS_, int MINB_ = 1>
 struct CfgQ {
     using T = T_;
     static constexpr int kKVQ = KVQ_;   // kKVFp8E4m3 or kKVInt8
@@ -29,15 +29,16 @@ struct CfgQ {
     static constexpr int kConsWarps = kGroups * 4;
     static constexpr int kConsThreads = kConsWarps * 32;
     static constexpr int kNThreads = kConsThreads;
-    static constexpr int kNt = 16;
-    static constexpr int kNT8 = 2;
+    static constexpr int kNt = NT_;
+    static constexpr int kNT8 = NT_ / 8;
     static constexpr int kStages = NS_;
     static constexpr int kMinB = MINB_;
-    static constexpr int kStageBytes = kNt * kQRowBytes + 128;   // 16 rows + per-token scales (64 B used)
+    static constexpr int kStageBytes = kNt * kQRowBytes + 128;   // Nt rows + per-token scales (4*Nt <= 128 B)
     static constexpr int kRingBytes = NS_ * kStageBytes;
     static constexpr int kSBytes = kGroups * 4 * kNT8 * 32 * 16;
     static constexpr int kSmem = kRingBytes + kSBytes;
     static_assert(BM_ == 16 || BM_ == 32, "BM must be 16 or 32");
+    static_assert(NT_ == 16 || NT_ == 32, "Nt must be 16 or 32");
     static_assert(NS_ >= 2 && NS_ <= 8, "need 2..8 stages");
 };
 
@@ -99,10 +100,9 @@ __device__ __forceinline__ void dq_pairs(uint32_t q, uint32_t &hi_pair, uint32_t
 }
 
 // ---- tile copy: 16 rows x 40 chunks (XOR-swizzled) + 16 per-token scales (zero-filled beyond the sequence end)
-template <int NISS>
+template <int kNt, int NISS>
 __device__ __forceinline__ void issue_tile_copy_q(uint32_t dst, const uint8_t *src, int64_t row_stride, const float *scale_src, int tok0,
                                                   int seqlen_k, int iss_tid) {
-    constexpr int kNt = 16;
 #pragma unroll
     for (int it = 0; it < (kNt * kQChunks + NISS - 1) / NISS; ++it) {
         const int idx = iss_tid + it * NISS;
@@ -116,54 +116,62 @@ __device__ __forceinline__ void issue_tile_copy_q(uint32_t dst, const uint8_t *s
     if (iss_tid < kNt) cp_async_4(dst + kNt * kQRowBytes + 4 * iss_tid, scale_src + iss_tid, (tok0 + iss_tid) < seqlen_k);
 }
 
-// ---- QK partial for one 16-token tile
+// ---- QK partial for one Nt-token tile
 template <typename CQ, typename ET>
 __device__ __forceinline__ void qk_stage_q(const uint32_t sbase, const uint32_t (&kqq_off)[4], const uint32_t rope_off, const uint32_t (&qf)[9][4],
-                                           const float (&sc)[2][2], float (&sacc)[2][4]) {
+                                           const float (&sc)[CQ::kNT8][2], float (&sacc)[CQ::kNT8][4]) {
     using T = typename CQ::T;
-    float lat[2][4], rope[2][4];
+    constexpr int NT8 = CQ::kNT8;
+    float lat[NT8][4], rope[NT8][4];
 #pragma unroll
-    for (int nt = 0; nt < 2; ++nt)
+    for (int nt = 0; nt < NT8; ++nt)
 #pragma unroll
         for (int e = 0; e < 4; ++e) { lat[nt][e] = 0.f; rope[nt][e] = 0.f; }
 #pragma unroll
     for (int u = 0; u < 4; ++u) {
-        uint32_t w[4];
-        ldsm_x4(w, sbase + kqq_off[u]);   // w[mi]: n-tile (mi&1), k-step 2u + (mi>>1)
 #pragma unroll
-        for (int e = 0; e < 4; ++e) {
-            uint32_t b1, b0;
-            dq_pairs<T, CQ::kKVQ>(w[e], b1, b0);
-            ET::mma(lat[e & 1], qf[2 * u + (e >> 1)], b0, b1);
+        for (int npp = 0; npp < NT8 / 2; ++npp) {
+            uint32_t w[4];
+            ldsm_x4(w, sbase + kqq_off[u] + npp * 16 * kQRowBytes);   // w[mi]: n-tile 2*npp + (mi&1), k-step 2u + (mi>>1)
+#pragma unroll
+            for (int e = 0; e < 4; ++e) {
+                uint32_t b1, b0;
+                dq_pairs<T, CQ::kKVQ>(w[e], b1, b0);
+                ET::mma(lat[2 * npp + (e & 1)], qf[2 * u + (e >> 1)], b0, b1);
+            }
         }
     }
-    {
+#pragma unroll
+    for (int npp = 0; npp < NT8 / 2; ++npp) {
         uint32_t b[4];
-        ldsm_x4(b, sbase + rope_off);
-        ET::mma(rope[0], qf[8], b[0], b[1]);
-        ET::mma(rope[1], qf[8], b[2], b[3]);
+        ldsm_x4(b, sbase + rope_off + npp * 16 * kQRowBytes);
+        ET::mma(rope[2 * npp], qf[8], b[0], b[1]);
+        ET::mma(rope[2 * npp + 1], qf[8], b[2], b[3]);
     }
 #pragma unroll
-    for (int nt = 0; nt < 2; ++nt)
+    for (int nt = 0; nt < NT8; ++nt)
 #pragma unroll
         for (int e = 0; e < 4; ++e) sacc[nt][e] = fmaf(sc[nt][e & 1], lat[nt][e], rope[nt][e]);
 }
 
-// ---- PV for one 16-token tile: O[:, 128 columns] += (P*scale) V ; n-tile 2P = even dims 16P+2g, 2P+1 = odd dims
+// ---- PV for one Nt-token tile: O[:, 128 columns] += (P*scale) V ; n-tile 2P = even dims 16P+2g, 2P+1 = odd dims
 template <typename CQ, typename ET>
-__device__ __forceinline__ void pv_stage_q(const uint32_t (&pa)[1][4], const uint32_t sbase, const uint32_t (&vqq_off)[4], float (&acc_o)[16][4]) {
+__device__ __forceinline__ void pv_stage_q(const uint32_t (&pa)[CQ::kNt / 16][4], const uint32_t sbase, const uint32_t (&vqq_off)[4], float (&acc_o)[16][4]) {
     using T = typename CQ::T;
 #pragma unroll
-    for (int u = 0; u < 4; ++u) {
-        uint32_t w[4];
-        ldsm_x4_trans(w, sbase + vqq_off[u]);   // w[mi]: token half (mi&1), 16-dim group 2u + (mi>>1)
+    for (int kc = 0; kc < CQ::kNt / 16; ++kc) {
 #pragma unroll
-        for (int pp = 0; pp < 2; ++pp) {
-            uint32_t xb0, xb1, yb0, yb1;
-            dq_pairs<T, CQ::kKVQ>(w[2 * pp], yb0, xb0);
-            dq_pairs<T, CQ::kKVQ>(w[2 * pp + 1], yb1, xb1);
-            ET::mma(acc_o[2 * (2 * u + pp)], pa[0], xb0, xb1);
-            ET::mma(acc_o[2 * (2 * u + pp) + 1], pa[0], yb0, yb1);
+        for (int u = 0; u < 4; ++u) {
+            uint32_t w[4];
+            ldsm_x4_trans(w, sbase + vqq_off[u] + kc * 16 * kQRowBytes);   // w[mi]: token half (mi&1) of this 16-token slab, 16-dim group 2u + (mi>>1)
+#pragma unroll
+            for (int pp = 0; pp < 2; ++pp) {
+                uint32_t xb0, xb1, yb0, yb1;
+                dq_pairs<T, CQ::kKVQ>(w[2 * pp], yb0, xb0);
+                dq_pairs<T, CQ::kKVQ>(w[2 * pp + 1], yb1, xb1);
+                ET::mma(acc_o[2 * (2 * u + pp)], pa[kc], xb0, xb1);
+                ET::mma(acc_o[2 * (2 * u + pp) + 1], pa[kc], yb0, yb1);
+            }
         }
     }
 }
@@ -173,21 +181,22 @@ __device__ __forceinline__ void compute_tile_q(
     const uint32_t sbase, const int tok0, float4 *sS_mine, const float4 *sS_grp, const int grp, const uint32_t (&kqq_off)[4], const uint32_t rope_off,
     const uint32_t (&vqq_off)[4], const int t, const float sl2, const uint32_t (&qf)[9][4], float (&acc_o)[16][4], float &m0, float &m1, float &l0,
     float &l1, const int lim0, const int lim1, const int mask_min) {
+    constexpr int NT8 = CQ::kNT8;
     // per-token scales of this lane's S columns: tokens 8*nt + 2t + {0,1}
-    float sc[2][2];
-    {
-        const float2 s0 = lds_f2(sbase + 16 * kQRowBytes + 4 * (2 * t));
-        const float2 s1 = lds_f2(sbase + 16 * kQRowBytes + 4 * (8 + 2 * t));
-        sc[0][0] = s0.x; sc[0][1] = s0.y; sc[1][0] = s1.x; sc[1][1] = s1.y;
+    float sc[NT8][2];
+#pragma unroll
+    for (int nt = 0; nt < NT8; ++nt) {
+        const float2 sv = lds_f2(sbase + CQ::kNt * kQRowBytes + 4 * (8 * nt + 2 * t));
+        sc[nt][0] = sv.x; sc[nt][1] = sv.y;
     }
-    float sacc[2][4];
+    float sacc[NT8][4];
     qk_stage_q<CQ, ET>(sbase, kqq_off, rope_off, qf, sc, sacc);
     exch_store<CQ>(sS_mine, sacc);
     bar_sync(1 + grp, 128);
-    float s[2][4];
+    float s[NT8][4];
     exch_sum<CQ>(sS_grp, s);
     mask_stage<CQ>(s, tok0, t, lim0, lim1, mask_min);
-    uint32_t pa[1][4];
+    uint32_t pa[CQ::kNt / 16][4];
     softmax_stage<CQ, ET, true>(s, sl2, m0, m1, l0, l1, acc_o, pa, sc);
     pv_stage_q<CQ, ET>(pa, sbase, vqq_off, acc_o);
 }
@@ -198,8 +207,8 @@ mla_decode_q_kernel(const __grid_constant__ Flash_fwd_mla_params params) {
     using C = CQ;
     using T = typename C::T;
     using ET = ElemTraits<T>;
-    constexpr int NT = 16;
-    constexpr int NT8 = 2;
+    constexpr int NT = C::kNt;
+    constexpr int NT8 = C::kNT8;
     constexpr int NS = C::kStages;
 
     extern __shared__ __align__(128) unsigned char smem_buf[];
@@ -295,7 +304,7 @@ mla_decode_q_kernel(const __grid_constant__ Flash_fwd_mla_params params) {
                 const int tok0 = tok_begin + s * NT;
                 const uint8_t *src = kbase + (int64_t)pgv[s] * k_batch_stride + (int64_t)(tok0 & ps_mask) * k_row_stride;
                 const float *ssrc = scale_base + (int64_t)pgv[s] * params.page_block_size + (tok0 & ps_mask);
-                issue_tile_copy_q<C::kNThreads>(ring_u32 + s * C::kStageBytes, src, k_row_stride, ssrc, tok0, seqlen_k, tid);
+                issue_tile_copy_q<NT, C::kNThreads>(ring_u32 + s * C::kStageBytes, src, k_row_stride, ssrc, tok0, seqlen_k, tid);
             }
             cp_async_commit();
         }
@@ -327,7 +336,7 @@ mla_decode_q_kernel(const __grid_constant__ Flash_fwd_mla_params params) {
                     const int tok_p = tok_begin + (n + NS - 1) * NT;
                     const uint8_t *src = kbase + (int64_t)pg_cur * k_batch_stride + (int64_t)(tok_p & ps_mask) * k_row_stride;
                     const float *ssrc = scale_base + (int64_t)pg_cur * params.page_block_size + (tok_p & ps_mask);
-                    issue_tile_copy_q<C::kNThreads>(ring_u32 + wr_slot * C::kStageBytes, src, k_row_stride, ssrc, tok_p, seqlen_k, tid);
+                    issue_tile_copy_q<NT, C::kNThreads>(ring_u32 + wr_slot * C::kStageBytes, src, k_row_stride, ssrc, tok_p, seqlen_k, tid);
                 }
             }
             cp_async_commit();
@@ -436,19 +445,25 @@ void launch_main_q(Flash_fwd_mla_params &p, cudaStream_t stream) {
 
 template <typename T, int KVQ>
 void mla_sm86_run_q_impl(Flash_fwd_mla_params &p, cudaStream_t stream) {
-    const PlanQ plan = pick_plan_q(p.seqlen_q);
+    PlanQ plan = pick_plan_q(p.seqlen_q);
+    if (plan.nt > p.page_block_size) { plan.nt = p.page_block_size; if (plan.ns < 3) plan.ns = 3; }   // tile within one page
     bool launched = false;
-#define MLA_SM86_QCASE(BM_, NS_, MB_)                                                         \
-    if (plan.bm == BM_ && plan.ns == NS_ && plan.minb == MB_) {                               \
-        launch_main_q<CfgQ<T, KVQ, BM_, NS_, MB_>>(p, stream);                                \
+#define MLA_SM86_QCASE(BM_, NT_, NS_, MB_)                                                    \
+    if (plan.bm == BM_ && plan.nt == NT_ && plan.ns == NS_ && plan.minb == MB_) {             \
+        launch_main_q<CfgQ<T, KVQ, BM_, NT_, NS_, MB_>>(p, stream);                           \
         launched = true;                                                                      \
     }
-    MLA_SM86_QCASE(16, 3, 1)
-    MLA_SM86_QCASE(16, 4, 1)
-    MLA_SM86_QCASE(16, 5, 1)
-    MLA_SM86_QCASE(16, 3, 2)
-    MLA_SM86_QCASE(32, 3, 1)
-    MLA_SM86_QCASE(32, 4, 1)
+    MLA_SM86_QCASE(16, 16, 3, 1)
+    MLA_SM86_QCASE(16, 16, 4, 1)
+    MLA_SM86_QCASE(16, 16, 5, 1)
+    MLA_SM86_QCASE(16, 16, 3, 2)
+    MLA_SM86_QCASE(16, 32, 2, 1)
+    MLA_SM86_QCASE(16, 32, 3, 1)
+    MLA_SM86_QCASE(16, 32, 4, 1)
+    MLA_SM86_QCASE(32, 16, 3, 1)
+    MLA_SM86_QCASE(32, 16, 4, 1)
+    MLA_SM86_QCASE(32, 32, 2, 1)
+    MLA_SM86_QCASE(32, 32, 3, 1)
 #undef MLA_SM86_QCASE
     FLASH_ASSERT(launched);
 }

@@ -23,11 +23,17 @@ struct Plan {
 #ifndef FLASH_MLA_SM86_BM_LARGE      // rows per CTA otherwise
 #define FLASH_MLA_SM86_BM_LARGE 32
 #endif
-#ifndef FLASH_MLA_SM86_NT            // tokens per KV tile (16 or 32; clamped to the page size)
-#define FLASH_MLA_SM86_NT 16
+#ifndef FLASH_MLA_SM86_NT_SMALL       // tokens per KV tile when BM = 16 (16 or 32; clamped to the page size)
+#define FLASH_MLA_SM86_NT_SMALL 16
 #endif
-#ifndef FLASH_MLA_SM86_NS            // smem ring stages
-#define FLASH_MLA_SM86_NS 3
+#ifndef FLASH_MLA_SM86_NS_SMALL       // smem ring stages when BM = 16
+#define FLASH_MLA_SM86_NS_SMALL 3
+#endif
+#ifndef FLASH_MLA_SM86_NT_LARGE       // tokens per KV tile when BM = 32
+#define FLASH_MLA_SM86_NT_LARGE 32
+#endif
+#ifndef FLASH_MLA_SM86_NS_LARGE       // smem ring stages when BM = 32
+#define FLASH_MLA_SM86_NS_LARGE 2
 #endif
 #ifndef FLASH_MLA_SM86_MINB          // CTAs per SM
 #define FLASH_MLA_SM86_MINB 1
@@ -58,8 +64,8 @@ inline int env_int(const char *name, int dflt) {
 inline Plan pick_plan(int M, int page_size) {
     Plan p;
     p.bm = (M <= 16) ? FLASH_MLA_SM86_BM_SMALL : FLASH_MLA_SM86_BM_LARGE;
-    p.nt = FLASH_MLA_SM86_NT;
-    p.ns = FLASH_MLA_SM86_NS;
+    p.nt = (p.bm == 16) ? FLASH_MLA_SM86_NT_SMALL : FLASH_MLA_SM86_NT_LARGE;
+    p.ns = (p.bm == 16) ? FLASH_MLA_SM86_NS_SMALL : FLASH_MLA_SM86_NS_LARGE;
     p.minb = FLASH_MLA_SM86_MINB;
     p.spec = FLASH_MLA_SM86_SPEC != 0;
     p.pipe = FLASH_MLA_SM86_PIPE != 0;
@@ -69,29 +75,36 @@ inline Plan pick_plan(int M, int page_size) {
             p.bm = bm; p.nt = nt; p.ns = ns; p.minb = mb; p.spec = sp != 0; p.pipe = pi != 0;
         }
     }
-    if (p.nt > page_size) p.nt = page_size;
+    if (p.nt > page_size) {   // a tile must lie within one page: shrink it and deepen the ring to keep the bytes in flight
+        p.nt = page_size;
+        if (p.ns < 3) p.ns = 3;
+    }
     return p;
 }
 
 // Quantized-KV kernels (fp8 e4m3 / int8): rows per CTA, ring stages, CTAs per SM.
 struct PlanQ {
-    int bm, ns, minb;
+    int bm, nt, ns, minb;
 };
+#ifndef FLASH_MLA_SM86_QNT            // tokens per tile of the quantized kernels (16 or 32; clamped to the page size)
+#define FLASH_MLA_SM86_QNT 32
+#endif
 #ifndef FLASH_MLA_SM86_QNS            // ring stages of the quantized kernels
-#define FLASH_MLA_SM86_QNS 4
+#define FLASH_MLA_SM86_QNS 2
 #endif
 #ifndef FLASH_MLA_SM86_QMINB          // CTAs per SM of the quantized kernels with BM=16
 #define FLASH_MLA_SM86_QMINB 1
 #endif
-// FLASH_MLA_SM86_QCFG="bm,ns,minb" overrides at run time.
+// FLASH_MLA_SM86_QCFG="bm,ns[,minb[,nt]]" overrides at run time.
 inline PlanQ pick_plan_q(int M) {
     PlanQ p;
     p.bm = (M <= 16) ? 16 : 32;
-    p.ns = p.bm == 16 ? FLASH_MLA_SM86_QNS : 3;
+    p.nt = FLASH_MLA_SM86_QNT;
+    p.ns = FLASH_MLA_SM86_QNS;   // 2 stages of 32 tokens (BM 16 and 32): measured best on sm_86
     p.minb = p.bm == 16 ? FLASH_MLA_SM86_QMINB : 1;
     if (const char *e = std::getenv("FLASH_MLA_SM86_QCFG")) {
-        int bm, ns, mb = 1;
-        if (std::sscanf(e, "%d,%d,%d", &bm, &ns, &mb) >= 2) { p.bm = bm; p.ns = ns; p.minb = mb; }
+        int bm, ns, mb = 1, nt = p.nt;
+        if (std::sscanf(e, "%d,%d,%d,%d", &bm, &ns, &mb, &nt) >= 2) { p.bm = bm; p.ns = ns; p.minb = mb; p.nt = nt; }
     }
     return p;
 }
