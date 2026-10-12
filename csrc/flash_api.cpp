@@ -26,7 +26,8 @@ std::vector<at::Tensor>
 get_mla_metadata(
     at::Tensor &seqlens_k,
     const int num_q_tokens_per_head_k,
-    const int num_heads_k
+    const int num_heads_k,
+    std::optional<std::string> kv_dtype
 ) {
     CHECK_DEVICE(seqlens_k);
     TORCH_CHECK(seqlens_k.is_contiguous());
@@ -48,7 +49,9 @@ get_mla_metadata(
         block_size_n = mla_sm86::sched_granule(num_q_tokens_per_head_k);
         fixed_overhead_num_blocks = mla_sm86::sched_overhead_blocks();
         min_blocks_per_part = mla_sm86::sched_min_blocks_per_part();
-        num_sm_parts = mla_sm86::num_sm_parts_for(num_q_tokens_per_head_k, num_heads_k, sm_count);
+        const bool quant = kv_dtype.has_value() && kv_dtype.value() != "native" && kv_dtype.value() != "bf16" && kv_dtype.value() != "fp16";
+        num_sm_parts = quant ? mla_sm86::num_sm_parts_for_q(num_q_tokens_per_head_k, num_heads_k, sm_count)
+                             : mla_sm86::num_sm_parts_for(num_q_tokens_per_head_k, num_heads_k, sm_count);
     }
     num_sm_parts = std::max(num_sm_parts, 1);
 
@@ -95,7 +98,8 @@ mha_fwd_kvcache_mla(
     std::optional<at::Tensor> out_,              // optional preallocated output (b, s_q, h_q, head_size_v)
     std::optional<at::Tensor> lse_,              // optional preallocated lse (b, h_q, s_q), fp32
     std::optional<at::Tensor> workspace_,        // optional preallocated workspace (bytes >= get_mla_workspace_bytes)
-    std::optional<at::Tensor> kv_scale_          // per-token fp32 dequant scale for quantized KV (unused for native KV)
+    std::optional<at::Tensor> kv_scale_,         // per-token fp32 dequant scale [num_blocks, page_block_size] (quantized KV only)
+    std::optional<std::string> kv_dtype_         // "fp8" | "int8" when kcache is a uint8 tensor [num_blocks, page, 640]
 ) {
     auto dprops = at::cuda::getCurrentDeviceProperties();
     bool is_sm8x = dprops->major == 8 && dprops->minor >= 0;
@@ -104,16 +108,29 @@ mha_fwd_kvcache_mla(
     TORCH_CHECK(impl == "v2" || impl == "legacy" || impl == "legacy_ws", "impl must be one of 'v2', 'legacy', 'legacy_ws'");
     const bool use_v2 = impl == "v2";
 
-    at::Tensor vcache = vcache_.has_value() ? vcache_.value() : kcache;
+    const bool quant = kcache.dtype() == torch::kUInt8;
+    at::Tensor kcache_v = kcache;
+    if (quant) {   // [num_blocks, page, 640] bytes -> [num_blocks, page, 1, 640]
+        TORCH_CHECK(impl == "v2", "quantized KV cache needs impl='v2'");
+        TORCH_CHECK(!vcache_.has_value(), "quantized KV cache: K and V share the cache");
+        TORCH_CHECK(kcache.dim() == 3 || kcache.dim() == 4, "quantized k_cache must be [num_blocks, page, 640] (or with a unit head dim)");
+        kcache_v = kcache.dim() == 3 ? kcache.unsqueeze(2) : kcache;
+        TORCH_CHECK(kv_scale_.has_value() && kv_dtype_.has_value(), "quantized KV cache needs kv_scale and kv_dtype ('fp8' or 'int8')");
+        TORCH_CHECK(kv_dtype_.value() == "fp8" || kv_dtype_.value() == "int8", "kv_dtype must be 'fp8' or 'int8'");
+    } else {
+        TORCH_CHECK(!kv_scale_.has_value() && (!kv_dtype_.has_value() || kv_dtype_.value() == "native"), "kv_scale/kv_dtype only apply to a quantized (uint8) k_cache");
+    }
+    const at::Tensor &kc = kcache_v;
+    at::Tensor vcache = vcache_.has_value() ? vcache_.value() : kc;
 
     auto q_dtype = q.dtype();
-    TORCH_CHECK(kcache.dtype() == q_dtype, "query and key must have the same dtype");
-    TORCH_CHECK(!kv_scale_.has_value(), "quantized KV cache is not supported yet");
+    if (!quant) TORCH_CHECK(kc.dtype() == q_dtype, "query and key must have the same dtype");
+    TORCH_CHECK(q_dtype == torch::kBFloat16 || q_dtype == torch::kHalf || !use_v2, "impl='v2' needs a bf16/fp16 query");
 
-    CHECK_DEVICE(q); CHECK_DEVICE(kcache); CHECK_DEVICE(vcache);
+    CHECK_DEVICE(q); CHECK_DEVICE(kc); CHECK_DEVICE(vcache);
 
     TORCH_CHECK(q.stride(-1) == 1, "Input tensor must have contiguous last dimension");
-    TORCH_CHECK(kcache.stride(-1) == 1, "Input tensor must have contiguous last dimension");
+    TORCH_CHECK(kc.stride(-1) == 1, "Input tensor must have contiguous last dimension");
     TORCH_CHECK(vcache.stride(-1) == 1, "Input tensor must have contiguous last dimension");
 
     CHECK_DEVICE(block_table);
@@ -129,9 +146,9 @@ mha_fwd_kvcache_mla(
     TORCH_CHECK(head_size_v % 32 == 0, "head_size_v should be a multiple of 32");
 
     const int max_num_blocks_per_seq = block_table.size(1);
-    const int num_blocks = kcache.size(0);
-    const int page_block_size = kcache.size(1);
-    const int num_heads_k = kcache.size(2);
+    const int num_blocks = kc.size(0);
+    const int page_block_size = kc.size(1);
+    const int num_heads_k = kc.size(2);
     TORCH_CHECK(batch_size > 0, "batch size must be postive");
     TORCH_CHECK(num_heads_ori % num_heads_k == 0, "Number of heads in key/value must divide number of heads in query");
 
@@ -143,9 +160,9 @@ mha_fwd_kvcache_mla(
     q = q.view({batch_size, seqlen_q_ori, num_heads_k, ngroups, head_size}).transpose(2, 3)
             .reshape({batch_size, seqlen_q, num_heads, head_size});
 
-    int head_size_k = head_size;
+    int head_size_k = quant ? 640 : head_size;
     CHECK_SHAPE(q, batch_size, seqlen_q, num_heads, head_size);
-    CHECK_SHAPE(kcache, num_blocks, page_block_size, num_heads_k, head_size_k);
+    CHECK_SHAPE(kc, num_blocks, page_block_size, num_heads_k, head_size_k);
     if (vcache_.has_value()) { CHECK_SHAPE(vcache, num_blocks, page_block_size, num_heads_k, head_size_v); }
     CHECK_SHAPE(block_table, batch_size, max_num_blocks_per_seq);
 
@@ -205,21 +222,21 @@ mha_fwd_kvcache_mla(
     params.scale_softmax_log2 = float(softmax_scale * M_LOG2E);
     // Set the pointers and strides.
     params.q_ptr = q.data_ptr();
-    params.k_ptr = kcache.data_ptr();
+    params.k_ptr = kc.data_ptr();
     params.v_ptr = vcache.data_ptr();
     params.o_ptr = out.data_ptr();
     params.softmax_lse_ptr = softmax_lse.data_ptr();
     // All stride are in elements, not bytes.
     params.q_batch_stride = q.stride(0);
-    params.k_batch_stride = kcache.stride(0);
+    params.k_batch_stride = kc.stride(0);
     params.v_batch_stride = vcache.stride(0);
     params.o_batch_stride = out.stride(0);
     params.q_row_stride = q.stride(-3);
-    params.k_row_stride = kcache.stride(-3);
+    params.k_row_stride = kc.stride(-3);
     params.v_row_stride = vcache.stride(-3);
     params.o_row_stride = out.stride(-3);
     params.q_head_stride = q.stride(-2);
-    params.k_head_stride = kcache.stride(-2);
+    params.k_head_stride = kc.stride(-2);
     params.v_head_stride = vcache.stride(-2);
     params.o_head_stride = out.stride(-2);
 
@@ -265,13 +282,24 @@ mha_fwd_kvcache_mla(
         TORCH_CHECK(page_block_size == 16 || page_block_size == 32 || page_block_size == 64,
                     "impl='v2' supports page_block_size 16/32/64");
         TORCH_CHECK(q.stride(-3) % 2 == 0 && reinterpret_cast<uintptr_t>(q.data_ptr()) % 4 == 0, "q rows must be 4-byte aligned");
-        TORCH_CHECK(kcache.stride(-3) % 8 == 0 && kcache.stride(0) % 8 == 0 && reinterpret_cast<uintptr_t>(kcache.data_ptr()) % 16 == 0,
-                    "k_cache rows must be 16-byte aligned");
+        TORCH_CHECK(reinterpret_cast<uintptr_t>(kc.data_ptr()) % 16 == 0, "k_cache must be 16-byte aligned");
+        if (quant) {
+            const at::Tensor &ks = kv_scale_.value();
+            CHECK_DEVICE(ks);
+            TORCH_CHECK(ks.dtype() == torch::kFloat && ks.is_contiguous(), "kv_scale must be a contiguous float32 tensor");
+            CHECK_SHAPE(ks, num_blocks, page_block_size);
+            TORCH_CHECK(kc.stride(-3) == 640 && kc.stride(0) % 128 == 0 && kc.stride(0) == (int64_t)page_block_size * 640, "quantized k_cache must be contiguous [num_blocks, page, 640]");
+            TORCH_CHECK(q.stride(-3) % 4 == 0 && reinterpret_cast<uintptr_t>(q.data_ptr()) % 8 == 0, "quantized path: q rows must be 8-byte aligned");
+            params.kv_scale_ptr = ks.data_ptr<float>();
+            params.kv_dtype = kv_dtype_.value() == "fp8" ? kKVFp8E4m3 : kKVInt8;
+        } else {
+            TORCH_CHECK(kc.stride(-3) % 8 == 0 && kc.stride(0) % 8 == 0, "k_cache rows must be 16-byte aligned");
+        }
         TORCH_CHECK(out.stride(-3) % 2 == 0 && reinterpret_cast<uintptr_t>(out.data_ptr()) % 4 == 0, "out rows must be 4-byte aligned");
         if (q_dtype == torch::kBFloat16) {
-            mla_sm86::mla_sm86_run<__nv_bfloat16>(params, stream);
+            if (quant) mla_sm86::mla_sm86_run_q<__nv_bfloat16>(params, stream); else mla_sm86::mla_sm86_run<__nv_bfloat16>(params, stream);
         } else if (q_dtype == torch::kHalf) {
-            mla_sm86::mla_sm86_run<__half>(params, stream);
+            if (quant) mla_sm86::mla_sm86_run_q<__half>(params, stream); else mla_sm86::mla_sm86_run<__half>(params, stream);
         } else {
             TORCH_CHECK(false, "Unsupported tensor dtype for query");
         }
@@ -334,8 +362,8 @@ mha_fwd_kvcache_mla(
 std::string sm86_config(const int num_q_tokens_per_head_k, const int page_block_size) {
     const auto p = mla_sm86::pick_plan(num_q_tokens_per_head_k, page_block_size);
     char buf[256];
-    std::snprintf(buf, sizeof(buf), "bm=%d nt=%d stages=%d ctas_per_sm=%d spec=%d fuse_max_splits=%d sched_ov=%d sched_min_blocks=%d",
-                  p.bm, p.nt, p.ns, p.minb, (int)p.spec, mla_sm86::fuse_max_splits_default(), mla_sm86::sched_overhead_blocks(),
+    std::snprintf(buf, sizeof(buf), "bm=%d nt=%d stages=%d ctas_per_sm=%d spec=%d pipe=%d fuse_max_splits=%d sched_ov=%d sched_min_blocks=%d",
+                  p.bm, p.nt, p.ns, p.minb, (int)p.spec, (int)p.pipe, mla_sm86::fuse_max_splits_default(), mla_sm86::sched_overhead_blocks(),
                   mla_sm86::sched_min_blocks_per_part());
     return std::string(buf);
 }

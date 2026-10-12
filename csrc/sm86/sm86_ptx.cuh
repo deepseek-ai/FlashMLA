@@ -52,6 +52,12 @@ __device__ __forceinline__ void cp_async_mbar_arrive_noinc(uint32_t addr) {
     asm volatile("cp.async.mbarrier.arrive.noinc.shared.b64 [%0];\n" ::"r"(addr) : "memory");
 }
 
+__device__ __forceinline__ float2 lds_f2(uint32_t addr) {
+    float2 v;
+    asm volatile("ld.shared.v2.f32 {%0, %1}, [%2];\n" : "=f"(v.x), "=f"(v.y) : "r"(addr) : "memory");
+    return v;
+}
+
 __device__ __forceinline__ void bar_sync(int id, int nthreads) {
     asm volatile("bar.sync %0, %1;\n" ::"r"(id), "r"(nthreads) : "memory");
 }

@@ -11,12 +11,15 @@
 //      v2b (kSpec = true) : one producer warp issues cp.async and signals tile arrival with
 //                           cp.async.mbarrier.arrive; consumers wait on full/empty mbarriers, so the M-groups
 //                           run decoupled and the producer prefetches across batch-segment boundaries.
+//      v2c (kPipe = true) : v2a data path, but software-pipelined inside a warp: QK(n+1) is issued before softmax(n)
+//                           and PV(n); the S exchange uses a split-phase mbarrier so its wait overlaps the PV MMAs.
 //  * Persistent scheduler: blockIdx.z indexes tile_scheduler_metadata (same format as the legacy kernels).
 //  * Split-KV partials (fp32 O + LSE) are merged by a separate combine kernel.
 #pragma once
 
 #include <cstdio>
 #include <cstdlib>
+#include <type_traits>
 
 #include "sm86_ptx.cuh"
 #include "../flash_mla.h"
@@ -47,7 +50,7 @@ __device__ __forceinline__ unsigned long long mla_gtime() {
 #endif
 constexpr int kFuseCap = 8;   // compile-time bound on the splits handled by the fused (last-arriver) combine
 
-template <typename T_, int BM_, int NT_, int NS_, int MINB_ = 1, bool SPEC_ = false>
+template <typename T_, int BM_, int NT_, int NS_, int MINB_ = 1, bool SPEC_ = false, bool PIPE_ = false>
 struct Cfg {
     using T = T_;
     static constexpr int kBM = BM_;
@@ -55,6 +58,7 @@ struct Cfg {
     static constexpr int kConsWarps = kGroups * 4;
     static constexpr int kConsThreads = kConsWarps * 32;
     static constexpr bool kSpec = SPEC_;
+    static constexpr bool kPipe = PIPE_;
     static constexpr int kNThreads = kConsThreads + (SPEC_ ? 32 : 0);
     static constexpr int kNt = NT_;
     static constexpr int kNT8 = NT_ / 8;
@@ -65,10 +69,12 @@ struct Cfg {
     static constexpr int kSBytes = kGroups * 4 * kNT8 * 32 * 16;   // partial-S exchange buffer (one)
     static constexpr int kSBufs = SPEC_ ? 2 : 1;
     static constexpr int kBarOff = kRingBytes + kSBufs * kSBytes;
-    static constexpr int kSmem = kBarOff + (SPEC_ ? 2 * NS_ * 8 : 0);
+    static constexpr int kSmem = kBarOff + (SPEC_ ? 2 * NS_ * 8 : 0) + (PIPE_ ? kGroups * 8 : 0);
     static_assert(BM_ == 16 || BM_ == 32, "BM must be 16 or 32");
     static_assert(NT_ == 16 || NT_ == 32, "Nt must be 16 or 32");
     static_assert(NS_ >= 2 && NS_ <= 8, "need 2..8 stages");
+    static_assert(!(SPEC_ && PIPE_), "v2b and v2c are exclusive");
+    static_assert(!PIPE_ || NS_ >= 3, "v2c needs >= 3 stages");
 };
 
 // ---------------------------------------------------------------------------------------------------------
@@ -90,19 +96,13 @@ __device__ __forceinline__ void issue_tile_copy(uint32_t dst, const T *src, int6
 }
 
 // ---------------------------------------------------------------------------------------------------------
-// One KV tile of one consumer warp: S partial -> exchange -> softmax -> PV.
+// Stages of one KV tile for one consumer warp:  QK partial -> exchange -> mask -> softmax -> PV.
 // ---------------------------------------------------------------------------------------------------------
+// S partial = Q[:, slice j] * K^T[slice j, tile]  (fp32 accumulators in C-fragment layout)
 template <typename C, typename ET>
-__device__ __forceinline__ void compute_tile(
-    const uint32_t sbase, const int tok0, float4 *sS_mine, const float4 *sS_grp, const int grp,
-    const uint32_t kq_off, const uint32_t (&vq_off)[4], const int t, const float sl2,
-    const uint32_t (&qf)[9][4], float (&acc_o)[16][4], float &m0, float &m1, float &l0, float &l1,
-    const int lim0, const int lim1, const int mask_min) {
+__device__ __forceinline__ void qk_stage(const uint32_t sbase, const uint32_t kq_off, const uint32_t (&qf)[9][4], float (&sacc)[C::kNT8][4]) {
     constexpr int NT = C::kNt;
     constexpr int NT8 = C::kNT8;
-
-    // ---- S partial = Q[:, slice j] * K^T[slice j, tile] ----
-    float sacc[NT8][4];
 #pragma unroll
     for (int nt = 0; nt < NT8; ++nt) { sacc[nt][0] = sacc[nt][1] = sacc[nt][2] = sacc[nt][3] = 0.f; }
 #pragma unroll
@@ -115,13 +115,19 @@ __device__ __forceinline__ void compute_tile(
             ET::mma(sacc[2 * np + 1], qf[i], b[2], b[3]);
         }
     }
-#pragma unroll
-    for (int nt = 0; nt < NT8; ++nt)
-        sS_mine[nt * 32] = make_float4(sacc[nt][0], sacc[nt][1], sacc[nt][2], sacc[nt][3]);
-    bar_sync(1 + grp, 128);
+}
 
-    // ---- S = sum of the 4 partials (fixed order => bit-identical in all 4 warps) ----
-    float s[NT8][4];
+template <typename C>
+__device__ __forceinline__ void exch_store(float4 *sS_mine, const float (&sacc)[C::kNT8][4]) {
+#pragma unroll
+    for (int nt = 0; nt < C::kNT8; ++nt)
+        sS_mine[nt * 32] = make_float4(sacc[nt][0], sacc[nt][1], sacc[nt][2], sacc[nt][3]);
+}
+
+// S = sum of the 4 partials in a fixed order => bit-identical in all 4 warps of the group
+template <typename C>
+__device__ __forceinline__ void exch_sum(const float4 *sS_grp, float (&s)[C::kNT8][4]) {
+    constexpr int NT8 = C::kNT8;
 #pragma unroll
     for (int nt = 0; nt < NT8; ++nt) {
         const float4 p0 = sS_grp[(0 * NT8 + nt) * 32];
@@ -133,11 +139,14 @@ __device__ __forceinline__ void compute_tile(
         s[nt][2] = ((p0.z + p1.z) + p2.z) + p3.z;
         s[nt][3] = ((p0.w + p1.w) + p2.w) + p3.w;
     }
+}
 
-    // ---- masking (only tiles that cross the sequence end / causal diagonal) ----
-    if (tok0 + NT > mask_min) {
+// masking: only tiles that cross the sequence end / causal diagonal
+template <typename C>
+__device__ __forceinline__ void mask_stage(float (&s)[C::kNT8][4], const int tok0, const int t, const int lim0, const int lim1, const int mask_min) {
+    if (tok0 + C::kNt > mask_min) {
 #pragma unroll
-        for (int nt = 0; nt < NT8; ++nt) {
+        for (int nt = 0; nt < C::kNT8; ++nt) {
             const int c = tok0 + nt * 8 + 2 * t;
             if (c >= lim0) s[nt][0] = -INFINITY;
             if (c + 1 >= lim0) s[nt][1] = -INFINITY;
@@ -145,8 +154,13 @@ __device__ __forceinline__ void compute_tile(
             if (c + 1 >= lim1) s[nt][3] = -INFINITY;
         }
     }
+}
 
-    // ---- online softmax (log2 domain) ----
+// online softmax (log2 domain); rescales acc_o and converts P into bf16/fp16 A fragments (no smem round trip)
+template <typename C, typename ET, bool kScaled = false>
+__device__ __forceinline__ void softmax_stage(float (&s)[C::kNT8][4], const float sl2, float &m0, float &m1, float &l0, float &l1,
+                                              float (&acc_o)[16][4], uint32_t (&pa)[C::kNt / 16][4], const float (*sc)[2] = nullptr) {
+    constexpr int NT8 = C::kNT8;
     float mx0 = -INFINITY, mx1 = -INFINITY;
 #pragma unroll
     for (int nt = 0; nt < NT8; ++nt) {
@@ -181,23 +195,54 @@ __device__ __forceinline__ void compute_tile(
         acc_o[i][0] *= sc0; acc_o[i][1] *= sc0;
         acc_o[i][2] *= sc1; acc_o[i][3] *= sc1;
     }
-
-    // ---- O[:, V cols 128j..128j+127] += P * V ----
 #pragma unroll
-    for (int kc = 0; kc < NT / 16; ++kc) {
-        uint32_t pa[4];
-        pa[0] = ET::pack(s[2 * kc][0], s[2 * kc][1]);
-        pa[1] = ET::pack(s[2 * kc][2], s[2 * kc][3]);
-        pa[2] = ET::pack(s[2 * kc + 1][0], s[2 * kc + 1][1]);
-        pa[3] = ET::pack(s[2 * kc + 1][2], s[2 * kc + 1][3]);
+    for (int kc = 0; kc < C::kNt / 16; ++kc) {
+        if constexpr (kScaled) {   // quantized KV: P * per-token scale (the row sums above use the unscaled P)
+            pa[kc][0] = ET::pack(s[2 * kc][0] * sc[2 * kc][0], s[2 * kc][1] * sc[2 * kc][1]);
+            pa[kc][1] = ET::pack(s[2 * kc][2] * sc[2 * kc][0], s[2 * kc][3] * sc[2 * kc][1]);
+            pa[kc][2] = ET::pack(s[2 * kc + 1][0] * sc[2 * kc + 1][0], s[2 * kc + 1][1] * sc[2 * kc + 1][1]);
+            pa[kc][3] = ET::pack(s[2 * kc + 1][2] * sc[2 * kc + 1][0], s[2 * kc + 1][3] * sc[2 * kc + 1][1]);
+        } else {
+            pa[kc][0] = ET::pack(s[2 * kc][0], s[2 * kc][1]);
+            pa[kc][1] = ET::pack(s[2 * kc][2], s[2 * kc][3]);
+            pa[kc][2] = ET::pack(s[2 * kc + 1][0], s[2 * kc + 1][1]);
+            pa[kc][3] = ET::pack(s[2 * kc + 1][2], s[2 * kc + 1][3]);
+        }
+    }
+}
+
+// O[:, V cols 128j..128j+127] += P * V
+template <typename C, typename ET>
+__device__ __forceinline__ void pv_stage(const uint32_t (&pa)[C::kNt / 16][4], const uint32_t sbase, const uint32_t (&vq_off)[4], float (&acc_o)[16][4]) {
+#pragma unroll
+    for (int kc = 0; kc < C::kNt / 16; ++kc) {
 #pragma unroll
         for (int np = 0; np < 8; ++np) {
             uint32_t b[4];
             ldsm_x4_trans(b, sbase + vq_off[np & 3] + (np >> 2) * 128 + kc * 16 * kRowBytes);
-            ET::mma(acc_o[2 * np], pa, b[0], b[1]);
-            ET::mma(acc_o[2 * np + 1], pa, b[2], b[3]);
+            ET::mma(acc_o[2 * np], pa[kc], b[0], b[1]);
+            ET::mma(acc_o[2 * np + 1], pa[kc], b[2], b[3]);
         }
     }
+}
+
+// v2a / v2b: one tile start to finish (S exchange through a blocking named barrier)
+template <typename C, typename ET>
+__device__ __forceinline__ void compute_tile(
+    const uint32_t sbase, const int tok0, float4 *sS_mine, const float4 *sS_grp, const int grp,
+    const uint32_t kq_off, const uint32_t (&vq_off)[4], const int t, const float sl2,
+    const uint32_t (&qf)[9][4], float (&acc_o)[16][4], float &m0, float &m1, float &l0, float &l1,
+    const int lim0, const int lim1, const int mask_min) {
+    float sacc[C::kNT8][4];
+    qk_stage<C, ET>(sbase, kq_off, qf, sacc);
+    exch_store<C>(sS_mine, sacc);
+    bar_sync(1 + grp, 128);
+    float s[C::kNT8][4];
+    exch_sum<C>(sS_grp, s);
+    mask_stage<C>(s, tok0, t, lim0, lim1, mask_min);
+    uint32_t pa[C::kNt / 16][4];
+    softmax_stage<C, ET>(s, sl2, m0, m1, l0, l1, acc_o, pa);
+    pv_stage<C, ET>(pa, sbase, vq_off, acc_o);
 }
 
 // ---------------------------------------------------------------------------------------------------------
@@ -269,6 +314,7 @@ mla_decode_kernel(const __grid_constant__ Flash_fwd_mla_params params) {
     constexpr int NT8 = C::kNT8;
     constexpr int NS = C::kStages;
     constexpr bool SPEC = C::kSpec;
+    constexpr bool PIPE = C::kPipe;
 
     extern __shared__ __align__(128) unsigned char smem_buf[];
     const uint32_t ring_u32 = smem_u32(smem_buf);
@@ -290,6 +336,10 @@ mla_decode_kernel(const __grid_constant__ Flash_fwd_mla_params params) {
     const int begin_idx = md.x, begin_seqlen = md.y, end_idx = md.z, end_seqlen = md.w;
     if (begin_idx >= params.b) return;
 
+    if constexpr (PIPE) {
+        if (tid < C::kGroups) mbar_init(bar_u32 + tid * 8, 128);   // S-exchange barrier of M-group `tid`: 128 thread arrivals / phase
+        __syncthreads();
+    }
     if constexpr (SPEC) {
         if (tid == 0) {
 #pragma unroll
@@ -330,6 +380,7 @@ mla_decode_kernel(const __grid_constant__ Flash_fwd_mla_params params) {
     // v2b: ring position (global across segments): slot index and fill-round
     int gslot = 0, ground = 0;
     int sbuf = 0;   // S exchange buffer parity (v2b)
+    int xph = 0;    // exchange count (v2c): mbarrier phase parity
 
 #pragma unroll 1
     for (int batch_id = begin_idx; batch_id <= end_idx; ++batch_id) {
@@ -416,6 +467,61 @@ mla_decode_kernel(const __grid_constant__ Flash_fwd_mla_params params) {
         float m0 = -INFINITY, m1 = -INFINITY, l0 = 0.f, l1 = 0.f;
 
         int rd_slot = 0, wr_slot = NS - 1;
+        if constexpr (PIPE) {
+            // ---------------- v2c: software-pipelined tile loop ----------------
+            const uint32_t xbar = bar_u32 + grp * 8;
+            if (n_tiles > 0) {
+                float s[NT8][4];
+                {   // S(0)
+                    float sacc[NT8][4];
+                    cp_async_wait<NS - 2>();
+                    __syncthreads();
+                    qk_stage<C, ET>(ring_u32, kq_off, qf, sacc);
+                    exch_store<C>(sS_mine_base, sacc);
+                    mbar_arrive(xbar);
+                    mbar_wait(xbar, xph & 1); ++xph;
+                    exch_sum<C>(sS_grp_base, s);
+                    mask_stage<C>(s, tok_begin, t, lim0, lim1, mask_min);
+                }
+                auto step = [&](auto has_next, int n) {
+                    constexpr bool HN = decltype(has_next)::value;
+                    float sacc[NT8][4];
+                    const int nrd = (rd_slot + 1 == NS) ? 0 : rd_slot + 1;
+                    if constexpr (HN) {
+                        cp_async_wait<NS - 3>();   // tile n+1 landed
+                        __syncthreads();           // ... for every thread; slot (n-1) is free for the prefetch
+                        {
+                            const int pg_cur = pg_pending;
+                            pg_pending = load_pg(n + NS);
+                            if (n + NS - 1 < n_tiles) {
+                                const int tok_p = tok_begin + (n + NS - 1) * NT;
+                                const T *src = kbase + (int64_t)pg_cur * k_batch_stride + (int64_t)(tok_p & ps_mask) * k_row_stride;
+                                issue_tile_copy<NT, C::kNThreads>(ring_u32 + wr_slot * C::kStageBytes, src, k_row_stride, tok_p, seqlen_k, tid);
+                            }
+                        }
+                        cp_async_commit();
+                        qk_stage<C, ET>(ring_u32 + nrd * C::kStageBytes, kq_off, qf, sacc);   // QK(n+1)
+                    }
+                    uint32_t pa[NT / 16][4];
+                    softmax_stage<C, ET>(s, sl2, m0, m1, l0, l1, acc_o, pa);                    // softmax(n)
+                    if constexpr (HN) {
+                        exch_store<C>(sS_mine_base, sacc);
+                        mbar_arrive(xbar);
+                    }
+                    pv_stage<C, ET>(pa, ring_u32 + rd_slot * C::kStageBytes, vq_off, acc_o);   // PV(n)
+                    if constexpr (HN) {
+                        mbar_wait(xbar, xph & 1); ++xph;
+                        exch_sum<C>(sS_grp_base, s);
+                        mask_stage<C>(s, tok_begin + (n + 1) * NT, t, lim0, lim1, mask_min);
+                    }
+                    rd_slot = nrd;
+                    wr_slot = (wr_slot + 1 == NS) ? 0 : wr_slot + 1;
+                };
+#pragma unroll 1
+                for (int n = 0; n + 1 < n_tiles; ++n) step(std::true_type{}, n);
+                step(std::false_type{}, n_tiles - 1);
+            }
+        } else {
 #pragma unroll 1
         for (int n = 0; n < n_tiles; ++n) {
             const int tok0 = tok_begin + n * NT;
@@ -447,6 +553,7 @@ mla_decode_kernel(const __grid_constant__ Flash_fwd_mla_params params) {
                 if (++gslot == NS) { gslot = 0; ++ground; }
                 sbuf ^= 1;
             }
+        }
         }
 
         MLA_TRACE_FIRST(3, batch_id == begin_idx);
@@ -748,24 +855,32 @@ void mla_sm86_run(Flash_fwd_mla_params &p, cudaStream_t stream) {
     if (p.combine_counters == nullptr || plan.spec) p.fuse_max_splits = 0;   // v2b has no fused combine
     if (p.fuse_max_splits > kFuseCap) p.fuse_max_splits = kFuseCap;
 
-#define MLA_SM86_CASE(BM_, NT_, NS_, MB_, SP_)                                                             \
-    if (plan.bm == BM_ && plan.nt == NT_ && plan.ns == NS_ && plan.minb == MB_ && plan.spec == SP_) {      \
-        launch_main<Cfg<T, BM_, NT_, NS_, MB_, SP_>>(p, stream);                                           \
+#define MLA_SM86_CASE(BM_, NT_, NS_, MB_, SP_, PI_)                                                        \
+    if (plan.bm == BM_ && plan.nt == NT_ && plan.ns == NS_ && plan.minb == MB_ && plan.spec == SP_ && plan.pipe == PI_) { \
+        launch_main<Cfg<T, BM_, NT_, NS_, MB_, SP_, PI_>>(p, stream);                                      \
         launched = true;                                                                                   \
     }
     bool launched = false;
     // v2a
-    MLA_SM86_CASE(16, 16, 3, 1, false)
-    MLA_SM86_CASE(16, 16, 4, 1, false)
-    MLA_SM86_CASE(32, 16, 3, 1, false)
-    MLA_SM86_CASE(32, 16, 4, 1, false)
-    MLA_SM86_CASE(16, 16, 2, 2, false)
-    MLA_SM86_CASE(16, 32, 2, 1, false)
-    MLA_SM86_CASE(32, 32, 2, 1, false)
+    MLA_SM86_CASE(16, 16, 3, 1, false, false)
+    MLA_SM86_CASE(16, 16, 4, 1, false, false)
+    MLA_SM86_CASE(32, 16, 3, 1, false, false)
+    MLA_SM86_CASE(32, 16, 4, 1, false, false)
+    MLA_SM86_CASE(16, 16, 2, 2, false, false)
+    MLA_SM86_CASE(16, 32, 2, 1, false, false)
+    MLA_SM86_CASE(32, 32, 2, 1, false, false)
     // v2b (BM=32 / 2-CTA-per-SM variants spill: the 9th warp lowers the per-thread register cap to 168, so they are not instantiated)
-    MLA_SM86_CASE(16, 16, 3, 1, true)
-    MLA_SM86_CASE(16, 16, 4, 1, true)
-    MLA_SM86_CASE(16, 32, 2, 1, true)
+    MLA_SM86_CASE(16, 16, 3, 1, true, false)
+    MLA_SM86_CASE(16, 16, 4, 1, true, false)
+    MLA_SM86_CASE(16, 32, 2, 1, true, false)
+    // v2c
+    MLA_SM86_CASE(16, 16, 3, 1, false, true)
+    MLA_SM86_CASE(16, 16, 4, 1, false, true)
+    MLA_SM86_CASE(16, 16, 5, 1, false, true)
+    MLA_SM86_CASE(32, 16, 3, 1, false, true)
+    MLA_SM86_CASE(32, 16, 4, 1, false, true)
+    MLA_SM86_CASE(16, 32, 3, 1, false, true)
+    MLA_SM86_CASE(32, 32, 3, 1, false, true)
 #undef MLA_SM86_CASE
     FLASH_ASSERT(launched);
 

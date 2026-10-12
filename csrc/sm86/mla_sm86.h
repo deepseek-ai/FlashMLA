@@ -11,7 +11,8 @@ namespace mla_sm86 {
 
 struct Plan {
     int bm, nt, ns, minb;   // rows per CTA, tokens per KV tile, smem ring stages, CTAs per SM
-    bool spec;              // false: v2a (all warps cp.async + CTA barrier); true: v2b (producer warp + mbarriers)
+    bool spec;              // v2b: producer warp + mbarriers
+    bool pipe;              // v2c: software-pipelined tile loop
 };
 
 // Compile-time defaults (override with -DFLASH_MLA_SM86_<NAME>=..., e.g. through the FLASH_MLA_DEFINES env var of setup.py)
@@ -34,6 +35,9 @@ struct Plan {
 #ifndef FLASH_MLA_SM86_SPEC          // 1 = v2b (producer warp + mbarriers)
 #define FLASH_MLA_SM86_SPEC 0
 #endif
+#ifndef FLASH_MLA_SM86_PIPE          // 1 = v2c (software-pipelined tile loop)
+#define FLASH_MLA_SM86_PIPE 0
+#endif
 #ifndef FLASH_MLA_SM86_FUSE          // max splits merged by the fused last-arriver combine (0 = always use the combine kernel)
 #define FLASH_MLA_SM86_FUSE 0
 #endif
@@ -50,7 +54,7 @@ inline int env_int(const char *name, int dflt) {
 }
 
 // Config selection by the number of rows M = s_q * h_q / h_k (shared by the kernel launcher and the metadata builder).
-// FLASH_MLA_SM86_CFG="bm,nt,ns[,minb[,spec]]" overrides the whole plan at run time.
+// FLASH_MLA_SM86_CFG="bm,nt,ns[,minb[,spec[,pipe]]]" overrides the whole plan at run time.
 inline Plan pick_plan(int M, int page_size) {
     Plan p;
     p.bm = (M <= 16) ? FLASH_MLA_SM86_BM_SMALL : FLASH_MLA_SM86_BM_LARGE;
@@ -58,12 +62,45 @@ inline Plan pick_plan(int M, int page_size) {
     p.ns = FLASH_MLA_SM86_NS;
     p.minb = FLASH_MLA_SM86_MINB;
     p.spec = FLASH_MLA_SM86_SPEC != 0;
+    p.pipe = FLASH_MLA_SM86_PIPE != 0;
     if (const char *e = std::getenv("FLASH_MLA_SM86_CFG")) {
-        int bm, nt, ns, mb = 1, sp = 0;
-        if (std::sscanf(e, "%d,%d,%d,%d,%d", &bm, &nt, &ns, &mb, &sp) >= 3) { p.bm = bm; p.nt = nt; p.ns = ns; p.minb = mb; p.spec = sp != 0; }
+        int bm, nt, ns, mb = 1, sp = 0, pi = 0;
+        if (std::sscanf(e, "%d,%d,%d,%d,%d,%d", &bm, &nt, &ns, &mb, &sp, &pi) >= 3) {
+            p.bm = bm; p.nt = nt; p.ns = ns; p.minb = mb; p.spec = sp != 0; p.pipe = pi != 0;
+        }
     }
     if (p.nt > page_size) p.nt = page_size;
     return p;
+}
+
+// Quantized-KV kernels (fp8 e4m3 / int8): rows per CTA, ring stages, CTAs per SM.
+struct PlanQ {
+    int bm, ns, minb;
+};
+#ifndef FLASH_MLA_SM86_QNS            // ring stages of the quantized kernels
+#define FLASH_MLA_SM86_QNS 4
+#endif
+#ifndef FLASH_MLA_SM86_QMINB          // CTAs per SM of the quantized kernels with BM=16
+#define FLASH_MLA_SM86_QMINB 1
+#endif
+// FLASH_MLA_SM86_QCFG="bm,ns,minb" overrides at run time.
+inline PlanQ pick_plan_q(int M) {
+    PlanQ p;
+    p.bm = (M <= 16) ? 16 : 32;
+    p.ns = p.bm == 16 ? FLASH_MLA_SM86_QNS : 3;
+    p.minb = p.bm == 16 ? FLASH_MLA_SM86_QMINB : 1;
+    if (const char *e = std::getenv("FLASH_MLA_SM86_QCFG")) {
+        int bm, ns, mb = 1;
+        if (std::sscanf(e, "%d,%d,%d", &bm, &ns, &mb) >= 2) { p.bm = bm; p.ns = ns; p.minb = mb; }
+    }
+    return p;
+}
+
+inline int num_sm_parts_for_q(int M, int h_k, int sm_count) {
+    const PlanQ p = pick_plan_q(M);
+    const int num_m_blocks = (M + p.bm - 1) / p.bm;
+    const int parts = sm_count * p.minb / h_k / num_m_blocks;
+    return parts < 1 ? 1 : parts;
 }
 
 inline int num_sm_parts_for(int M, int h_k, int sm_count) {
@@ -84,9 +121,12 @@ inline int sched_overhead_blocks() { return env_int("FLASH_MLA_SM86_OV", FLASH_M
 inline int sched_min_blocks_per_part() { return env_int("FLASH_MLA_SM86_MINBLK", FLASH_MLA_SM86_MINBLK); }
 constexpr int kMaxSplitsPerBatch = 256;
 
-// Defined in mla_decode_sm86_{bf16,fp16}.cu.  T = __nv_bfloat16 / __half.
+// Defined in mla_decode_sm86_{bf16,fp16}.cu / mla_decode_sm86_q_{bf16,fp16}.cu.  T = __nv_bfloat16 / __half.
 template <typename T>
 void mla_sm86_run(Flash_fwd_mla_params &params, cudaStream_t stream);
+// quantized KV cache (params.kv_dtype = kKVFp8E4m3 / kKVInt8, params.kv_scale_ptr)
+template <typename T>
+void mla_sm86_run_q(Flash_fwd_mla_params &params, cudaStream_t stream);
 
 // Workspace layout (bytes) used by the split-KV partials.
 struct WorkspaceLayout {

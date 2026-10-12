@@ -9,12 +9,14 @@ def get_mla_metadata(
     cache_seqlens: torch.Tensor,
     num_q_tokens_per_head_k: int,
     num_heads_k: int,
+    kv_dtype: Optional[str] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Arguments:
         cache_seqlens: (batch_size), dtype torch.int32.
         num_q_tokens_per_head_k: Equals to seq_len_q * num_heads_q // num_heads_k.
         num_heads_k: num_heads_k.
+        kv_dtype: optional hint, "fp8" / "int8" when the KV cache is quantized (the kernels use a different CTA count per SM).
 
     Returns:
         tile_scheduler_metadata: (num_sm_parts, TileSchedulerMetaDataSize), dtype torch.int32.
@@ -23,7 +25,7 @@ def get_mla_metadata(
     Computed fully on the device (no host sync), so it can be captured in a CUDA Graph; the shapes depend only on
     (batch_size, num_q_tokens_per_head_k, num_heads_k).
     """
-    return flash_mla_cuda.get_mla_metadata(cache_seqlens, num_q_tokens_per_head_k, num_heads_k)
+    return flash_mla_cuda.get_mla_metadata(cache_seqlens, num_q_tokens_per_head_k, num_heads_k, kv_dtype)
 
 
 def get_mla_workspace_bytes(
@@ -68,6 +70,7 @@ def flash_mla_with_kvcache(
     workspace: Optional[torch.Tensor] = None,
     impl: str = "v2",
     kv_scale: Optional[torch.Tensor] = None,
+    kv_dtype: Optional[str] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Arguments:
@@ -86,7 +89,8 @@ def flash_mla_with_kvcache(
             call allocates nothing and never synchronises with the host (CUDA-Graph safe).
         impl: "v2" (default; sm86-optimised kernels), "legacy" (the original sm80 kernel) or "legacy_ws"
             (the original warp-specialised sm80 kernel).
-        kv_scale: per-token fp32 dequant scales of a quantized KV cache (docs/kv_quant_format.md).
+        kv_scale: per-token fp32 dequant scales (num_blocks, page_block_size) of a quantized KV cache (docs/kv_quant_format.md).
+        kv_dtype: "fp8" or "int8" when k_cache is the uint8 tensor (num_blocks, page_block_size, 640) of a quantized cache.
 
     Returns:
         out: (batch_size, seq_len_q, num_heads_q, head_dim_v).
@@ -110,5 +114,6 @@ def flash_mla_with_kvcache(
         lse,
         workspace,
         kv_scale,
+        kv_dtype,
     )
     return out, softmax_lse
