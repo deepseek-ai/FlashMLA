@@ -39,15 +39,15 @@ get_mla_metadata(
     auto options = seqlens_k.options();
 
     int sm_count = dprops->multiProcessorCount;
-    int block_size_n, fixed_overhead_num_blocks, num_sm_parts;
+    int block_size_n, fixed_overhead_num_blocks, num_sm_parts, min_blocks_per_part = 0;
     if (is_sm90) {   // original sm90 scheduling constants
         block_size_n = 64;
         fixed_overhead_num_blocks = 5;
         num_sm_parts = sm_count / num_heads_k / cutlass::ceil_div(num_q_tokens_per_head_k, 32);
     } else {
-        block_size_n = mla_sm86::kSchedGranule;
-        fixed_overhead_num_blocks = 2;
-        if (const char *e = std::getenv("FLASH_MLA_SM86_OV")) { fixed_overhead_num_blocks = std::atoi(e); }
+        block_size_n = mla_sm86::sched_granule(num_q_tokens_per_head_k);
+        fixed_overhead_num_blocks = mla_sm86::sched_overhead_blocks();
+        min_blocks_per_part = mla_sm86::sched_min_blocks_per_part();
         num_sm_parts = mla_sm86::num_sm_parts_for(num_q_tokens_per_head_k, num_heads_k, sm_count);
     }
     num_sm_parts = std::max(num_sm_parts, 1);
@@ -67,6 +67,7 @@ get_mla_metadata(
     params.block_size_n = block_size_n;
     params.fixed_overhead_num_blocks = fixed_overhead_num_blocks;
     params.num_sm_parts = num_sm_parts;
+    params.min_blocks_per_part = min_blocks_per_part;
     get_mla_metadata_func(params, stream);
 
     return {tile_scheduler_metadata, num_splits};
@@ -244,6 +245,7 @@ mha_fwd_kvcache_mla(
         params.softmax_lseaccum_ptr = base + lay.lseaccum_off;
         params.workspace = base;
         params.combine_counters = reinterpret_cast<int *>(base + lay.counters_off);
+        params.fuse_max_splits = mla_sm86::fuse_max_splits_default();
         if (!lse_direct && use_v2 && lse_.has_value()) params.softmax_lse_ptr = base + lay.lsetmp_off;   // staged, then copied into lse
     } else {
         softmax_lse_accum = torch::empty({batch_size + num_sm_parts, num_heads, seqlen_q}, opts.dtype(at::kFloat));
@@ -328,9 +330,20 @@ mha_fwd_kvcache_mla(
     return {out, softmax_lse};
 }
 
+// Human-readable description of the sm86 kernel configuration chosen for a problem (compile-time defaults + env overrides).
+std::string sm86_config(const int num_q_tokens_per_head_k, const int page_block_size) {
+    const auto p = mla_sm86::pick_plan(num_q_tokens_per_head_k, page_block_size);
+    char buf[256];
+    std::snprintf(buf, sizeof(buf), "bm=%d nt=%d stages=%d ctas_per_sm=%d spec=%d fuse_max_splits=%d sched_ov=%d sched_min_blocks=%d",
+                  p.bm, p.nt, p.ns, p.minb, (int)p.spec, mla_sm86::fuse_max_splits_default(), mla_sm86::sched_overhead_blocks(),
+                  mla_sm86::sched_min_blocks_per_part());
+    return std::string(buf);
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.doc() = "FlashMLA";
     m.def("get_mla_metadata", &get_mla_metadata);
     m.def("get_mla_workspace_bytes", &get_mla_workspace_bytes);
+    m.def("sm86_config", &sm86_config);
     m.def("fwd_kvcache_mla", &mha_fwd_kvcache_mla);
 }

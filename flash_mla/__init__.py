@@ -5,4 +5,5 @@ from .flash_mla_interface import (
     flash_mla_with_kvcache,
     get_mla_workspace_bytes,
     alloc_mla_workspace,
+    sm86_config,
 )

@@ -31,6 +31,22 @@ constexpr int kRowBytes = kD * 2;               // 1152 B per token row (native 
 constexpr int kChunksPerRow = kRowBytes / 16;   // 72 16-byte chunks
 constexpr int kMaxSplits = 256;
 
+// Optional per-CTA timeline (debug builds only, -DMLA_SM86_TRACE): globaltimer stamps of the first segment of each part.
+#ifdef MLA_SM86_TRACE
+__device__ unsigned long long g_mla_trace[1024 * 8];
+__device__ __forceinline__ unsigned long long mla_gtime() {
+    unsigned long long t;
+    asm volatile("mov.u64 %0, %%globaltimer;\n" : "=l"(t));
+    return t;
+}
+#define MLA_TRACE(slot) do { if (threadIdx.x == 0) g_mla_trace[blockIdx.z * 8 + (slot)] = mla_gtime(); } while (0)
+#define MLA_TRACE_FIRST(slot, cond) do { if ((cond) && threadIdx.x == 0) g_mla_trace[blockIdx.z * 8 + (slot)] = mla_gtime(); } while (0)
+#else
+#define MLA_TRACE(slot) do {} while (0)
+#define MLA_TRACE_FIRST(slot, cond) do {} while (0)
+#endif
+constexpr int kFuseCap = 8;   // compile-time bound on the splits handled by the fused (last-arriver) combine
+
 template <typename T_, int BM_, int NT_, int NS_, int MINB_ = 1, bool SPEC_ = false>
 struct Cfg {
     using T = T_;
@@ -185,6 +201,63 @@ __device__ __forceinline__ void compute_tile(
 }
 
 // ---------------------------------------------------------------------------------------------------------
+// Fused split-KV combine, executed by the last-arriving CTA of a (batch, head, m-block): merges the nsp <= kFuseCap
+// partials of every valid row in split-index order (deterministic whatever the arrival order).
+// ---------------------------------------------------------------------------------------------------------
+template <typename C, typename ET>
+__device__ __forceinline__ void fused_combine(const Flash_fwd_mla_params &params, int batch_id, int bidh, int m_block, int nsp, int split_offset) {
+    using T = typename C::T;
+    constexpr int NTH = C::kConsThreads;
+    constexpr int kRowsPerPass = NTH / 128;
+    const int tid = threadIdx.x;
+    const int c = tid & 127, rg = tid >> 7;
+    const int M = params.seqlen_q, hh = params.h;
+    const float *lse_acc = reinterpret_cast<const float *>(params.softmax_lseaccum_ptr);
+    const float *o_acc = reinterpret_cast<const float *>(params.oaccum_ptr);
+#pragma unroll 4
+    for (int rl = rg; rl < C::kBM; rl += kRowsPerPass) {
+        const int row = m_block * C::kBM + rl;
+        if (row >= M) continue;
+        float4 v[kFuseCap];
+        float lv[kFuseCap];
+#pragma unroll
+        for (int sidx = 0; sidx < kFuseCap; ++sidx) {
+            if (sidx < nsp) {
+                const int64_t slot = (int64_t)(split_offset + sidx) * hh + bidh;
+                lv[sidx] = __ldcg(lse_acc + slot * M + row);
+                v[sidx] = __ldcg(reinterpret_cast<const float4 *>(o_acc + (slot * M + row) * kDV + c * 4));
+            } else {
+                lv[sidx] = -INFINITY;
+                v[sidx] = make_float4(0.f, 0.f, 0.f, 0.f);
+            }
+        }
+        float mx = -INFINITY;
+#pragma unroll
+        for (int sidx = 0; sidx < kFuseCap; ++sidx) mx = fmaxf(mx, lv[sidx]);
+        const float mxs = (mx == -INFINITY) ? 0.f : mx;
+        float sum = 0.f;
+#pragma unroll
+        for (int sidx = 0; sidx < kFuseCap; ++sidx) sum += (sidx < nsp) ? expf(lv[sidx] - mxs) : 0.f;
+        const float glse = (sum == 0.f || sum != sum) ? INFINITY : logf(sum) + mxs;
+        float4 acc = make_float4(0.f, 0.f, 0.f, 0.f);
+#pragma unroll
+        for (int sidx = 0; sidx < kFuseCap; ++sidx) {
+            if (sidx < nsp) {
+                const float w = expf(lv[sidx] - glse);
+                acc.x += w * v[sidx].x; acc.y += w * v[sidx].y; acc.z += w * v[sidx].z; acc.w += w * v[sidx].w;
+            }
+        }
+        T *o = reinterpret_cast<T *>(params.o_ptr) + (int64_t)batch_id * params.o_batch_stride + (int64_t)bidh * params.o_head_stride +
+               (int64_t)row * params.o_row_stride + c * 4;
+        uint2 pk;
+        pk.x = ET::pack(acc.x, acc.y);
+        pk.y = ET::pack(acc.z, acc.w);
+        *reinterpret_cast<uint2 *>(o) = pk;
+        if (c == 0) reinterpret_cast<float *>(params.softmax_lse_ptr)[((int64_t)batch_id * hh + bidh) * M + row] = glse;
+    }
+}
+
+// ---------------------------------------------------------------------------------------------------------
 // Main kernel
 // ---------------------------------------------------------------------------------------------------------
 template <typename C>
@@ -202,6 +275,7 @@ mla_decode_kernel(const __grid_constant__ Flash_fwd_mla_params params) {
     float4 *sS_all = reinterpret_cast<float4 *>(smem_buf + C::kRingBytes);
     const uint32_t bar_u32 = smem_u32(smem_buf + C::kBarOff);   // full[NS], empty[NS] (v2b only)
 
+    MLA_TRACE(0);
     const int tid = threadIdx.x;
     const int warp = tid >> 5, lane = tid & 31;
     const bool is_producer = SPEC && (warp == C::kConsWarps);
@@ -211,7 +285,8 @@ mla_decode_kernel(const __grid_constant__ Flash_fwd_mla_params params) {
 
     const int *meta = params.tile_scheduler_metadata_ptr + part * TileSchedulerMetaDataSize;
     const int4 md = __ldg(reinterpret_cast<const int4 *>(meta));
-    const int begin_n_split_idx = __ldg(meta + 4);
+    const int4 md2 = __ldg(reinterpret_cast<const int4 *>(meta + 4));
+    const int begin_n_split_idx = md2.x;
     const int begin_idx = md.x, begin_seqlen = md.y, end_idx = md.z, end_seqlen = md.w;
     if (begin_idx >= params.b) return;
 
@@ -258,7 +333,7 @@ mla_decode_kernel(const __grid_constant__ Flash_fwd_mla_params params) {
 
 #pragma unroll 1
     for (int batch_id = begin_idx; batch_id <= end_idx; ++batch_id) {
-        const int seqlen_k = __ldg(params.cu_seqlens_k + batch_id);
+        const int seqlen_k = (batch_id == begin_idx) ? md2.y : __ldg(params.cu_seqlens_k + batch_id);
         const int tok_begin = (batch_id == begin_idx) ? begin_seqlen : 0;
         const int tok_end = (batch_id == end_idx) ? min(end_seqlen, seqlen_k) : seqlen_k;
         const int n_split_idx = (batch_id == begin_idx) ? begin_n_split_idx : 0;
@@ -325,6 +400,7 @@ mla_decode_kernel(const __grid_constant__ Flash_fwd_mla_params params) {
             pg_pending = pgv[NS - 1];
         }
 
+        MLA_TRACE_FIRST(1, batch_id == begin_idx);
         // per-row causal / split column limits (absolute token index; col >= limit is masked)
         int lim0 = tok_end, lim1 = tok_end;
         int mask_min = tok_end;
@@ -346,6 +422,7 @@ mla_decode_kernel(const __grid_constant__ Flash_fwd_mla_params params) {
             if constexpr (!SPEC) {
                 cp_async_wait<NS - 2>();
                 __syncthreads();
+                MLA_TRACE_FIRST(2, batch_id == begin_idx && n == 0);
                 {
                     const int pg_cur = pg_pending;
                     pg_pending = load_pg(n + NS);   // consumed one iteration later: hides the load latency
@@ -372,6 +449,7 @@ mla_decode_kernel(const __grid_constant__ Flash_fwd_mla_params params) {
             }
         }
 
+        MLA_TRACE_FIRST(3, batch_id == begin_idx);
         // ---- epilogue ----
         l0 += __shfl_xor_sync(0xffffffffu, l0, 1);
         l0 += __shfl_xor_sync(0xffffffffu, l0, 2);
@@ -413,21 +491,98 @@ mla_decode_kernel(const __grid_constant__ Flash_fwd_mla_params params) {
                 if (rv0) la[row0] = lse0;
                 if (rv1) la[row1] = lse1;
             }
+            if constexpr (!SPEC) {
+                const int nsp = __ldg(params.num_splits_ptr + batch_id + 1) - split_offset;
+                if (params.combine_counters != nullptr && nsp <= params.fuse_max_splits) {   // CTA-uniform
+                    __shared__ int s_last;
+                    __threadfence();
+                    __syncthreads();
+                    if (tid == 0) {
+                        int *cnt = params.combine_counters + ((int64_t)batch_id * hh + bidh) * ((M + 15) / 16) + m_block;
+                        const int prev = atomicAdd(cnt, 1);
+                        const int last = (prev == nsp - 1);
+                        if (last) *cnt = 0;   // self-reset: valid for the next call / graph replay
+                        s_last = last;
+                    }
+                    __syncthreads();
+                    if (s_last) {
+                        __threadfence();
+                        fused_combine<C, ET>(params, batch_id, bidh, m_block, nsp, split_offset);
+                    }
+                    __syncthreads();   // s_last is reused by the next segment
+                }
+            }
         }
     }
+    MLA_TRACE(5);
     if constexpr (SPEC) {
         if (is_producer) cp_async_wait<0>();
     }
 }
 
 // ---------------------------------------------------------------------------------------------------------
-// Separate split-KV combine kernel: one CTA (128 threads) per (batch, head, row).
+// Separate split-KV combine kernels.  Result = sum_s exp(lse_s - lse) * O_s, accumulated in split-index order (the
+// reduction tree depends only on nsp => deterministic).  Rows whose splits were merged by the fused path (or that have
+// a single split) return immediately.
+//   kWide  (few rows):  one CTA per (row, quarter of the 512 columns); 16 split-groups x 32 float4 columns.  All
+//                       partial-O loads are issued before the LSE normalisation is known, one round for nsp <= 64.
+//   kWarp  (many rows): one warp per row (lane owns 4 float4 columns), 8 rows per CTA.
 // ---------------------------------------------------------------------------------------------------------
+constexpr int kCombineThreads = 512;
+constexpr int kCombineWarpThreads = 256;
+
+__device__ __forceinline__ bool combine_skip(const Flash_fwd_mla_params &params, int nsp) {
+    return nsp <= 1 || (params.combine_counters != nullptr && nsp <= params.fuse_max_splits);
+}
+
+// LSE part: lanes of one warp compute glse and write the split weights into sScale (visible after __syncwarp).
+__device__ __forceinline__ void combine_weights(const Flash_fwd_mla_params &params, int lane, int nsp, int split_offset, int hs, int hs_idx,
+                                                int out_idx, float *sScale, bool write_lse) {
+    const float *lse_acc = reinterpret_cast<const float *>(params.softmax_lseaccum_ptr) + (int64_t)split_offset * hs + hs_idx;
+    constexpr int kPer = kMaxSplits / 32;   // 8 splits per lane at most
+    float lv[kPer];
+#pragma unroll
+    for (int i = 0; i < kPer; ++i) {
+        const int sp = lane + 32 * i;
+        lv[i] = (sp < nsp) ? __ldcg(lse_acc + (int64_t)sp * hs) : -INFINITY;
+    }
+    float mx = -INFINITY;
+#pragma unroll
+    for (int i = 0; i < kPer; ++i) mx = fmaxf(mx, lv[i]);
+#pragma unroll
+    for (int o = 16; o >= 1; o >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, o));
+    const float mxs = (mx == -INFINITY) ? 0.f : mx;
+    float sum = 0.f;
+#pragma unroll
+    for (int i = 0; i < kPer; ++i) sum += expf(lv[i] - mxs);
+#pragma unroll
+    for (int o = 16; o >= 1; o >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, o);
+    const float glse = (sum == 0.f || sum != sum) ? INFINITY : logf(sum) + mxs;
+    if (write_lse && lane == 0) reinterpret_cast<float *>(params.softmax_lse_ptr)[out_idx] = glse;
+#pragma unroll
+    for (int i = 0; i < kPer; ++i) {
+        const int sp = lane + 32 * i;
+        if (sp < nsp) sScale[sp] = expf(lv[i] - glse);
+    }
+}
+
 template <typename T>
-__global__ void __launch_bounds__(128)
-mla_combine_kernel(const __grid_constant__ Flash_fwd_mla_params params) {
+__device__ __forceinline__ void combine_store4(const Flash_fwd_mla_params &params, int batch_idx, int head_idx, int row, int col, float4 r) {
+    using ET = ElemTraits<T>;
+    T *o = reinterpret_cast<T *>(params.o_ptr) + (int64_t)batch_idx * params.o_batch_stride + (int64_t)head_idx * params.o_head_stride +
+           (int64_t)row * params.o_row_stride + col;
+    uint2 pk;
+    pk.x = ET::pack(r.x, r.y);
+    pk.y = ET::pack(r.z, r.w);
+    *reinterpret_cast<uint2 *>(o) = pk;
+}
+
+template <typename T>
+__global__ void __launch_bounds__(kCombineThreads)
+mla_combine_wide_kernel(const __grid_constant__ Flash_fwd_mla_params params) {
     const int tid = threadIdx.x;
-    const int bidx = blockIdx.x;
+    const int grp = tid >> 5, c = tid & 31;   // 16 split groups x 32 float4 columns
+    const int bidx = blockIdx.x >> 2, quarter = blockIdx.x & 3;
     const int M = params.seqlen_q;
     const int hs = params.h * M;
     const int batch_idx = bidx / hs;
@@ -435,69 +590,132 @@ mla_combine_kernel(const __grid_constant__ Flash_fwd_mla_params params) {
 
     const int split_offset = __ldg(params.num_splits_ptr + batch_idx);
     const int nsp = __ldg(params.num_splits_ptr + batch_idx + 1) - split_offset;
-    if (nsp <= 1) return;
+    if (combine_skip(params, nsp)) return;
     FLASH_DEVICE_ASSERT(nsp <= kMaxSplits);
 
     __shared__ float sScale[kMaxSplits];
-    const float *lse_acc = reinterpret_cast<const float *>(params.softmax_lseaccum_ptr) + (int64_t)split_offset * hs + hs_idx;
+    __shared__ float4 sAcc[16][32];
 
-    if (tid < 32) {
-        constexpr int kPer = kMaxSplits / 32;   // 8 splits per lane at most
-        float lv[kPer];
+    const int64_t sstride = (int64_t)hs * kDV;
+    const float *oa = reinterpret_cast<const float *>(params.oaccum_ptr) + ((int64_t)split_offset * hs + hs_idx) * kDV + quarter * 128 + c * 4;
+
+    constexpr int kChunk = 4;   // splits per group per round: nsp <= 64 in one round
+    float4 v[kChunk];
 #pragma unroll
-        for (int i = 0; i < kPer; ++i) {
-            const int s = tid + 32 * i;
-            lv[i] = (s < nsp) ? __ldcg(lse_acc + (int64_t)s * hs) : -INFINITY;
-        }
-        float mx = -INFINITY;
-#pragma unroll
-        for (int i = 0; i < kPer; ++i) mx = fmaxf(mx, lv[i]);
-#pragma unroll
-        for (int o = 16; o >= 1; o >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, o));
-        const float mxs = (mx == -INFINITY) ? 0.f : mx;
-        float sum = 0.f;
-#pragma unroll
-        for (int i = 0; i < kPer; ++i) sum += expf(lv[i] - mxs);
-#pragma unroll
-        for (int o = 16; o >= 1; o >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, o);
-        const float glse = (sum == 0.f || sum != sum) ? INFINITY : logf(sum) + mxs;
-        if (tid == 0) reinterpret_cast<float *>(params.softmax_lse_ptr)[bidx] = glse;
-#pragma unroll
-        for (int i = 0; i < kPer; ++i) {
-            const int s = tid + 32 * i;
-            if (s < nsp) sScale[s] = expf(lv[i] - glse);
-        }
+    for (int u = 0; u < kChunk; ++u) {
+        const int sp = grp + 16 * u;
+        v[u] = (sp < nsp) ? __ldcg(reinterpret_cast<const float4 *>(oa + (int64_t)sp * sstride)) : make_float4(0.f, 0.f, 0.f, 0.f);
     }
+    if (tid < 32) combine_weights(params, tid, nsp, split_offset, hs, hs_idx, bidx, sScale, quarter == 0);
     __syncthreads();
 
-    const float *oa = reinterpret_cast<const float *>(params.oaccum_ptr) + ((int64_t)split_offset * hs + hs_idx) * kDV + tid * 4;
-    const int64_t sstride = (int64_t)hs * kDV;
     float4 acc = make_float4(0.f, 0.f, 0.f, 0.f);
-    int sp = 0;
-    for (; sp + 8 <= nsp; sp += 8) {   // 8 independent loads in flight, accumulation order stays 0..nsp-1
-        float4 v[8];
+    for (int base = 0; base < nsp; base += 16 * kChunk) {
 #pragma unroll
-        for (int u = 0; u < 8; ++u) v[u] = __ldcg(reinterpret_cast<const float4 *>(oa + (int64_t)(sp + u) * sstride));
+        for (int u = 0; u < kChunk; ++u) {
+            const int sp = base + grp + 16 * u;
+            if (sp < nsp) {
+                const float w = sScale[sp];
+                acc.x += w * v[u].x; acc.y += w * v[u].y; acc.z += w * v[u].z; acc.w += w * v[u].w;
+            }
+        }
+        if (base + 16 * kChunk < nsp) {
 #pragma unroll
-        for (int u = 0; u < 8; ++u) {
-            const float w = sScale[sp + u];
-            acc.x += w * v[u].x; acc.y += w * v[u].y; acc.z += w * v[u].z; acc.w += w * v[u].w;
+            for (int u = 0; u < kChunk; ++u) {
+                const int sp = base + 16 * kChunk + grp + 16 * u;
+                v[u] = (sp < nsp) ? __ldcg(reinterpret_cast<const float4 *>(oa + (int64_t)sp * sstride)) : make_float4(0.f, 0.f, 0.f, 0.f);
+            }
         }
     }
-    for (; sp < nsp; ++sp) {
-        const float4 v = __ldcg(reinterpret_cast<const float4 *>(oa + (int64_t)sp * sstride));
-        const float w = sScale[sp];
-        acc.x += w * v.x; acc.y += w * v.y; acc.z += w * v.z; acc.w += w * v.w;
+    sAcc[grp][c] = acc;
+    __syncthreads();
+    if (tid < 32) {
+        float4 r = sAcc[0][tid];
+#pragma unroll
+        for (int g2 = 1; g2 < 16; ++g2) {
+            const float4 a = sAcc[g2][tid];
+            r.x += a.x; r.y += a.y; r.z += a.z; r.w += a.w;
+        }
+        const int head_idx = hs_idx / M;
+        const int row = hs_idx - head_idx * M;
+        combine_store4<T>(params, batch_idx, head_idx, row, quarter * 128 + tid * 4, r);
+    }
+}
+
+template <typename T>
+__global__ void __launch_bounds__(kCombineWarpThreads)
+mla_combine_warp_kernel(const __grid_constant__ Flash_fwd_mla_params params) {
+    const int tid = threadIdx.x;
+    const int warp = tid >> 5, lane = tid & 31;
+    const int bidx = blockIdx.x * (kCombineWarpThreads / 32) + warp;
+    const int M = params.seqlen_q;
+    const int hs = params.h * M;
+    if (bidx >= params.b * hs) return;   // whole warp
+    const int batch_idx = bidx / hs;
+    const int hs_idx = bidx - batch_idx * hs;
+
+    const int split_offset = __ldg(params.num_splits_ptr + batch_idx);
+    const int nsp = __ldg(params.num_splits_ptr + batch_idx + 1) - split_offset;
+    if (combine_skip(params, nsp)) return;   // warp-uniform
+    FLASH_DEVICE_ASSERT(nsp <= kMaxSplits);
+
+    __shared__ float sScaleAll[kCombineWarpThreads / 32][kMaxSplits];
+    float *sScale = sScaleAll[warp];
+
+    const int64_t sstride = (int64_t)hs * kDV;
+    const float *oa = reinterpret_cast<const float *>(params.oaccum_ptr) + ((int64_t)split_offset * hs + hs_idx) * kDV + lane * 4;
+
+    constexpr int kChunk = 5;   // splits per round (5 x 4 columns = 20 float4 loads in flight per lane)
+    float4 v[kChunk][4];
+#pragma unroll
+    for (int u = 0; u < kChunk; ++u)
+#pragma unroll
+        for (int ci = 0; ci < 4; ++ci)
+            v[u][ci] = (u < nsp) ? __ldcg(reinterpret_cast<const float4 *>(oa + (int64_t)u * sstride + ci * 128)) : make_float4(0.f, 0.f, 0.f, 0.f);
+    combine_weights(params, lane, nsp, split_offset, hs, hs_idx, bidx, sScale, true);
+    __syncwarp();
+
+    float4 acc[4];
+#pragma unroll
+    for (int ci = 0; ci < 4; ++ci) acc[ci] = make_float4(0.f, 0.f, 0.f, 0.f);
+    for (int base = 0; base < nsp; base += kChunk) {
+#pragma unroll
+        for (int u = 0; u < kChunk; ++u) {
+            if (base + u < nsp) {
+                const float w = sScale[base + u];
+#pragma unroll
+                for (int ci = 0; ci < 4; ++ci) {
+                    acc[ci].x += w * v[u][ci].x; acc[ci].y += w * v[u][ci].y; acc[ci].z += w * v[u][ci].z; acc[ci].w += w * v[u][ci].w;
+                }
+            }
+        }
+        if (base + kChunk < nsp) {
+#pragma unroll
+            for (int u = 0; u < kChunk; ++u)
+#pragma unroll
+                for (int ci = 0; ci < 4; ++ci)
+                    v[u][ci] = (base + kChunk + u < nsp)
+                                   ? __ldcg(reinterpret_cast<const float4 *>(oa + (int64_t)(base + kChunk + u) * sstride + ci * 128))
+                                   : make_float4(0.f, 0.f, 0.f, 0.f);
+        }
     }
     const int head_idx = hs_idx / M;
     const int row = hs_idx - head_idx * M;
-    T *o = reinterpret_cast<T *>(params.o_ptr) + (int64_t)batch_idx * params.o_batch_stride + (int64_t)head_idx * params.o_head_stride +
-           (int64_t)row * params.o_row_stride + tid * 4;
-    using ET = ElemTraits<T>;
-    uint2 pk;
-    pk.x = ET::pack(acc.x, acc.y);
-    pk.y = ET::pack(acc.z, acc.w);
-    *reinterpret_cast<uint2 *>(o) = pk;
+#pragma unroll
+    for (int ci = 0; ci < 4; ++ci) combine_store4<T>(params, batch_idx, head_idx, row, ci * 128 + lane * 4, acc[ci]);
+}
+
+template <typename T>
+void launch_combine(Flash_fwd_mla_params &p, cudaStream_t stream) {
+    const int rows = p.b * p.h * p.seqlen_q;
+    const char *mode = std::getenv("FLASH_MLA_SM86_COMBINE");   // "wide" | "warp" | unset = auto
+    const bool wide = mode ? (mode[0] == 'w' && mode[1] == 'i') : (rows <= 64);
+    if (wide) {
+        mla_combine_wide_kernel<T><<<rows * 4, kCombineThreads, 0, stream>>>(p);
+    } else {
+        mla_combine_warp_kernel<T><<<(rows + kCombineWarpThreads / 32 - 1) / (kCombineWarpThreads / 32), kCombineWarpThreads, 0, stream>>>(p);
+    }
+    CHECK_CUDA_KERNEL_LAUNCH();
 }
 
 // ---------------------------------------------------------------------------------------------------------
@@ -527,6 +745,8 @@ void mla_sm86_run(Flash_fwd_mla_params &p, cudaStream_t stream) {
     FLASH_ASSERT((p.k_row_stride % 8) == 0 && (p.k_batch_stride % 8) == 0);
     FLASH_ASSERT(p.kv_dtype == kKVNative);
     const Plan plan = pick_plan(p.seqlen_q, p.page_block_size);
+    if (p.combine_counters == nullptr || plan.spec) p.fuse_max_splits = 0;   // v2b has no fused combine
+    if (p.fuse_max_splits > kFuseCap) p.fuse_max_splits = kFuseCap;
 
 #define MLA_SM86_CASE(BM_, NT_, NS_, MB_, SP_)                                                             \
     if (plan.bm == BM_ && plan.nt == NT_ && plan.ns == NS_ && plan.minb == MB_ && plan.spec == SP_) {      \
@@ -549,8 +769,7 @@ void mla_sm86_run(Flash_fwd_mla_params &p, cudaStream_t stream) {
 #undef MLA_SM86_CASE
     FLASH_ASSERT(launched);
 
-    mla_combine_kernel<T><<<p.b * p.h * p.seqlen_q, 128, 0, stream>>>(p);
-    CHECK_CUDA_KERNEL_LAUNCH();
+    launch_combine<T>(p, stream);
 }
 
 }  // namespace mla_sm86

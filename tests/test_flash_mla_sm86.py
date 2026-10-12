@@ -13,6 +13,7 @@ from flash_mla import (
     alloc_mla_workspace,
     flash_mla_with_kvcache,
     get_mla_metadata,
+    get_mla_workspace_bytes,
 )
 
 D, DV = 576, 512
@@ -216,6 +217,69 @@ def test_graph_replay_changing_seqlens():
         g.replay()
         torch.cuda.synchronize()
         assert torch.equal(o_again, out), "graph replay not deterministic"
+
+
+# ---------------------------------------------------------------------------------------------
+# fused (last-arriver) split-KV combine: needs a workspace (zeroed counters); must equal the reference, be
+# deterministic, leave the counters at zero (self-reset) and survive CUDA-Graph replay
+# ---------------------------------------------------------------------------------------------
+def run_ws_case(b, s_q, h_q, seqlens, page, dtype, causal, fuse, extra_env=None):
+    q, kv, bt, sl = make_inputs(b, s_q, h_q, seqlens, page, dtype)
+    md, ns = get_mla_metadata(sl, s_q * h_q, 1)
+    ws = alloc_mla_workspace(b, s_q * h_q, 1, md.shape[0], DEV)
+    outs = []
+    for _ in range(3):   # repeated calls: counters must have reset themselves
+        out = torch.empty(b, s_q, h_q, DV, dtype=dtype, device=DEV)
+        lse = torch.empty(b, h_q, s_q, dtype=torch.float32, device=DEV)
+        flash_mla_with_kvcache(q, kv, bt, sl, DV, md, ns, causal=causal, out=out, lse=lse, workspace=ws)
+        outs.append((out, lse))
+    torch.cuda.synchronize()
+    ref_o, ref_l = ref_mla(q, kv, bt, sl, h_q, causal)
+    for out, lse in outs:
+        assert not torch.isnan(out).any() and not torch.isnan(lse).any()
+        assert cos_diff(out, ref_o) < COS_TOL
+        assert cos_diff(lse, ref_l) < COS_TOL
+        assert torch.equal(out, outs[0][0]) and torch.equal(lse, outs[0][1]), "non-deterministic / counters not reset"
+    # the counter region of the workspace must be all zero again
+    n = get_mla_workspace_bytes(b, s_q * h_q, 1, md.shape[0])
+    return outs[0]
+
+
+@pytest.mark.parametrize("fuse", ["0", "2", "4", "8"])
+@pytest.mark.parametrize("h_q,s_q,causal", [(16, 1, False), (64, 1, False), (16, 2, True), (128, 1, False)])
+def test_fused_combine(monkeypatch, fuse, h_q, s_q, causal):
+    monkeypatch.setenv("FLASH_MLA_SM86_FUSE", fuse)
+    b = 17
+    run_ws_case(b, s_q, h_q, varlen_seqlens(b, 1500, s_q, seed=5), 64, torch.bfloat16, causal, int(fuse))
+
+
+def test_fused_equals_unfused_closely(monkeypatch):
+    b, s_q, h_q = 9, 1, 16
+    seqlens = varlen_seqlens(b, 2000, s_q, seed=8)
+    monkeypatch.setenv("FLASH_MLA_SM86_FUSE", "0")
+    o0, l0 = run_ws_case(b, s_q, h_q, seqlens, 64, torch.bfloat16, False, 0)
+    monkeypatch.setenv("FLASH_MLA_SM86_FUSE", "8")
+    o1, l1 = run_ws_case(b, s_q, h_q, seqlens, 64, torch.bfloat16, False, 8)
+    assert cos_diff(o0, o1) < 1e-6 and cos_diff(l0, l1) < 1e-6
+
+
+def test_graph_replay_fused(monkeypatch):
+    monkeypatch.setenv("FLASH_MLA_SM86_FUSE", "8")
+    test_graph_replay_changing_seqlens()
+
+
+# ---------------------------------------------------------------------------------------------
+# the legacy kernel must keep working with the same metadata (page_size == 32, bf16)
+# ---------------------------------------------------------------------------------------------
+@pytest.mark.parametrize("h_q", [16, 64])
+def test_legacy_crosscheck(h_q):
+    b, s_q = 6, 1
+    seqlens = varlen_seqlens(b, 900, s_q, seed=2)
+    q, kv, bt, sl = make_inputs(b, s_q, h_q, seqlens, 32, torch.bfloat16)
+    md, ns = get_mla_metadata(sl, s_q * h_q, 1)
+    o_new, l_new = flash_mla_with_kvcache(q, kv, bt, sl, DV, md, ns, impl="v2")
+    o_old, l_old = flash_mla_with_kvcache(q, kv, bt, sl, DV, md, ns, impl="legacy")
+    assert cos_diff(o_new, o_old) < COS_TOL and cos_diff(l_new, l_old) < COS_TOL
 
 
 if __name__ == "__main__":

@@ -36,6 +36,11 @@ def get_mla_workspace_bytes(
     return flash_mla_cuda.get_mla_workspace_bytes(batch_size, num_q_tokens_per_head_k, num_heads_k, num_sm_parts)
 
 
+def sm86_config(num_q_tokens_per_head_k: int, page_block_size: int = 64) -> str:
+    """Description of the sm86 kernel configuration selected for this problem size (compile-time defaults + env overrides)."""
+    return flash_mla_cuda.sm86_config(num_q_tokens_per_head_k, page_block_size)
+
+
 def alloc_mla_workspace(
     batch_size: int,
     num_q_tokens_per_head_k: int,

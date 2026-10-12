@@ -47,6 +47,8 @@ struct Flash_fwd_mla_params {
     // Per-(batch, m-block) arrival counters for the fused split-KV combine. Must be all-zero on entry;
     // the last-arriving CTA resets its counter to 0 (stays valid across CUDA Graph replays). nullptr => separate combine kernel.
     int *__restrict__ combine_counters = nullptr;
+    // Fused combine handles batch elements with 2..fuse_max_splits splits (needs combine_counters); more splits use the combine kernel.
+    int fuse_max_splits = 0;
     // Per-token fp32 dequant scale, row-major [num_blocks, page_block_size]; nullptr when kv_dtype == kKVNative.
     // See docs/kv_quant_format.md.
     const float *__restrict__ kv_scale_ptr = nullptr;
@@ -60,7 +62,7 @@ static constexpr int kKVFp8E4m3 = 1;    // 512 latent dims fp8 e4m3 + fp32 per-t
 static constexpr int kKVInt8 = 2;       // 512 latent dims int8     + fp32 per-token scale, 64 rope dims bf16
 
 static constexpr int TileSchedulerMetaDataSize = 8;
-// [begin_idx, begin_seqlen, end_idx, end_seqlen, begin_n_split_idx, _, _, _]
+// [begin_idx, begin_seqlen, end_idx, end_seqlen, begin_n_split_idx, seqlen_k[begin_idx] (sm86 metadata only), _, _]
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -82,6 +84,7 @@ struct Mla_metadata_params {
     int block_size_n;
     int fixed_overhead_num_blocks;
     int num_sm_parts;
+    int min_blocks_per_part;   // >0: use at most total_units / min_blocks_per_part active parts (the rest stay empty)
 };
 
 void get_mla_metadata_func(Mla_metadata_params &params, cudaStream_t stream);
