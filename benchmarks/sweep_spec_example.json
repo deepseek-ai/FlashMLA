@@ -1,0 +1,7 @@
+{
+  "_comment": "Example spec for benchmarks/sweep.py. Names must match the FLASH_MLA_SM86_<NAME> macros read by csrc/sm86 (SK decides the real set).",
+  "grid": {"BM": [16, 32], "NT": [16, 32], "STAGES": [2, 3, 4]},
+  "constraint": "not (BM == 32 and NT == 32 and STAGES == 4)",
+  "extra_defines": "",
+  "configs": {}
+}

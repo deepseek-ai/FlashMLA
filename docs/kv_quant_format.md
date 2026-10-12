@@ -49,6 +49,8 @@ Page `p` starts at `p * page_stride`; the scale of slot `t` of page `p` is at fl
 `amax = max_i |x_i|` over the 512 latent dims (fp32 accumulate of the bf16 input).
 
 * fp8 e4m3: `scale = amax / 448` (448 = max finite e4m3fn); `q_i = cvt_e4m3_rn(x_i / scale)` (saturating).
+* Both divisions (`amax / 448`, `x_i / scale`) are IEEE-754 fp32 divisions rounded to nearest even (`__fdiv_rn`), NOT multiplications by
+  a reciprocal; the torch reference `flash_mla/kv_quant.py` and the CUDA write path agree bit for bit (tests/test_kv_quant.py).
 * int8:     `scale = amax / 127`; `q_i = clamp(rne(x_i / scale), -127, 127)`.
 * if `amax == 0` store `scale = 1.0` and `q = 0`. `scale` is always a finite positive fp32.
 * rope dims are copied as bf16 unchanged.
