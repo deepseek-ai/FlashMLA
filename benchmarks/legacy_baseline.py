@@ -59,7 +59,7 @@ def run_case(b, s_q, s_k, h_q, warp_spec, check):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--ws", default="both", choices=["0", "1", "both"])
+    ap.add_argument("--ws", default="0", choices=["0", "1", "both"])
     ap.add_argument("--out", default=None)
     ap.add_argument("--hq", default="16,128"); ap.add_argument("--b", default="1,64,128"); ap.add_argument("--sk", default="1024,4096,8192")
     a = ap.parse_args()

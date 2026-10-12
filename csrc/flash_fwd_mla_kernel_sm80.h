@@ -1,5 +1,6 @@
 #pragma once
 
+#include <stdexcept>
 #include <cute/tensor.hpp>
 #include <cutlass/cutlass.h>
 #include <cutlass/array.h>
@@ -36,7 +37,8 @@ struct Flash_fwd_kernel_traits_mla {
 
     static constexpr int kNWarps = kNWarps_;
     static constexpr int kNThreads = kNWarps * 32;
-    static constexpr int kNWarpsM = 2;
+    // sm86 legacy fix: a BlockM=16 tile uses a single M-warp (m16 MMA), the original BlockM=32 uses 2.
+    static constexpr int kNWarpsM = kBlockM_ >= 32 ? 2 : 1;
     static constexpr int kNWarpsN = kNWarps / kNWarpsM;
     static_assert(kNWarps == kNWarpsM * kNWarpsN);
 
@@ -706,7 +708,19 @@ struct mha_fwd_splitkv_mla<T, Headdim, false> {
         static_assert(Headdim == 576);
         FLASH_ASSERT(params.d_v == 512);
         FLASH_ASSERT(params.k_ptr == params.v_ptr);  // Shared_KV
-        using Kernel_traits = Flash_fwd_kernel_traits_mla<576, 32, 32, 8, T, 512>;
-        run_flash_splitkv_fwd_mla<Kernel_traits, flash::SharedStorageMLA<Kernel_traits>>(params, stream);
+        // Original tile (BlockM=32, 8 warps) needs ~113 KB of shared memory: fine on A100 (164 KB) but not on sm_86
+        // (99 KB opt-in limit; cudaFuncSetAttribute fails with "invalid argument"). Pick the largest tile that fits.
+        int dev = 0, max_optin = 0;
+        cudaGetDevice(&dev);
+        cudaDeviceGetAttribute(&max_optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev);
+        using Traits32 = Flash_fwd_kernel_traits_mla<576, 32, 32, 8, T, 512>;
+        using Traits16 = Flash_fwd_kernel_traits_mla<576, 16, 32, 4, T, 512>;
+        if (sizeof(flash::SharedStorageMLA<Traits32>) <= (size_t)max_optin) {
+            run_flash_splitkv_fwd_mla<Traits32, flash::SharedStorageMLA<Traits32>>(params, stream);
+        } else if (sizeof(flash::SharedStorageMLA<Traits16>) <= (size_t)max_optin) {
+            run_flash_splitkv_fwd_mla<Traits16, flash::SharedStorageMLA<Traits16>>(params, stream);
+        } else {
+            throw std::runtime_error("legacy sm80 MLA kernel does not fit in shared memory on this device");
+        }
     }
 };
