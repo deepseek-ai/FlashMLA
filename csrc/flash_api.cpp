@@ -194,7 +194,11 @@ mha_fwd_kvcache_mla(
 
     if (q_dtype == torch::kBFloat16) {
         if (is_sm90) {
+#ifndef FLASH_MLA_NO_SM90
             mha_fwd_splitkv_mla<cutlass::bfloat16_t, 576, true>::run(params, stream);
+#else
+            TORCH_CHECK(false, "this build has no sm90 kernels (FLASH_MLA_ARCH=80/86)");
+#endif
         } else if (warp_spec) {
             mha_fwd_splitkv_mla_ws<cutlass::bfloat16_t, 576>::run(params, stream);
         } else {
@@ -204,7 +208,11 @@ mha_fwd_kvcache_mla(
     #ifndef FLASH_MLA_DISABLE_FP16
     else if (q_dtype == torch::kHalf) {
         if (is_sm90) {
+#ifndef FLASH_MLA_NO_SM90
             mha_fwd_splitkv_mla<cutlass::half_t, 576, true>::run(params, stream);
+#else
+            TORCH_CHECK(false, "this build has no sm90 kernels (FLASH_MLA_ARCH=80/86)");
+#endif
         } else {
             TORCH_CHECK(false, "sm80 only support bfloat16");
         }

@@ -40,7 +40,24 @@ struct Flash_fwd_mla_params {
 
     void *__restrict__ softmax_lseaccum_ptr;
     void *__restrict__ oaccum_ptr;
+
+    // ---- Interfaces for the Ampere (sm86) kernels; unused by the legacy sm80/sm90 kernels. ----
+    // Caller-owned persistent scratch (fp32 partial O / LSE for split-KV). nullptr => allocate per call.
+    void *__restrict__ workspace = nullptr;
+    // Per-(batch, m-block) arrival counters for the fused split-KV combine. Must be all-zero on entry;
+    // the last-arriving CTA resets its counter to 0 (stays valid across CUDA Graph replays). nullptr => separate combine kernel.
+    int *__restrict__ combine_counters = nullptr;
+    // Per-token fp32 dequant scale, row-major [num_blocks, page_block_size]; nullptr when kv_dtype == kKVNative.
+    // See docs/kv_quant_format.md.
+    const float *__restrict__ kv_scale_ptr = nullptr;
+    // One of the kKV* values below.
+    int kv_dtype = 0;
 };
+
+// Values for Flash_fwd_mla_params::kv_dtype.
+static constexpr int kKVNative = 0;     // bf16 / fp16 KV cache (D = 576 elements per token)
+static constexpr int kKVFp8E4m3 = 1;    // 512 latent dims fp8 e4m3 + fp32 per-token scale, 64 rope dims bf16
+static constexpr int kKVInt8 = 2;       // 512 latent dims int8     + fp32 per-token scale, 64 rope dims bf16
 
 static constexpr int TileSchedulerMetaDataSize = 8;
 // [begin_idx, begin_seqlen, end_idx, end_seqlen, begin_n_split_idx, _, _, _]

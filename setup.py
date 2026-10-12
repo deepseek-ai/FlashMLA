@@ -95,7 +95,8 @@ def _write_ninja_file(path,
         flags.append(f'cuda_post_cflags = {" ".join(cuda_post_cflags)}')
         cuda_post_cflags_sm80 = [s if s != 'arch=compute_90a,code=sm_90a' else 'arch=compute_80,code=sm_80' for s in cuda_post_cflags]
         flags.append(f'cuda_post_cflags_sm80 = {" ".join(cuda_post_cflags_sm80)}')
-        cuda_post_cflags_sm80_sm90 = cuda_post_cflags + ['-gencode', 'arch=compute_80,code=sm_80']
+        cuda_post_cflags_sm80_sm90 = cuda_post_cflags + (
+            ['-gencode', 'arch=compute_80,code=sm_80'] if 'arch=compute_90a,code=sm_90a' in cuda_post_cflags else [])
         flags.append(f'cuda_post_cflags_sm80_sm90 = {" ".join(cuda_post_cflags_sm80_sm90)}')
         cuda_post_cflags_sm100 = [s if s != 'arch=compute_90a,code=sm_90a' else 'arch=compute_100a,code=sm_100a' for s in cuda_post_cflags]
         flags.append(f'cuda_post_cflags_sm100 = {" ".join(cuda_post_cflags_sm100)}')
@@ -211,6 +212,16 @@ torch.utils.cpp_extension._write_ninja_file = _write_ninja_file
 DISABLE_FP16 = os.getenv("FLASH_MLA_DISABLE_FP16", "FALSE") == "TRUE"
 DEBUG_BUILD = os.getenv("FLASH_MLA_DEBUG", "FALSE") == "TRUE"
 
+# FLASH_MLA_ARCH: ""/"90" -> original build (sm_90a + sm_80 sources).
+#                 "80"/"86" -> Ampere-only build: skips every *_sm90*.cu source, passes
+#                 -gencode arch=compute_<ARCH>,code=sm_<ARCH>, defines FLASH_MLA_NO_SM90 and
+#                 drops the 12.x-only ptxas flag --register-usage-level (nvcc < 12.4 compatible).
+ARCH = os.getenv("FLASH_MLA_ARCH", "")
+assert ARCH in ("", "80", "86", "90"), f"unsupported FLASH_MLA_ARCH={ARCH!r} (use 80, 86 or 90)"
+AMPERE_ONLY = ARCH in ("80", "86")
+# FLASH_MLA_LINEINFO=1 adds -lineinfo (source correlation for ncu) to optimized builds.
+LINEINFO = os.getenv("FLASH_MLA_LINEINFO", "0") == "1"
+
 
 def append_nvcc_threads(nvcc_extra_args):
     nvcc_threads = os.getenv("NVCC_THREADS") or "32"
@@ -222,12 +233,13 @@ def get_sources():
         "csrc/flash_api.cpp",
         "csrc/flash_fwd_mla_bf16_sm80.cu",
         "csrc/flash_fwd_mla_bf16_ws_sm80.cu",
-        "csrc/flash_fwd_mla_bf16_sm90.cu",
         "csrc/flash_fwd_mla_metadata.cu",
     ]
 
-    if not DISABLE_FP16:
-        sources.append("csrc/flash_fwd_mla_fp16_sm90.cu")
+    if not AMPERE_ONLY:
+        sources.append("csrc/flash_fwd_mla_bf16_sm90.cu")
+        if not DISABLE_FP16:
+            sources.append("csrc/flash_fwd_mla_fp16_sm90.cu")
 
     return sources
 
@@ -236,14 +248,21 @@ def get_features_args():
     features_args = []
     if DISABLE_FP16:
         features_args.append("-DFLASH_MLA_DISABLE_FP16")
+    if AMPERE_ONLY:
+        features_args.append("-DFLASH_MLA_NO_SM90")
     return features_args
 
 
-subprocess.run(["git", "submodule", "update", "--init", "csrc/cutlass"])
+# Only touch the network if CUTLASS has not been checked out yet (worktrees / offline servers).
+if not (Path(__file__).resolve().parent / "csrc" / "cutlass" / "include" / "cutlass" / "cutlass.h").exists():
+    subprocess.run(["git", "submodule", "update", "--init", "csrc/cutlass"])
 
 cc_flag = []
 cc_flag.append("-gencode")
-cc_flag.append("arch=compute_90a,code=sm_90a")
+if AMPERE_ONLY:
+    cc_flag.append(f"arch=compute_{ARCH},code=sm_{ARCH}")
+else:
+    cc_flag.append("arch=compute_90a,code=sm_90a")
 
 this_dir = os.path.dirname(os.path.abspath(__file__))
 
@@ -279,8 +298,8 @@ ext_modules.append(
                     "--expt-extended-lambda",
                 ]
                 + ([] if DEBUG_BUILD else ["-DNDEBUG", "--use_fast_math"])
-                + (["-g", "-G", "-lineinfo"] if DEBUG_BUILD else [])
-                + ["--ptxas-options=-v,--register-usage-level=10"]
+                + (["-g", "-G", "-lineinfo"] if DEBUG_BUILD else (["-lineinfo"] if LINEINFO else []))
+                + ["--ptxas-options=-v" + ("" if AMPERE_ONLY else ",--register-usage-level=10")]
                 + cc_flag
             ) + get_features_args(),
         },
