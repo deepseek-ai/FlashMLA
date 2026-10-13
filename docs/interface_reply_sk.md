@@ -31,17 +31,17 @@ Compile-time macros with `#ifndef` defaults (see `csrc/sm86/mla_sm86.h`); pass t
 | macro | default | meaning |
 |---|---|---|
 | `FLASH_MLA_SM86_BM_SMALL` / `_BM_LARGE` | 16 / 32 | rows per CTA when `s_q*h_q/h_k <= 16` / otherwise |
-| `FLASH_MLA_SM86_NT` | 16 | tokens per KV tile (16 or 32; clamped to the page size) |
-| `FLASH_MLA_SM86_NS` | 3 | smem ring stages |
+| `FLASH_MLA_SM86_NT_SMALL` / `_NS_SMALL` | 16 / 3 | tokens per tile / ring stages when BM = 16 (tile is clamped to the page size; 16-token pages get 3+ stages) |
+| `FLASH_MLA_SM86_NT_LARGE` / `_NS_LARGE` | 32 / 2 | tokens per tile / ring stages when BM = 32 |
 | `FLASH_MLA_SM86_MINB` | 1 | CTAs per SM (sets `num_sm_parts`) |
 | `FLASH_MLA_SM86_SPEC` / `_PIPE` | 0 / 0 | 1 = v2b (producer warp + mbarrier) / v2c (software-pipelined) |
 | `FLASH_MLA_SM86_FUSE` | 0 | max splits merged by the fused last-arriver combine (0 = always use the combine kernel) |
 | `FLASH_MLA_SM86_OV`, `_MINBLK` | 2, 0 | scheduler: per-segment overhead / minimum 32-token blocks per active part |
-| `FLASH_MLA_SM86_QNS`, `_QMINB` | 4, 1 | stages / CTAs per SM of the fp8/int8 kernels |
+| `FLASH_MLA_SM86_QNT`, `_QNS`, `_QMINB` | 32, 2, 1 | tokens per tile / stages / CTAs per SM (BM = 16) of the fp8/int8 kernels |
 
 Only the combinations instantiated in the dispatch tables (`mla_sm86_run`, `mla_sm86_run_q_impl`) are valid; others abort
 with `Assertion failed ... launched`. Every macro can also be overridden **at run time** by an environment variable of the same
-name (read on every call), and `FLASH_MLA_SM86_CFG="bm,nt,ns[,minb[,spec[,pipe]]]"` / `FLASH_MLA_SM86_QCFG="bm,ns[,minb]"` set a
+name (read on every call), and `FLASH_MLA_SM86_CFG="bm,nt,ns[,minb[,spec[,pipe]]]"` / `FLASH_MLA_SM86_QCFG="bm,ns[,minb[,nt]]"` set a
 whole plan at once -- handy for sweeps without rebuilding (set them before `get_mla_metadata` as well: `minb` changes
 `num_sm_parts`). `flash_mla.sm86_config(num_q_tokens_per_head_k, page)` returns the selected configuration as a string.
 
