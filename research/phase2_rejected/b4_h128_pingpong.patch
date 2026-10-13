@@ -1,0 +1,172 @@
+diff --git a/csrc/sm86/mla_decode_sm86.cuh b/csrc/sm86/mla_decode_sm86.cuh
+index 819fa00..873b52f 100644
+--- a/csrc/sm86/mla_decode_sm86.cuh
++++ b/csrc/sm86/mla_decode_sm86.cuh
+@@ -50,9 +50,10 @@ __device__ __forceinline__ unsigned long long mla_gtime() {
+ #endif
+ constexpr int kFuseCap = 8;   // compile-time bound on the splits handled by the fused (last-arriver) combine
+ 
+-template <typename T_, int BM_, int NT_, int NS_, int MINB_ = 1, bool SPEC_ = false, bool PIPE_ = false>
++template <typename T_, int BM_, int NT_, int NS_, int MINB_ = 1, bool SPEC_ = false, bool PIPE_ = false, bool PP_ = false>
+ struct Cfg {
+     using T = T_;
++    static constexpr bool kPP = PP_;   // ping-pong tile loop of the two M-groups (BM 32)
+     static constexpr int kBM = BM_;
+     static constexpr int kGroups = BM_ / 16;
+     static constexpr int kConsWarps = kGroups * 4;
+@@ -75,6 +76,7 @@ struct Cfg {
+     static_assert(NS_ >= 2 && NS_ <= 8, "need 2..8 stages");
+     static_assert(!(SPEC_ && PIPE_), "v2b and v2c are exclusive");
+     static_assert(!PIPE_ || NS_ >= 3, "v2c needs >= 3 stages");
++    static_assert(!PP_ || (BM_ == 32 && !SPEC_ && !PIPE_), "ping-pong needs two M-groups (BM 32) and the v2a ring");
+ };
+ 
+ // ---------------------------------------------------------------------------------------------------------
+@@ -245,6 +247,26 @@ __device__ __forceinline__ void compute_tile(
+     pv_stage<C, ET>(pa, sbase, vq_off, acc_o);
+ }
+ 
++// ping-pong halves of compute_tile: QK + partial-S store | S sum + mask + softmax + PV (same arithmetic as compute_tile)
++template <typename C, typename ET>
++__device__ __forceinline__ void tile_qk_half(const uint32_t sbase, float4 *sS_mine, const uint32_t kq_off, const uint32_t (&qf)[9][4]) {
++    float sacc[C::kNT8][4];
++    qk_stage<C, ET>(sbase, kq_off, qf, sacc);
++    exch_store<C>(sS_mine, sacc);
++}
++
++template <typename C, typename ET>
++__device__ __forceinline__ void tile_pv_half(
++    const uint32_t sbase, const int tok0, const float4 *sS_grp, const uint32_t (&vq_off)[4], const int t, const float sl2,
++    float (&acc_o)[16][4], float &m0, float &m1, float &l0, float &l1, const int lim0, const int lim1, const int mask_min) {
++    float s[C::kNT8][4];
++    exch_sum<C>(sS_grp, s);
++    mask_stage<C>(s, tok0, t, lim0, lim1, mask_min);
++    uint32_t pa[C::kNt / 16][4];
++    softmax_stage<C, ET>(s, sl2, m0, m1, l0, l1, acc_o, pa);
++    pv_stage<C, ET>(pa, sbase, vq_off, acc_o);
++}
++
+ // ---------------------------------------------------------------------------------------------------------
+ // Fused split-KV combine, executed by the last-arriving CTA of a (batch, head, m-block): merges the nsp <= kFuseCap
+ // partials of every valid row in split-index order (deterministic whatever the arrival order).
+@@ -524,6 +546,48 @@ mla_decode_kernel(const __grid_constant__ Flash_fwd_mla_params params) {
+                 for (int n = 0; n + 1 < n_tiles; ++n) step(std::true_type{}, n);
+                 step(std::false_type{}, n_tiles - 1);
+             }
++        } else if constexpr (C::kPP) {
++            // ---------------- ping-pong: M-group 1 runs half a tile behind M-group 0 ----------------
++            // iteration n = two halves, each ended by a CTA barrier:
++            //   Y(n): tile n landed      group 0: QK(n) -> its S buffer      | group 1: S sum, softmax, PV of tile n-1
++            //   Z(n): tile n-1 released  -> prefetch tile n+NS-1 into its slot
++            //                            group 0: S sum, softmax, PV of n    | group 1: QK(n) -> its S buffer
++            // One group's softmax / PV overlaps the other's QK HMMAs.  Each S buffer is written and read on opposite sides of
++            // a CTA barrier (no named barrier needed); the prefetch is issued half a tile later than in v2a.
++            int prv_slot = NS - 1;   // ring slot of tile n-1
++#pragma unroll 1
++            for (int n = 0; n < n_tiles; ++n) {
++                const int tok0 = tok_begin + n * NT;
++                const uint32_t cur = ring_u32 + rd_slot * C::kStageBytes;
++                cp_async_wait<NS - 2>();
++                __syncthreads();   // Y(n)
++                if (grp == 0) tile_qk_half<C, ET>(cur, sS_mine_base, kq_off, qf);
++                else if (n > 0)
++                    tile_pv_half<C, ET>(ring_u32 + prv_slot * C::kStageBytes, tok0 - NT, sS_grp_base, vq_off, t, sl2, acc_o, m0, m1, l0, l1,
++                                        lim0, lim1, mask_min);
++                __syncthreads();   // Z(n)
++                {
++                    const int pg_cur = pg_pending;
++                    pg_pending = load_pg(n + NS);
++                    if (n + NS - 1 < n_tiles) {
++                        const int tok_p = tok_begin + (n + NS - 1) * NT;
++                        const T *src = kbase + (int64_t)pg_cur * k_batch_stride + (int64_t)(tok_p & ps_mask) * k_row_stride;
++                        issue_tile_copy<NT, C::kNThreads>(ring_u32 + wr_slot * C::kStageBytes, src, k_row_stride, tok_p, seqlen_k, tid);
++                    }
++                }
++                cp_async_commit();
++                if (grp == 0)
++                    tile_pv_half<C, ET>(cur, tok0, sS_grp_base, vq_off, t, sl2, acc_o, m0, m1, l0, l1, lim0, lim1, mask_min);
++                else tile_qk_half<C, ET>(cur, sS_mine_base, kq_off, qf);
++                prv_slot = rd_slot;
++                rd_slot = (rd_slot + 1 == NS) ? 0 : rd_slot + 1;
++                wr_slot = (wr_slot + 1 == NS) ? 0 : wr_slot + 1;
++            }
++            if (grp == 1 && n_tiles > 0) {   // group 1 finishes the last tile
++                bar_sync(1 + grp, 128);      // its 4 partial S of that tile are stored
++                tile_pv_half<C, ET>(ring_u32 + prv_slot * C::kStageBytes, tok_begin + (n_tiles - 1) * NT, sS_grp_base, vq_off, t, sl2, acc_o,
++                                    m0, m1, l0, l1, lim0, lim1, mask_min);
++            }
+         } else {
+ #pragma unroll 1
+         for (int n = 0; n < n_tiles; ++n) {
+@@ -862,7 +926,7 @@ void mla_sm86_run(Flash_fwd_mla_params &p, cudaStream_t stream) {
+     if (p.fuse_max_splits > kFuseCap) p.fuse_max_splits = kFuseCap;
+ 
+ #define MLA_SM86_CASE(BM_, NT_, NS_, MB_, SP_, PI_)                                                        \
+-    if (plan.bm == BM_ && plan.nt == NT_ && plan.ns == NS_ && plan.minb == MB_ && plan.spec == SP_ && plan.pipe == PI_) { \
++    if (!plan.pp && plan.bm == BM_ && plan.nt == NT_ && plan.ns == NS_ && plan.minb == MB_ && plan.spec == SP_ && plan.pipe == PI_) { \
+         launch_main<Cfg<T, BM_, NT_, NS_, MB_, SP_, PI_>>(p, stream);                                      \
+         launched = true;                                                                                   \
+     }
+@@ -888,6 +952,16 @@ void mla_sm86_run(Flash_fwd_mla_params &p, cudaStream_t stream) {
+     MLA_SM86_CASE(16, 32, 3, 1, false, true)
+     MLA_SM86_CASE(32, 32, 3, 1, false, true)
+ #undef MLA_SM86_CASE
++    // ping-pong (BM 32, v2a ring)
++#define MLA_SM86_CASE_PP(NT_, NS_)                                                                         \
++    if (plan.pp && plan.bm == 32 && plan.nt == NT_ && plan.ns == NS_ && plan.minb == 1 && !plan.spec && !plan.pipe) { \
++        launch_main<Cfg<T, 32, NT_, NS_, 1, false, false, true>>(p, stream);                               \
++        launched = true;                                                                                   \
++    }
++    MLA_SM86_CASE_PP(32, 2)
++    MLA_SM86_CASE_PP(16, 3)
++    MLA_SM86_CASE_PP(16, 4)
++#undef MLA_SM86_CASE_PP
+     FLASH_ASSERT(launched);
+ 
+     launch_combine<T>(p, stream);
+diff --git a/csrc/sm86/mla_sm86.h b/csrc/sm86/mla_sm86.h
+index 6de51d1..b8ee095 100644
+--- a/csrc/sm86/mla_sm86.h
++++ b/csrc/sm86/mla_sm86.h
+@@ -13,6 +13,7 @@ struct Plan {
+     int bm, nt, ns, minb;   // rows per CTA, tokens per KV tile, smem ring stages, CTAs per SM
+     bool spec;              // v2b: producer warp + mbarriers
+     bool pipe;              // v2c: software-pipelined tile loop
++    bool pp;                // BM 32: ping-pong of the two M-groups (group 1 half a tile behind group 0)
+ };
+ 
+ // Compile-time defaults (override with -DFLASH_MLA_SM86_<NAME>=..., e.g. through the FLASH_MLA_DEFINES env var of setup.py)
+@@ -44,6 +45,9 @@ struct Plan {
+ #ifndef FLASH_MLA_SM86_PIPE          // 1 = v2c (software-pipelined tile loop)
+ #define FLASH_MLA_SM86_PIPE 0
+ #endif
++#ifndef FLASH_MLA_SM86_PP            // 1 = ping-pong tile loop for BM = 32 (v2a ring)
++#define FLASH_MLA_SM86_PP 0
++#endif
+ #ifndef FLASH_MLA_SM86_FUSE          // max splits merged by the fused last-arriver combine (0 = always use the combine kernel)
+ #define FLASH_MLA_SM86_FUSE 0
+ #endif
+@@ -60,7 +64,7 @@ inline int env_int(const char *name, int dflt) {
+ }
+ 
+ // Config selection by the number of rows M = s_q * h_q / h_k (shared by the kernel launcher and the metadata builder).
+-// FLASH_MLA_SM86_CFG="bm,nt,ns[,minb[,spec[,pipe]]]" overrides the whole plan at run time.
++// FLASH_MLA_SM86_CFG="bm,nt,ns[,minb[,spec[,pipe[,pp]]]]" overrides the whole plan at run time.
+ inline Plan pick_plan(int M, int page_size) {
+     Plan p;
+     p.bm = (M <= 16) ? FLASH_MLA_SM86_BM_SMALL : FLASH_MLA_SM86_BM_LARGE;
+@@ -69,10 +73,11 @@ inline Plan pick_plan(int M, int page_size) {
+     p.minb = FLASH_MLA_SM86_MINB;
+     p.spec = FLASH_MLA_SM86_SPEC != 0;
+     p.pipe = FLASH_MLA_SM86_PIPE != 0;
++    p.pp = p.bm == 32 && FLASH_MLA_SM86_PP != 0;
+     if (const char *e = std::getenv("FLASH_MLA_SM86_CFG")) {
+-        int bm, nt, ns, mb = 1, sp = 0, pi = 0;
+-        if (std::sscanf(e, "%d,%d,%d,%d,%d,%d", &bm, &nt, &ns, &mb, &sp, &pi) >= 3) {
+-            p.bm = bm; p.nt = nt; p.ns = ns; p.minb = mb; p.spec = sp != 0; p.pipe = pi != 0;
++        int bm, nt, ns, mb = 1, sp = 0, pi = 0, pp = 0;
++        if (std::sscanf(e, "%d,%d,%d,%d,%d,%d,%d", &bm, &nt, &ns, &mb, &sp, &pi, &pp) >= 3) {
++            p.bm = bm; p.nt = nt; p.ns = ns; p.minb = mb; p.spec = sp != 0; p.pipe = pi != 0; p.pp = pp != 0;
+         }
+     }
+     if (p.nt > page_size) {   // a tile must lie within one page: shrink it and deepen the ring to keep the bytes in flight

@@ -2,7 +2,8 @@
 
 > **Status: plan.** Nothing on this page is implemented in this branch. Every number comes from a prototype measured on
 > the real 27-layer CUDA graph (an extra kernel, a patched copy of a kernel, a scheduler knob, parallel graph branches)
-> or, where noted, from a synthetic benchmark. The prototypes are throwaway harnesses and are not part of the repository.
+> or, where noted, from a synthetic benchmark. The prototype harnesses are in
+> [research/phase3/](../../research/README.md), which also says which script backs which item.
 
 Phase 3 covers three requests: L2 prefetch between the GEMMs, horizontal fusion of W_UK with the prologue, and the
 small-batch items that were postponed in phase 2. Panel B of Figure 3 shows the idea on a time axis.
@@ -392,3 +393,4 @@ once the discard is inside the combine.
   (P4).
 - `flash_mla/mla_decode_layer.py`: call sites of P3, P4, P5.
 - `csrc/flash_api.cpp`, `csrc/flash_mla.h`: parameter fields (P1, P6).
+- Existing prototypes to measure against: `research/phase3/`.

@@ -2,7 +2,7 @@
 
 Every entry here was built or prototyped and measured. They are kept so that nobody spends the time again, and because
 several of them changed how the later work was done. "Retry when" names the condition under which the idea deserves
-another look.
+another look. Code for the phase-2 and phase-3 entries is in [research/](../../research/README.md).
 
 ## 1. Rules learned
 

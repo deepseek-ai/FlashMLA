@@ -11,7 +11,7 @@ only.
 
 | | |
 |---|---|
-| Status | Phases 1 and 2 are implemented, tested (760 tests) and measured. Phase 3 is a plan backed by prototype measurements; its code is not in this branch. |
+| Status | Phases 1 and 2 are implemented, tested (760 tests) and measured. Phase 3 is a plan backed by prototype measurements: the prototype harnesses are in [research/phase3/](research/README.md), the implementation in the library is not written yet. |
 | Full write-up | [docs/optimization/](docs/optimization/README.md): results, design of every optimization, the phase-3 plan, and what did not work |
 | Original working report | [docs/ampere_opt_report.md](docs/ampere_opt_report.md) (Chinese), with the raw logs in `docs/perf_log_*.md` and `docs/bench_matrix.md` |
 
@@ -71,7 +71,7 @@ v2 attention kernel; "eager" launches each operation separately, "graph" replays
 | Phase 1: fused layer + v2 kernel | 65.8 | 117.9 | 259.3 | 440.0 |
 | Phase 2: + skinny GEMM (bf16 KV) | **61.5** | **102.3** | **239.5** | **431.4** |
 | Phase 2: + 8-bit KV cache (FP8) | 61.6 | **86.3** | **172.0** | **291.2** |
-| Phase 3 prototype: P1 + P2 + P3 (bf16), not in this branch | 56.2 | 97.4 | not run | not run |
+| Phase 3 prototype: P1 + P2 + P3 (bf16), not in the library yet | 56.2 | 97.4 | not run | not run |
 | Phase 3 projection: all six items | 51–53.5 | 93–95.5 | unchanged | unchanged |
 
 The phase-1 and phase-2 rows come from separate measurement sessions on the same GPU with the same thermal control;
@@ -138,7 +138,8 @@ Design details: [docs/optimization/03-phase2-gemm-kv-groups.md](docs/optimizatio
 ![Skinny GEMM and the phase-3 plan](docs/optimization/figures/fig3_gemm_and_l2_plan.png)
 
 At b=1 a layer spends 27 µs above its byte floor. Six items address it. They were measured with prototypes on the real
-27-layer graph (external kernels, a patched kernel copy, parallel graph branches); none of them is in this branch yet.
+27-layer graph (external kernels, a patched kernel copy, parallel graph branches). The prototype code is in
+[research/phase3/](research/README.md); the items themselves are not implemented in the library yet.
 
 | # | Item | Evidence | b=1, µs per layer | b=8, µs per layer | Output bit-identical |
 |---|---|---|---|---|---|
@@ -156,7 +157,8 @@ P1 + P2 + P3 stacked, measured: b=1 61.1 → 56.2 µs, b=8 101.7 → 97.4 µs. P
 ### What did not work
 
 Some of the most useful results are negative. The full list with reasons and retry conditions is in
-[docs/optimization/05-what-did-not-work.md](docs/optimization/05-what-did-not-work.md). The ones that cost the most time:
+[docs/optimization/05-what-did-not-work.md](docs/optimization/05-what-did-not-work.md); the patches of the rejected phase-2
+experiments are in [research/phase2_rejected/](research/README.md). The ones that cost the most time:
 
 - **Warp specialization** (a producer warp with mbarriers) is correct and not faster: the bandwidth case is already at
   the peak and the compute case waits on dependencies, not on barriers.
@@ -292,6 +294,7 @@ flash_mla/                      Python API: attention interface, KV quantization
 tests/                          760 tests
 benchmarks/                     kernel and layer timing, baselines (Triton, FlashInfer, legacy), matrix summarizer
 tools/                          build, Nsight Compute and Nsight Systems helpers
+research/                       not part of the library: phase-3 prototype harnesses, patches of rejected phase-2 experiments
 docs/optimization/              the consolidated write-up: results, phases 1-3, negative results, figures and their sources
 docs/                           original working report (Chinese), performance logs, benchmark matrix, KV format
 ```

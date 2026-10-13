@@ -124,6 +124,8 @@ the same decision. Nothing is read back by the host, so the launch stays graph-s
 
 ## 4. Tried in phase 2 and not kept
 
+The three patches are in [research/phase2_rejected/](../../research/README.md) and apply to this branch.
+
 | Idea | Result | Why |
 |---|---|---|
 | Combine reads all splits in one round (96 per round instead of 64, so the 82 splits of b=1 need one round) | 4.28 → 4.26 µs, bit-identical | the second round already overlapped the first; the chain from LSE to the weights is the bottleneck |

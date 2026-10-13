@@ -244,7 +244,7 @@ Per-kernel times from an Nsight Systems trace of the 27-layer graph; each includ
 
 This table is the starting point of phase 3.
 
-## 6. Phase 3 prototypes (not in this branch)
+## 6. Phase 3 prototypes (research code, not in the library)
 
 Measured on the real 27-layer graph, s_k=4096 unless noted, µs per layer. "Stack" is P1 (as an external kernel after the
 combine) + P2 (emulated through the minimum-units knob) + P3 (a patched copy of the GEMM kernel, 2 MB budget).
@@ -259,7 +259,8 @@ combine) + P2 (emulated through the minimum-units knob) + P3 (a patched copy of 
 | b=8, FP8 | 86.9 | 82.45 | −4.5 |
 
 The external discard kernel costs one extra launch (0.7–0.9 µs) that disappears once the discard lives inside the
-combine. Per-item numbers and the projection for all six items are in [04-phase3-plan.md](04-phase3-plan.md).
+combine. The harnesses are in [research/phase3/](../../research/README.md). Per-item numbers and the projection for all
+six items are in [04-phase3-plan.md](04-phase3-plan.md).
 
 ## 7. Correctness
 

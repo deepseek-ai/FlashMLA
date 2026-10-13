@@ -1,0 +1,14 @@
+diff --git a/csrc/sm86/mla_decode_sm86.cuh b/csrc/sm86/mla_decode_sm86.cuh
+index 819fa00..5946efb 100644
+--- a/csrc/sm86/mla_decode_sm86.cuh
++++ b/csrc/sm86/mla_decode_sm86.cuh
+@@ -708,7 +708,8 @@ mla_combine_wide_kernel(const __grid_constant__ Flash_fwd_mla_params params) {
+     const int64_t sstride = (int64_t)hs * kDV;
+     const float *oa = reinterpret_cast<const float *>(params.oaccum_ptr) + ((int64_t)split_offset * hs + hs_idx) * kDV + quarter * 128 + c * 4;
+ 
+-    constexpr int kChunk = 64 / NG;   // splits per group per round: nsp <= 64 in one round
++    // splits per group per round: one round for nsp <= 96 with 16 / 8 groups (82 parts -> b = 1 has up to 82 splits), 64 with 4
++    constexpr int kChunk = (NG >= 8 ? 96 : 64) / NG;
+     float4 v[kChunk];
+ #pragma unroll
+     for (int u = 0; u < kChunk; ++u) {

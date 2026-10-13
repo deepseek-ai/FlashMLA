@@ -1,0 +1,21 @@
+diff --git a/csrc/sm86/mla_decode_sm86.cuh b/csrc/sm86/mla_decode_sm86.cuh
+index 819fa00..46363c5 100644
+--- a/csrc/sm86/mla_decode_sm86.cuh
++++ b/csrc/sm86/mla_decode_sm86.cuh
+@@ -190,10 +190,13 @@ __device__ __forceinline__ void softmax_stage(float (&s)[C::kNT8][4], const floa
+     }
+     l0 = l0 * sc0 + ps0;
+     l1 = l1 * sc1 + ps1;
++    // no row max of this warp grew => both factors are exactly 1 (ex2(0)) and the rescale is the identity: skip it
++    if (__any_sync(0xffffffffu, sc0 != 1.f || sc1 != 1.f)) {
+ #pragma unroll
+-    for (int i = 0; i < 16; ++i) {
+-        acc_o[i][0] *= sc0; acc_o[i][1] *= sc0;
+-        acc_o[i][2] *= sc1; acc_o[i][3] *= sc1;
++        for (int i = 0; i < 16; ++i) {
++            acc_o[i][0] *= sc0; acc_o[i][1] *= sc0;
++            acc_o[i][2] *= sc1; acc_o[i][3] *= sc1;
++        }
+     }
+ #pragma unroll
+     for (int kc = 0; kc < C::kNt / 16; ++kc) {

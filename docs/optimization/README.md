@@ -11,6 +11,7 @@ measured results, the design of each optimization, the plan for the next phase a
 | [04-phase3-plan.md](04-phase3-plan.md) | Planned, not implemented: discard of dead partials, balanced part count, GEMM prefetch chain, W_UK + prologue in one launch |
 | [05-what-did-not-work.md](05-what-did-not-work.md) | Rejected approaches with numbers, reasons and retry conditions; rules learned |
 | [figures/](figures/) | The four figures (SVG and PNG) and the scripts that draw them |
+| [../../research/](../../research/README.md) | Code behind the numbers that is not part of the library: the phase-3 prototype harnesses and the patches of rejected phase-2 experiments |
 
 The original working report, written in Chinese while the work was in progress, is
 [../ampere_opt_report.md](../ampere_opt_report.md). The documents here restate it in English and add phase 3.
@@ -21,7 +22,7 @@ The original working report, written in Chinese while the work was in progress, 
 |---|---|---|
 | 1 | v2 decode kernel (bf16 / fp16), scheduler, combine variants, graph-safe API, 8-bit KV cache, fused prologue, decode layer as one CUDA graph | implemented, tested, measured |
 | 2 | Skinny GEMM for the four layer projections; two KV groups per CTA for the 8-bit kernel | implemented, tested, measured |
-| 3 | Six items that remove fixed cost between kernels at small batch | researched with prototypes on the real layer; plan written; not implemented |
+| 3 | Six items that remove fixed cost between kernels at small batch | researched with prototypes on the real layer (`research/phase3/`); plan written; not implemented in the library |
 
 ## The figures
 
