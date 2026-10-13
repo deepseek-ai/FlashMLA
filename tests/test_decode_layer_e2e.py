@@ -113,13 +113,14 @@ def test_fused_and_unfused_quantized_layers_write_identical_cache(kind):
     assert (d > 0).float().mean().item() < 0.2
 
 
+@pytest.mark.parametrize("fused", [True, False])
 @pytest.mark.parametrize("kind", ["native", "fp8", "int8"])
-def test_whole_layer_graph_replay_matches_eager_v2(kind):
+def test_whole_layer_graph_replay_matches_eager_v2(kind, fused):
     """Whole-step CUDA graph (metadata + L chained layers + quantize-on-write + v2 attention) over changing seqlens."""
     cfg = MLAConfig()
     b, s_k, page, L = 4, 200, 64, 3
     st, nblk = make_state(cfg, b, s_k, page, 1, attn="v2", kv_dtype=kind)
-    layers = [MLADecodeLayer(cfg, fused=True, attn="v2", kv_dtype=kind, seed=l) for l in range(L)]
+    layers = [MLADecodeLayer(cfg, fused=fused, attn="v2", kv_dtype=kind, seed=l) for l in range(L)]
     cs = [alloc_cache(nblk, page, kind, seed=l) for l in range(L)]
     caches_g, scales_g = [c[0] for c in cs], [c[1] for c in cs]
     st_e, _ = make_state(cfg, b, s_k, page, 1, attn="v2", kv_dtype=kind)

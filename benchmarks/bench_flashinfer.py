@@ -10,6 +10,7 @@ flashinfer.mla.BatchMLAPagedAttentionWrapper(backend="fa2"): JIT-compiles on fir
 If the JIT or the kernel fails on sm_86, the failure is recorded as a CSV row and the script exits cleanly.
 """
 import argparse
+import gc
 import os
 import sys
 import traceback
@@ -18,8 +19,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import torch
 
-from common import (D, DV, Case, CsvOut, Data, case_row, case_stats, cos_diff, default_out, make_seqlens, metrics,
-                    parse_int_list, preset, ref_attention, smi_sample, time_events, time_graph_replay)
+from common import (D, DV, Case, CsvOut, Data, case_row, case_stats, cooldown, cos_diff, default_out, enable_cooldown, make_seqlens,
+                    metrics, parse_int_list, preset, ref_attention, smi_sample, time_events, time_graph_replay)
 
 
 class FlashInferMLA:
@@ -85,6 +86,7 @@ def main():
     ap.add_argument("--mem-gb", type=float, default=12.0)
     ap.add_argument("--check", action="store_true")
     ap.add_argument("--no-smi", action="store_true")
+    ap.add_argument("--cool", action="store_true", help="wait for the GPU to cool (FLASHMLA_COOL_HI/LO) before every case")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--tag", default="flashinfer")
     ap.add_argument("--out", default=None)
@@ -99,6 +101,7 @@ def main():
         cases = [Case(c.h_q, c.s_q, c.b, c.s_k, pg or c.page, c.varlen or a.varlen, a.dtype)
                  for c in preset(a.preset) for pg in pages]
     modes = a.modes.split(",")
+    enable_cooldown(a.cool)
     import flashinfer
     print(f"[flashinfer] {flashinfer.__version__}; torch {torch.__version__}; {torch.cuda.get_device_name(0)}", flush=True)
     out = CsvOut(a.out or default_out(a.tag))
@@ -109,9 +112,13 @@ def main():
             max_pages = -(-int(max(make_seqlens(case, a.seed))) // case.page)
             per_layer = case.b * max_pages * case.page * D * 2
             n_layers = int(max(1, min(a.layers, a.mem_gb * 1e9 // per_layer)))
+        fi = fn = runners = g = o = lse = None   # release the previous case (FlashInfer wrapper, graph, runners) before allocating
+        gc.collect()
+        torch.cuda.empty_cache()
         data = Data(case, n_layers, True, a.check, a.seed)
         base = case_row(case, data.stats)
         try:
+            cooldown()
             fi = FlashInferMLA(case, data, use_graph=("graph" in modes))
             fn = fi.runner(0)
             fn()

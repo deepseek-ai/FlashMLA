@@ -98,6 +98,13 @@ def preset(name):
                     for sk in (1024, 4096, 8192):
                         cs.append(Case(h, sq, b, sk, 64))
                 cs.append(Case(h, sq, 1, 32768, 64))
+    elif name == "core":  # reduced integration matrix for the fp16 / fp8 / int8 runs: the two regimes + h_q=64
+        for h in (16, 64, 128):
+            for sq in (1, 2):
+                for b in (1, 4, 16, 64, 128):
+                    for sk in (1024, 4096, 8192):
+                        cs.append(Case(h, sq, b, sk, 64))
+                cs.append(Case(h, sq, 1, 32768, 64))
     elif name == "spot":  # page-size spot checks (run with --page 16 / 32)
         for h in (16, 128):
             for b, sk in ((1, 4096), (4, 4096), (64, 4096), (128, 8192)):
@@ -210,6 +217,35 @@ def smi_sample():
         return None
 
 
+COOL_HI = float(os.environ.get("FLASHMLA_COOL_HI", "68"))
+COOL_LO = float(os.environ.get("FLASHMLA_COOL_LO", "56"))
+COOL_MAX_S = float(os.environ.get("FLASHMLA_COOL_MAX_S", "60"))
+_COOL_ENABLED = False
+
+
+def enable_cooldown(on=True):
+    global _COOL_ENABLED
+    _COOL_ENABLED = on
+
+
+def cooldown():
+    """Thermal control (no sudo -> clocks cannot be locked): the RTX 3090 here sustains only ~1.2-1.5 GHz once it reaches its 83 C
+    target under continuous load, but boosts to 1.8-1.9 GHz when cool, and it cools from 91 C to <50 C within ~20 s when idle.
+    When enabled (`--cool`), block while the first visible GPU is hotter than COOL_HI until it is below COOL_LO (at most COOL_MAX_S)."""
+    if not _COOL_ENABLED:
+        return 0.0
+    t0 = time.time()
+    s = smi_sample()
+    if s is None or s[2] <= COOL_HI:
+        return 0.0
+    while time.time() - t0 < COOL_MAX_S:
+        time.sleep(1.0)
+        s = smi_sample()
+        if s is None or s[2] <= COOL_LO:
+            break
+    return time.time() - t0
+
+
 # ----------------------------------------------------------------------------------------------------------------------
 # reference + metrics
 # ----------------------------------------------------------------------------------------------------------------------
@@ -313,7 +349,9 @@ class Data:
                 kvq, sc = quantize_kv(torch.nan_to_num(kc.view(nblk, case.page, D)), case.kv)
                 self.kq.append(kvq)  # uint8 [nblk, page, 640], as in docs/kv_quant_format.md
                 self.kscale.append(sc)
-                self.kc.append(dequantize_kv(kvq, sc, case.kv, dt).view(nblk, case.page, 1, D) if check else None)
+                # the dequantized reference copy is only needed for layer 0 (the correctness check): keeps the memory of
+                # b=128, s_k=8192 caches affordable
+                self.kc.append(dequantize_kv(kvq, sc, case.kv, dt).view(nblk, case.page, 1, D) if (check and len(self.kq) == 1) else None)
             del kc
 
     def kv_of(self, layer, i):

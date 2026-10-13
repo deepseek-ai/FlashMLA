@@ -36,8 +36,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import torch
 
-from common import (D, DV, Case, CsvOut, Data, case_row, case_stats, cos_diff, default_out, dtype_of, make_seqlens, metrics,
-                    parse_int_list, preset, ref_attention, smi_sample, time_events, time_graph_replay)
+from common import (D, DV, Case, CsvOut, Data, case_row, case_stats, cooldown, cos_diff, default_out, dtype_of, enable_cooldown,
+                    make_seqlens, metrics, parse_int_list, preset, ref_attention, smi_sample, time_events, time_graph_replay)
 
 
 # ----------------------------------------------------------------------------------------------------------------------
@@ -69,8 +69,14 @@ class FlashMLAImpl:
             return "package has no kv_scale= kwarg"
         return None
 
+    def meta_kwargs(self, case):
+        # 8-bit caches: tell the scheduler (kv_dtype is a hint for the CTA count / split-count model of the 8-bit kernels)
+        if case.kv != "native" and "kv_dtype" in inspect.signature(self.fm.get_mla_metadata).parameters:
+            return {"kv_dtype": case.kv}
+        return {}
+
     def prepare(self, case, data):
-        meta, nsplit = self.fm.get_mla_metadata(data.sl, case.s_q * case.h_q, 1)
+        meta, nsplit = self.fm.get_mla_metadata(data.sl, case.s_q * case.h_q, 1, **self.meta_kwargs(case))
         st = dict(meta=meta, nsplit=nsplit, ws=None)
         # persistent workspace (partial O / LSE / combine counters) -> the call allocates nothing and is graph safe
         if self.use_ws and self.accepts("workspace") and hasattr(self.fm, "alloc_mla_workspace") and self.impl_kw in (None, "v2"):
@@ -78,7 +84,8 @@ class FlashMLAImpl:
         return st
 
     def meta_fn(self, case, data):
-        return lambda: self.fm.get_mla_metadata(data.sl, case.s_q * case.h_q, 1)
+        kw = self.meta_kwargs(case)
+        return lambda: self.fm.get_mla_metadata(data.sl, case.s_q * case.h_q, 1, **kw)
 
     def runner(self, case, data, state, layer):
         kw = {}
@@ -230,6 +237,7 @@ def main():
     ap.add_argument("--no-workspace", action="store_true", help="do not pass a persistent workspace")
     ap.add_argument("--check", action="store_true", help="cos_diff vs an fp32 reference (NaN-pads the cache tail)")
     ap.add_argument("--no-smi", action="store_true")
+    ap.add_argument("--cool", action="store_true", help="wait for the GPU to cool (FLASHMLA_COOL_HI/LO) before every case and impl")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--tag", default="decode")
     ap.add_argument("--out", default=None)
@@ -245,6 +253,7 @@ def main():
         cases = [Case(c.h_q, c.s_q, c.b, c.s_k, pg or c.page, c.varlen or a.varlen, a.dtype, a.kv)
                  for c in preset(a.preset) for pg in pages]
     modes = a.modes.split(",")
+    enable_cooldown(a.cool)
     torch.manual_seed(a.seed)
 
     import flash_mla
@@ -286,6 +295,7 @@ def main():
                 out.write(impl=impl.name, mode="-", status="skip: " + reason, **base)
                 continue
             try:
+                cooldown()
                 state = impl.prepare(case, data)
                 fn = impl.runner(case, data, state, 0)
                 try:

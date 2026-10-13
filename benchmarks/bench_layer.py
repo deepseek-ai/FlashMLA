@@ -19,7 +19,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import torch
 
-from common import CsvOut, cos_diff, default_out, flush_buffer, parse_int_list, smi_sample, time_events, time_graph_replay
+from common import (CsvOut, cooldown, cos_diff, default_out, enable_cooldown, flush_buffer, parse_int_list, smi_sample, time_events,
+                    time_graph_replay)
 from flash_mla.mla_decode_layer import MLAConfig, MLADecodeLayer, alloc_cache, capture_layer_graph, make_state
 
 
@@ -47,10 +48,12 @@ def main():
     ap.add_argument("--mem-gb", type=float, default=14.0)
     ap.add_argument("--nvtx", action="store_true", help="run a short marked loop for nsys (decode_step ranges)")
     ap.add_argument("--no-smi", action="store_true")
+    ap.add_argument("--cool", action="store_true", help="wait for the GPU to cool (FLASHMLA_COOL_HI/LO) before every variant")
     ap.add_argument("--tag", default="layer")
     ap.add_argument("--out", default=None)
     a = ap.parse_args()
 
+    enable_cooldown(a.cool)
     cfg = MLAConfig()
     out = CsvOut(a.out or default_out(a.tag))
     print(f"[layer] torch {torch.__version__}; {torch.cuda.get_device_name(0)}; attn={a.attn} page={a.page} kv={a.kv}; out={out.path}", flush=True)
@@ -67,6 +70,7 @@ def main():
             outputs = {}
             for variant in a.variants.split(","):
                 fused = variant == "fused"
+                cooldown()
                 st, _ = make_state(cfg, b, s_k, a.page, a.sq, attn=a.attn, kv_dtype=a.kv)
                 layers = [MLADecodeLayer(cfg, fused=fused, attn=a.attn, kv_dtype=a.kv, seed=l) for l in range(n_layers)]
                 cs = [alloc_cache(nblk, a.page, a.kv, seed=l) for l in range(n_layers)]

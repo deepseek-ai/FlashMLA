@@ -25,6 +25,19 @@ def bytes_per_token(kind):
     return 2 * (LATENT + ROPE) if kind_id(kind) == 0 else ROW_BYTES + 4
 
 
+_QMAX = {}
+
+
+def _qmax(k, device):
+    """0-dim fp32 device tensor holding 448 / 127, created once per device: an H2D copy per call would make quantize_kv
+    impossible to capture in a CUDA graph (the warm-up iterations of capture_layer_graph populate the cache)."""
+    key = (k, str(device))
+    t = _QMAX.get(key)
+    if t is None:
+        t = _QMAX[key] = torch.tensor(E4M3_MAX if k == 1 else INT8_MAX, dtype=torch.float32, device=device)
+    return t
+
+
 def quantize_kv(x, kind):
     """x: [..., 576] bf16 -> (kvq uint8 [..., 640], scale fp32 [...])."""
     k = kind_id(kind)
@@ -32,7 +45,7 @@ def quantize_kv(x, kind):
     assert x.dtype == torch.bfloat16 and x.shape[-1] == LATENT + ROPE
     lat = x[..., :LATENT].float()
     amax = lat.abs().amax(dim=-1)
-    qmax = torch.tensor(E4M3_MAX if k == 1 else INT8_MAX, dtype=torch.float32, device=x.device)
+    qmax = _qmax(k, x.device)
     # IEEE fp32 division (tensor / 0-dim tensor): `amax / 448.0` with a python scalar would be computed by torch as
     # amax * (1/448), which is not correctly rounded and differs from the kernel's __fdiv_rn in the last bit.
     scale = torch.where(amax > 0, torch.div(amax, qmax), torch.ones_like(amax))
