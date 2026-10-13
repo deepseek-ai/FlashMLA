@@ -268,6 +268,9 @@ def get_features_args():
         features_args.append("-DFLASH_MLA_DISABLE_FP16")
     if AMPERE_ONLY:
         features_args.append("-DFLASH_MLA_NO_SM90")
+    # FLASH_MLA_DEFINES="FLASH_MLA_SM86_BM=16 FLASH_MLA_SM86_NT=32": extra -D flags (template-parameter sweeps, benchmarks/sweep.py)
+    for d in os.getenv("FLASH_MLA_DEFINES", "").split():
+        features_args.append("-D" + d)
     return features_args
 
 
