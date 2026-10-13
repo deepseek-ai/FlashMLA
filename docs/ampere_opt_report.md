@@ -1,6 +1,6 @@
 # FlashMLA on Ampere（RTX 3090, sm_86）MLA decode 优化报告
 
-分支 `opt/sm86`（pzhao-eng/FlashMLA `a100_replace` 的 Ampere 移植之上），数据对应提交 `04b3338` / `1714846`。测量日期 2026-10-12 ~ 10-13。
+分支 `opt/sm86`（pzhao-eng/FlashMLA `a100_replace` 的 Ampere 移植之上），数据对应提交 `04b3338` / `1714846`；第二阶段（§11）对应 `4c66d76` / `23dd183`。测量日期 2026-10-12 ~ 10-13。
 所有数字都能在 `/data2/LiuJun/tmp/flashmla/{logs,ncu,nsys}` 的 CSV / 日志 / 报告里找到；完整矩阵见 [bench_matrix.md](bench_matrix.md)，
 kernel 侧过程记录见 [perf_log_kernel.md](perf_log_kernel.md)，系统侧见 [perf_log_sys.md](perf_log_sys.md)。
 
@@ -12,10 +12,12 @@ kernel 侧过程记录见 [perf_log_kernel.md](perf_log_kernel.md)，系统侧�
 * 带宽受限区（h_q=16，b≥64，s_k≥4096）达到只读峰值的 **94–99%**（graph 中位 847 GB/s）；计算受限区（h_q=128，b≥16，s_k≥4096）达到
   bf16 峰值的 **73–75%**（eager，中位 51.9 TFLOPS）/ 66–72%（graph）。FP16 实例 h_q=128 达 FP16 峰值的 77%。
 * 可选 8-bit KV cache（FP8 e4m3 或 INT8，每 token 一个 fp32 scale，rope 维保留 bf16，0.559× 字节）在 h_q=16、b≥32 上
-  eager **1.56–1.71×**、graph **1.47–1.58×**；可选的「每 SM 2 CTA」配置在长上下文下 graph 也达 **1.58–1.68×**。INT8 精度比 FP8 高 2.4–13 倍。
+  eager **1.56–1.71×**、graph **1.47–1.58×**（第一阶段默认）；第二阶段把默认改为「CTA 内两个 KV 组 + 按负载统一启用」（§11.2）后，
+  graph 下 b≥32、s_k≥4096 为 **1.55–1.70×**（FP8）、1.54–1.60×（INT8），短上下文不变慢。INT8 精度比 FP8 高 2.4–13 倍。
 * DeepSeek-V2-Lite 单层 decode：融合 prologue + 整层 CUDA Graph 后，相对未融合 eager 快 **2.0×（b=64）~ 14×（b=1, s_k=1024）**，每层 kernel 数 40–43 → 8。
-* 未达标：b≤4 且 KV < ~35 MB 时的延迟目标（graph 下超 2.8–4.0 µs，根因与已试方案见 §7），以及默认配置下 8-bit KV 在 graph 口径的 1.6×（可选配置只在长上下文达标）。
-* 正确性：合并后 508 个测试全部通过；compute-sanitizer memcheck / racecheck / synccheck / initcheck 0 错误。
+  第二阶段用自写的权重流式 skinny GEMM 替换 cuBLAS 的四个层投影（§11.1），整层 graph b=8 s_k=4096 再快 1.13×（bf16）/ 1.17×（FP8）（同一构建 A/B）。
+* 未达标：b≤4 且 KV < ~35 MB 时的延迟目标（graph 下超 2.8–4.0 µs，根因与已试方案见 §7）；8-bit graph 1.6× 只差 b32 s_k4096 一格（1.55×）。
+* 正确性：第一阶段合并后 508 个测试通过；第二阶段提交前全量 760 个测试通过；compute-sanitizer memcheck / racecheck / synccheck / initcheck 0 错误。
 
 ## 1. 背景与硬件上限
 
@@ -57,6 +59,8 @@ graph = 一个 CUDA Graph 捕获 N 层（默认 27 = DeepSeek-V2-Lite），**每
 | 9 | **融合 decode prologue**：RoPE + RMSNorm + q 拼接 + 分页 KV 写入（可选写入时量化）一个 kernel | `csrc/fused/` | graph 内 1.8–14 µs，对比同样操作的 PyTorch 版 59–90 µs（graph）/ 552–562 µs（eager）；量化写入与 torch 参考逐位一致 |
 | 10 | **整层 CUDA Graph**：DeepSeek-V2-Lite 单层 decode | `flash_mla/mla_decode_layer.py` | 对未融合 eager 2.0–14×；每层 kernel 40–43 → 8（§5） |
 | 11 | 基准与 profiling 工具：eager/graph 计时、四方对比、矩阵汇总、ncu/nsys 脚本 | `benchmarks/`、`tools/` | — |
+| 12 | **层投影 skinny GEMM**（第二阶段 B1）：swap-AB `mma.sync` + cp.async 48 KB 环形缓冲，权重流式读取，替换 qkv_a / W_UK / W_UV / o_proj 的 cuBLAS | `csrc/fused/skinny_gemm.cu`、`flash_mla/skinny_gemm.py` | b=8 四个 GEMM 61.7 → 41.5 µs；整层 graph b8 1.13–1.21×（§11.1） |
+| 13 | **8-bit：CTA 内两个 KV 组**（第二阶段 B2）：8 warp，组 g 处理 tile g、g+2…，段末合并；metadata 写每 part 负载，整次 launch 统一决定是否启用 | `csrc/sm86/mla_decode_sm86_q.cuh`、`csrc/flash_fwd_mla_metadata.cu` | 默认；graph 对旧默认 0.99–1.12×，长上下文 +4–11%（§11.2） |
 
 ## 3. v2 kernel 设计要点
 
@@ -114,6 +118,8 @@ h128 的 graph 口径比 eager 慢约 4%：两者 SM 时钟采样中位相近（
 推测是算力受限 kernel 在持续负载下的功耗/时钟波动（未定论）。
 
 ### 4.3 8-bit KV（h_q=16，s_q=1，page 64，GPU1，`--cool`，8 层 graph；同一 harness 同一 GPU 下 bf16 vs 8-bit）
+
+> 本节是第一阶段的默认配置（每 CTA 4 warp）。第二阶段的新默认（两个 KV 组，按负载启用）见 §11.2；下面的「2 CTA/SM」仍可选，但长上下文收益已被新默认覆盖。
 
 | b | s_k | bf16 eager / graph µs | FP8 eager / graph µs（加速比） | INT8 eager / graph µs（加速比） |
 |---|---|---|---|---|
@@ -199,8 +205,8 @@ s_k=1024：b1 未融合 eager 825.8 → 融合 graph v2 58.2 µs（**14.2×**）
 | 融合 v2 bf16 | 8 | 51.6 | 6.7 | 2.5 | 60.4 | 2.3 | ~123.5 µs |
 | 融合 v2 FP8 | 8 | 33.8 | 6.4 | 4.0（含量化写入） | 58.7 | 2.3 | ~105 µs |
 
-另外每个 decode step（所有层共用）跑 1 次 metadata kernel（4.2 µs）。融合后 GEMM 占一半左右，attention 约 42%；再往下的整层收益要靠 GEMM 侧
-（例如把 W_UK 吸收 bmm 与 q_proj 合并、或 o_proj 的 split-K），不在本项目范围。
+另外每个 decode step（所有层共用）跑 1 次 metadata kernel（4.2 µs）。融合后 GEMM 占一半左右，attention 约 42%；第二阶段据此重写了层投影 GEMM，
+b=8 时层内 GEMM 62.4 → 43.4 µs（§11.1）。
 
 ## 6. ncu / nsys 证据
 
@@ -240,6 +246,10 @@ combine 5.3–5.9 µs（一个空 kernel 就要 1.5 µs）。也就是说 kernel
 | 8-bit KV 用于 h_q≥64 | 0.93–0.97× | 算力受限，反量化增加 ALU | 有 FP8 张量核的硬件（sm_89+） |
 | 只给 decode kernel 做 CUDA Graph，b≥64 | eager ≈ graph | launch 开销被几百 µs 的 kernel 摊薄；graph 的价值在小 batch 和整层 | — |
 | 在 h16 大 batch bf16 上追求超过 legacy | 无余量 | 修好的 legacy 已在峰值的 92–98% | — |
+| 8-bit KV 组**按段**启用（段 tile 数 < 门限只用一组，第二阶段） | 混合时严重变慢：b32 s_k4096 151 vs 122 µs | 同一 launch 里单组 CTA 在途字节只有双组的一半，DRAM 带宽按在途字节分配，单组 CTA 被饿慢并决定尾部；改为整次 launch 统一（§11.2） | — |
+| combine 单轮读取（每轮 96 split，第二阶段 B3） | b1 s_k8192 combine 4.28 → 4.26 µs，无收益（逐位一致） | 第二轮读取已与第一轮计算重叠，瓶颈是 LSE → 权重的依赖链 | — |
+| softmax 在行最大值不变时跳过 O 的 rescale（第二阶段 B4） | decode 慢 3–5%（h128 54.1 → 52.7 TFLOPS） | `__any_sync` 分支把 64 个 FMUL 隔进单独基本块，无法再与 HMMA 交错 | — |
+| h128 BM32 两组 ping-pong（组 1 落后半个 tile，第二阶段 B4） | 0.96–0.98×（逐位一致） | barrier stall 1.30 → 1.08，但指令 +5%，math-pipe throttle 不变：瓶颈是 FP32 累加的 tensor 管线（可达上限的 76%），错相位不增加吞吐 | 可用 FP16 累加或减少每 tile HMMA 数时 |
 
 ## 8. 记分卡（对照计划 §5 目标）
 
@@ -248,9 +258,9 @@ combine 5.3–5.9 µs（一个空 kernel 就要 1.5 µs）。也就是说 kernel
 | h16 s_q1 b64–128 s_k4k–8k ≥ 80% 实测带宽（≈700 GB/s） | graph 821–864 GB/s（中位 847，94–99%）；eager 93–99% | ✅ |
 | h128 ≥ 60% bf16 峰值（≥42 TFLOPS） | eager 50.8–52.6 TFLOPS（73–75%）；graph 46.5–50.6（66–72%）；fp16 77% | ✅ |
 | b≤4 延迟 ≤ 1.3 ×（KV 字节 / 带宽）+ 5 µs | graph：KV ≥ 37.7 MB 达标（b1 s_k32768、b4 s_k8192）；KV ≤ 18.9 MB 超 2.8–4.0 µs；eager 全部超（2.3–8.6 µs） | ❌（部分） |
-| FP8 KV 带宽受限区 ≥ 1.6× | 默认：eager 1.56–1.71×（6 个形状中 5 个 ≥1.6）、graph 1.47–1.58×；可选 2 CTA/SM：长上下文 graph 1.58–1.68× | ◐ |
+| FP8 KV 带宽受限区 ≥ 1.6× | 第二阶段默认（两个 KV 组）：graph b≥32 s_k≥4096 1.55–1.70×（只有 b32 s_k4096 = 1.55×）、eager ≥1.60×；第一阶段默认 graph 1.47–1.58× | ◐（差一格） |
 | 全矩阵胜过 Triton / legacy / FlashInfer | 最快或持平；唯一例外 eager h16 b1 s_k1024 对 legacy 0.93× | ✅ |
-| 正确性 | 合并后 508 测试通过（sm86 140、quant 102、fused prologue 24、fused layer 8、kv_quant 18、整层 e2e 152、fork sm80 64）；sanitizer 0 错误；graph 回放改 seqlen 正确 | ✅ |
+| 正确性 | 第一阶段合并后 508 测试通过（sm86 140、quant 102、fused prologue 24、fused layer 8、kv_quant 18、整层 e2e 152、fork sm80 64）；第二阶段 760 通过（新增 skinny GEMM 128，quant 102 → 226）；sanitizer 0 错误；graph 回放改 seqlen 正确 | ✅ |
 
 b≤4 的超出部分 = 启动 ~4 µs + 尾部 ~3 µs + combine ~5 µs 的固定成本（§6），在 Ampere 上没有 PDL / cluster 可以重叠，剩余可削空间估计 1–3 µs。
 
@@ -261,7 +271,7 @@ b≤4 的超出部分 = 启动 ~4 µs + 尾部 ~3 µs + combine ~5 µs 的固定
 FLASH_MLA_ARCH=86 python setup.py build_ext --inplace        # 或 tools/build.sh
 #   FLASH_MLA_LINEINFO=1 加 -lineinfo（ncu 源码视图）；FLASH_MLA_DEFINES="FLASH_MLA_SM86_NT_SMALL=32 ..." 设置 kernel 可调参数
 python -m pytest tests/test_flash_mla_sm86.py tests/test_flash_mla_sm86_quant.py tests/test_fused_prologue.py \
-    tests/test_fused_layer.py tests/test_kv_quant.py tests/test_decode_layer_e2e.py tests/test_flash_mla_sm80.py -q
+    tests/test_fused_layer.py tests/test_kv_quant.py tests/test_decode_layer_e2e.py tests/test_flash_mla_sm80.py tests/test_skinny_gemm.py -q
 ```
 
 ```python
@@ -280,9 +290,11 @@ md, nsplit = flash_mla.get_mla_metadata(cache_seqlens, s_q * h_q, 1, kv_dtype="i
 o, lse = flash_mla.flash_mla_with_kvcache(q, kvq, block_table, cache_seqlens, 512, md, nsplit,
                                            softmax_scale=(128 + 64) ** -0.5, kv_scale=scale, kv_dtype="int8")
 
-# 长上下文的 8-bit 服务可选：进程启动前 export FLASH_MLA_SM86_QCFG=16,2,2,32（每 SM 2 CTA，适用区间见 §4.3）
+# 8-bit 默认 = 两个 KV 组，每 part 负载 >= 64 个 32-token 单位时启用（§11.2）；FLASH_MLA_SM86_KGMIN 调门限，
+# FLASH_MLA_SM86_QCFG=16,2,1,32 回到第一阶段的 4-warp 配置，=16,2,2,32 为每 SM 2 CTA（§4.3）
 
 # 整层：from flash_mla import MLAConfig, MLADecodeLayer, alloc_cache, make_state, capture_layer_graph
+# 层投影默认走 skinny GEMM（MLADecodeLayer(..., gemm="auto")；单矩阵投影 T > 32 时回退 cuBLAS），gemm="torch" 全用 cuBLAS
 ```
 
 约束：`impl="v2"` 要求 d=576、d_v=512、K/V 共享 cache、cache 行 16 字节对齐；page ∈ {16, 32, 64}；8-bit 只走 v2 且 h_q 建议 ≤ 32。
@@ -301,16 +313,95 @@ tools/prof_nsys.sh <tag> -- python benchmarks/bench_layer.py --mode graph --iter
 
 ## 10. 剩余想法（按预期收益排序）
 
-1. **8-bit 自动选择 part 数**：2 CTA/SM 的收益只取决于实际 KV 长度，而它只在 GPU 上。可以让 metadata kernel 按实际总 token 数与平均 s_k
-   在 82 / 164 个 part 之间选择，decode 的 grid 固定为 164、多余的 CTA 直接退出。这样默认就能拿到长上下文的 +3–11%，短上下文不受影响。
+1. ~~8-bit 自动选择 part 数~~：第二阶段改用「CTA 内两个 KV 组 + metadata 按负载统一启用」实现了同样的目标（§11.2）。
 2. **8-bit 反量化减负**：per-token scale 已经在 MMA 外乘到 S / P 上；剩下的转换开销来自每个 latent 元素被转换两次（QK 用 `ldmatrix`、PV 用
    `ldmatrix.trans` 各从 8-bit smem 读一次再转换）。可以试每个 tile 只转换一次、写成 bf16 smem 共享，用 smem 带宽换 ALU。INT8 现在经 fp32 魔数
    （PRMT + FADD 再打包），比 FP8 的位运算 + `fma.bf16x2` 略贵，与 INT8 在 graph 下略慢一致。
 3. **b≤4 固定开销**：把 metadata 计算并进主 kernel 或提前预取，省一次串行访存（估计 0.5–1 µs）；b≤2 专用的小 combine 路径。
 4. **h_q=8**：swap-AB，让 m16 不浪费一半的 MMA 行。
-5. **整层 GEMM 侧**：融合后 GEMM 占层时间的一半，可以考虑 W_UK 吸收与 q_proj 合并、小 batch 的 split-K GEMM。
+5. **整层 GEMM 侧**：第二阶段已用 skinny GEMM 把 b=8 的四个投影从 61.7 降到 41.5 µs（§11.1）；剩下的是每次 launch 约 2.6 µs 的固定开销，
+   可试 GEMM 之间的 L2 预取链、W_UK 与 prologue 横向融合（各省约 2 µs/层）。
 6. **真实权重精度评估**：目前 8-bit 精度用的是合成统计数据（刻意对 per-token scale 不友好），有 DeepSeek 权重后应复测。
 7. **接入 vLLM**：v2 支持 page 64 与 graph-safe workspace，可以作为 vLLM 的 MLA decode 后端在 3090 上做端到端吞吐评估。
+
+## 11. 第二阶段（2026-10-13）：层 GEMM、8-bit KV 组、combine、h128
+
+先用 ncu（full 集，`--clock-control base`，SM ≈1.38 GHz，`FLASH_MLA_LINEINFO=1` 构建，源码行归因）确认瓶颈，再决定做什么：
+
+* **层 GEMM**：cuBLAS 在 T = b ≤ 64 时只开 32–64 个 CTA（< 82 SM），DRAM 吞吐 qkv_a 61–63%、W_UK 19–39%、W_UV 22–38%、o_proj 51–63%；
+  b=8 时四个 GEMM + reshape 拷贝占每层 busy 时间的 50%。
+* **8-bit kernel**：math-pipe throttle 的 96% 落在 HMMA 指令上，ALU 管线只有 27–34%；每个 SMSP 只有 1 个 warp，HMMA 的延迟没人掩盖。
+  所以要加 warp，而不是减反量化指令。
+* **h128（BM32）**：CPI 9.68，其中 barrier 1.30（每 tile 的 CTA `__syncthreads` 占全部采样 8.5%，组内 S 交换 4.9%）；tensor 38.2%（FP32 累加可达上限的 76%）。
+
+### 11.1 层投影 skinny GEMM（B1，`4c66d76`）
+
+* swap-AB：权重作 `mma.sync m16n8k16` 的 A 操作数（16 行一个 m-tile），token 作 B（n8）；权重行 128 B、XOR swizzle，`cp.async` 多级环形缓冲（48 KB）；
+  CTA 内 4 个 warp 按 k16 步切分 K，最后在 smem 里固定顺序归约（结果确定）。可选 split-K 由最后到达的 CTA 按 split 顺序归约、计数器自复位（graph 安全）。
+* 规则（扫描得出）：splits = 1；n_tile 32（per-head bmm 在 T ≤ 16 时用 16）；单矩阵投影 T > 32 时回退 cuBLAS。W_UV 直接写 [T, H·128] 布局，省掉 reshape 拷贝。
+* 流式阶段约 870 GB/s；剩下的是每次 launch 约 2.6 µs 的固定开销。
+
+| 整层 graph µs/层（27 层，page 64，同一构建背靠背） | b1 s1k | b1 s4k | b8 s1k | b8 s4k | b32 s1k | b32 s4k | b64 s1k | b64 s4k |
+|---|---|---|---|---|---|---|---|---|
+| bf16，cuBLAS | 57.7 | 65.2 | 81.5 | 115.4 | 122.2 | 255.9 | 175.3 | 438.2 |
+| bf16，skinny | 54.1 | 61.3 | **68.4** | **102.0** | 106.8 | 239.3 | 168.4 | 430.7 |
+| FP8，cuBLAS | 58.5 | 65.2 | 80.7 | 100.4 | 106.4 | 188.4 | 140.2 | 303.2 |
+| FP8，skinny | 54.9 | 61.5 | **66.8** | **86.1** | 90.5 | 171.9 | 134.1 | 300.8 |
+
+nsys（b8 s_k4096）：层内 GEMM 62.4 → 43.4 µs。
+
+### 11.2 8-bit：CTA 内两个 KV 组，按负载整次启用（B2，`23dd183`）
+
+* **设计**：BM16 的 8-bit kernel 加第二组 4 个 warp（`CfgQ` 的 KG = 2）。组 g 处理本 part 的第 g、g+2、… 个 tile，各有自己的 2 级 ring、S 交换缓冲和
+  named barrier（两组之间没有逐 tile 的 CTA barrier），段末经 smem 按固定顺序合并 (m, l, O)，组 0 写出。part 数仍是 82，partial / combine 流量不变；
+  每个 SMSP 有 2 个 warp，一个在 HMMA 时另一个可以做反量化。254–255 寄存器，0 spill，1 CTA/SM。
+* **只在长 part 上划算**：每段的 Q 加载和合并是固定开销。两组恒开时，graph 下对旧默认是 0.84–1.10×（短上下文变慢）。
+* **按段启用是错的**：第一次尝试按每段 tile 数决定用一组还是两组，结果同一次 launch 里混着一组和两组的 CTA 时严重变慢（b32 s_k4096 151 µs，
+  旧默认 122 µs）。ncu（boost 时钟、热缓存）显示最慢的 SM 248k 周期，旧默认 199k：单组 CTA 在途只有 1 个 tile，双组 2 个，DRAM 带宽按在途字节分配，
+  单组 CTA 被饿慢，并决定 kernel 尾部。**结论：凡是改变每个 CTA 在途字节的选择，都必须整次 launch 一致。**
+* **整次 launch 一致的选择**：metadata kernel 本来就算出总负载 T 和 part 数，把每 part 负载 `T / P`（32-token 单位，含每段固定开销，所有 part 相同）
+  写进元数据行第 6 个 int；kernel 开头比较它和 `kg_min_tiles`（`FLASH_MLA_SM86_KGMIN`，默认 64），全部 CTA 得出同一个结论。没有 host 同步，graph 安全。
+
+graph，h_q=16，page 64，8 层，GPU1，对旧默认（4 warp）的时间比（>1 更快）：
+
+| FP8：b（行）× s_k（列） | 1024 | 2048 | 4096 | 8192 | 16384 |
+|---|---|---|---|---|---|
+| 16 | 1.01 | 1.02 | 1.02 | 1.00 | 1.05 |
+| 32 | 1.00 | 1.01 | 0.99 | 1.04 | 1.08 |
+| 48 | 1.03 | 1.01 | 1.03 | 1.08 | 1.06 |
+| 64 | 1.02 | 1.01 | 1.06 | 1.10 | 1.07 |
+| 96 | 1.00 | 1.04 | 1.08 | 1.12 | — |
+| 128 | 1.00 | 1.05 | 1.11 | 1.07 | — |
+
+* FP8 全网格 0.993–1.115×，s_k ≤ 2048 最小 0.999；对 bf16 的加速比在 b≥32、s_k≥4096 为 1.55–1.70×（唯一 < 1.6 的是 b32 s_k4096：每 part 50 单位，走单组，1.55×）。
+* INT8 同趋势：0.992–1.072×，b≥32、s_k≥4096 对 bf16 1.54–1.60×。
+* eager 在每 part 75–103 单位处有 0.97–0.99 的格（同一格 graph 是 +3–5%），s_k≥8192 且 b≥64 时 eager 也 +3–8%。
+* 整层（27 层 graph，FP8）：b64 s_k8192 523.3 → 487.3 µs（1.07×），b64 s_k4096 300.7 → 291.2，b32 s_k8192 284.7 → 275.3；其余格 ±1%。
+* 回到旧配置：`FLASH_MLA_SM86_QCFG=16,2,1,32`；`FLASH_MLA_SM86_KGMIN` 调门限（0 = 恒开）。
+
+### 11.3 试了但没保留的
+
+* **combine 单轮读取**（B3）：wide combine 每轮从 64 个 split 提到 96 个，b1 的 82 个 split 一轮读完，逐位一致；但 combine 本来已经是 4.28 µs
+  （不是计划时假设的 5.5–5.7 µs），改后 4.26 µs，没有可测收益。
+* **softmax 跳过 O 的 rescale**（B4）：行最大值没变时缩放因子恰好是 1，用 `__any_sync` 判断后跳过 64 个 FMUL，结果逐位一致；
+  但 decode 反而慢 3–5%（分支让这些 FMUL 不能再和 HMMA 交错）。
+* **h128 两组 ping-pong**（B4）：M 组 1 落后半个 tile，一组做 softmax / PV 时另一组做 QK；逐位一致。NT32 / 2 级时 0.96–0.98×，NT16 配置本身就慢 13–17%。
+  ncu：barrier 1.30 → 1.08，但指令 +5%，math-pipe throttle 不变，tensor 38.2% → 36.7%。h128 BM32 卡在 FP32 累加的 tensor 管线上，错开相位不增加吞吐。
+  目标 55 TFLOPS 未达到（当前默认 53–54 TFLOPS，eager，b≥64、s_k≥4096）。
+
+### 11.4 第二阶段后的整层（27 层 graph，µs/层，s_k=4096，GPU1，`23dd183`）
+
+| b | bf16 | FP8 | 第一阶段 bf16 / FP8（§5.1） |
+|---|---|---|---|
+| 1 | 61.5 | 61.6 | 65.8 / 66.1 |
+| 8 | **102.3** | **86.3** | 117.9 / 102.3 |
+| 32 | 239.5 | 172.0 | 259.3 / 194.3 |
+| 64 | 431.4 | 291.2 | 440.0 / 310.5 |
+
+（第一阶段的数字是另一次测量，同一 GPU、同样 `--cool`；同一构建内的 A/B 见 §11.1、§11.2。）
+
+`docs/bench_matrix.md` 没有重新生成，仍是第一阶段构建的整合矩阵：其中 8-bit 一节是旧默认（单 KV 组），新默认在同条件网格上的对比见 §11.2，
+bf16 / fp16 kernel 第二阶段没有改动。
 
 ## 附：数据来源
 
@@ -323,5 +414,9 @@ tools/prof_nsys.sh <tag> -- python benchmarks/bench_layer.py --mode graph --iter
 | 8-bit 2 CTA/SM | `logs/bench_qm{,2,3}_*.csv`，`logs/mc_qminb{,2,3}_summary.csv` |
 | 整层各后端 | `logs/si_mx_layerB_*.log` |
 | ncu / nsys | `ncu/si_*`，`nsys/si_layer_*` |
+| 第二阶段测量（A1–A3） | `ncu/p2_gemm_*`、`ncu/p2_q8_*_b1a7691li.*`、`ncu/p2_h128_v2_*` |
+| 第二阶段 B1 | `logs/bench_p2_b1_sweep_*.csv`、`logs/bench_p2_b1_layer_*.csv`、`nsys/p2_b1_layer_skinny_b8_4c66d76.*` |
+| 第二阶段 B2 | `logs/bench_p2_b2*_4c66d76b2*.csv`、`logs/p2_b2{,g,f,i}_grid_summary.csv`、`ncu/p2_b2_*`、`nsys/p2_b2_*`、`logs/bench_p2_b2_layer_*_23dd183_*.csv` |
+| 第二阶段 B3 / B4 | `logs/bench_p2_b34_*.csv`、`logs/bench_p2_b4pp_*.csv`、`nsys/p2_b3_comb_*`、`ncu/p2_b4pp_ncu_h128_b64_s4096.txt`；未保留的补丁 `b4_pp_uncommitted.patch`、`patch_b3.py`、`patch_b4.py` |
 
 （路径相对 `/data2/LiuJun/tmp/flashmla/`。）

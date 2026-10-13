@@ -57,9 +57,13 @@ for i in range(num_layers):
 The original Ampere port cannot launch on a GeForce Ampere card (its tile needs 113 KB of shared memory, the sm_86 limit is 99 KB, and it only
 accepts 32-token pages). This branch adds a native sm_86 decode kernel (`impl="v2"`, the default), a graph-safe API, FP16, 16/32/64-token pages,
 an optional FP8 / INT8 KV cache, a fused decode prologue and a DeepSeek-V2-Lite decode layer. On an RTX 3090 (measured peaks: 873.8 GB/s read-only,
-70 TFLOPS bf16) it reaches 93-99% of the DRAM peak at h_q=16, b>=64, s_k>=4096 and 73-75% (eager) / 66-72% (CUDA Graph) of the bf16 tensor peak at h_q=128, b>=16, s_k>=4096; see
+70 TFLOPS bf16) it reaches 93-99% of the DRAM peak at h_q=16, b>=64, s_k>=4096 and 73-75% (eager) / 66-72% (CUDA Graph) of the bf16 tensor peak at h_q=128, b>=16, s_k>=4096.
+With an 8-bit KV cache the kernel runs two KV groups per CTA once the load per part is large enough, which makes FP8 1.55-1.70x faster than bf16
+under CUDA Graph at b>=32, s_k>=4096; in the decode layer the four projections run on a weight-streaming skinny GEMM (b=8, s_k=4096:
+GEMMs 62 -> 43 us, whole layer 1.13x bf16 / 1.17x FP8 over cuBLAS). See
 [docs/ampere_opt_report.md](docs/ampere_opt_report.md) for design, measurements and what did not work, and
-[docs/bench_matrix.md](docs/bench_matrix.md) for the full matrix against legacy, Triton and FlashInfer.
+[docs/bench_matrix.md](docs/bench_matrix.md) for the full matrix against legacy, Triton and FlashInfer (first-release build; its 8-bit
+section predates the two KV groups, see report section 11.2).
 
 ```bash
 # build for sm_86 only (nvcc >= 12.x; tested with nvcc 12.4 + torch 2.7.1+cu126), in place
@@ -67,7 +71,7 @@ FLASH_MLA_ARCH=86 python setup.py build_ext --inplace       # or tools/build.sh
 #   FLASH_MLA_LINEINFO=1  adds -lineinfo (ncu source view);  FLASH_MLA_DEFINES="FLASH_MLA_SM86_NT_SMALL=32 ..." sets kernel tunables
 CUDA_VISIBLE_DEVICES=0 python -m pytest tests/test_flash_mla_sm86.py tests/test_flash_mla_sm86_quant.py \
     tests/test_fused_prologue.py tests/test_fused_layer.py tests/test_kv_quant.py tests/test_decode_layer_e2e.py \
-    tests/test_flash_mla_sm80.py -q                          # the last one: the fork's own test, impl = legacy and v2
+    tests/test_skinny_gemm.py tests/test_flash_mla_sm80.py -q   # the last one: the fork's own test, impl = legacy and v2
 ```
 
 ```python
@@ -90,9 +94,14 @@ kvq, scale = flash_mla.quantize_kv(kv_native.view(-1, page, 576), "fp8")        
 md, nsplit = flash_mla.get_mla_metadata(cache_seqlens, s_q * h_q, 1, kv_dtype="fp8")
 o, lse = flash_mla.flash_mla_with_kvcache(q, kvq, block_table, cache_seqlens, 512, md, nsplit, softmax_scale=(128 + 64) ** -0.5,
                                            kv_scale=scale, kv_dtype="fp8")
+# h_q*s_q <= 16: two KV groups per CTA when the load per part (metadata column 6, 32-token units) is >= 64, else one.
+#   env FLASH_MLA_SM86_KGMIN=<n> moves the threshold (0 = always two groups); FLASH_MLA_SM86_QCFG="16,2,1,32" restores the
+#   single-group plan of the first release.
 
 # a whole DeepSeek-V2-Lite decode layer: q_proj/kv_a_proj -> absorption bmm -> fused prologue (RoPE, RMSNorm, concat,
-# paged-cache write, optional quantize-on-write) -> v2 attention -> W_UV bmm -> o_proj, whole step capturable in one CUDA Graph
+# paged-cache write, optional quantize-on-write) -> v2 attention -> W_UV bmm -> o_proj, whole step capturable in one CUDA Graph;
+# MLADecodeLayer(..., gemm="auto") runs the projections on the skinny GEMM for b*s_q <= 64 (q/kv_a and o_proj go back to
+# cuBLAS above 32 tokens, the per-head bmms stay); gemm="torch" keeps cuBLAS everywhere
 from flash_mla import MLAConfig, MLADecodeLayer, alloc_cache, make_state, capture_layer_graph
 ```
 
