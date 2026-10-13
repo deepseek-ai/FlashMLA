@@ -1,6 +1,6 @@
 # FlashMLA on Ampere（RTX 3090, sm_86）MLA decode 优化报告
 
-分支 `opt/sm86`（pzhao-eng/FlashMLA `a100_replace` 的 Ampere 移植之上），数据对应提交 `04b3338` / `1714846`；第二阶段（§11）对应 `4c66d76` / `23dd183`。测量日期 2026-10-12 ~ 10-13。
+分支 `opt/sm86`（pzhao-eng/FlashMLA `a100_replace` 的 Ampere 移植之上），数据对应提交 `2af5251` / `3c59398`；第二阶段（§11）对应 `f5b32bb` / `997a632`。测量日期 2026-10-12 ~ 10-13。
 所有数字都能在 `/data2/LiuJun/tmp/flashmla/{logs,ncu,nsys}` 的 CSV / 日志 / 报告里找到；完整矩阵见 [bench_matrix.md](bench_matrix.md)，
 kernel 侧过程记录见 [perf_log_kernel.md](perf_log_kernel.md)，系统侧见 [perf_log_sys.md](perf_log_sys.md)。
 
@@ -334,7 +334,7 @@ tools/prof_nsys.sh <tag> -- python benchmarks/bench_layer.py --mode graph --iter
   所以要加 warp，而不是减反量化指令。
 * **h128（BM32）**：CPI 9.68，其中 barrier 1.30（每 tile 的 CTA `__syncthreads` 占全部采样 8.5%，组内 S 交换 4.9%）；tensor 38.2%（FP32 累加可达上限的 76%）。
 
-### 11.1 层投影 skinny GEMM（B1，`4c66d76`）
+### 11.1 层投影 skinny GEMM（B1，`f5b32bb`）
 
 * swap-AB：权重作 `mma.sync m16n8k16` 的 A 操作数（16 行一个 m-tile），token 作 B（n8）；权重行 128 B、XOR swizzle，`cp.async` 多级环形缓冲（48 KB）；
   CTA 内 4 个 warp 按 k16 步切分 K，最后在 smem 里固定顺序归约（结果确定）。可选 split-K 由最后到达的 CTA 按 split 顺序归约、计数器自复位（graph 安全）。
@@ -350,7 +350,7 @@ tools/prof_nsys.sh <tag> -- python benchmarks/bench_layer.py --mode graph --iter
 
 nsys（b8 s_k4096）：层内 GEMM 62.4 → 43.4 µs。
 
-### 11.2 8-bit：CTA 内两个 KV 组，按负载整次启用（B2，`23dd183`）
+### 11.2 8-bit：CTA 内两个 KV 组，按负载整次启用（B2，`997a632`）
 
 * **设计**：BM16 的 8-bit kernel 加第二组 4 个 warp（`CfgQ` 的 KG = 2）。组 g 处理本 part 的第 g、g+2、… 个 tile，各有自己的 2 级 ring、S 交换缓冲和
   named barrier（两组之间没有逐 tile 的 CTA barrier），段末经 smem 按固定顺序合并 (m, l, O)，组 0 写出。part 数仍是 82，partial / combine 流量不变；
@@ -389,7 +389,7 @@ graph，h_q=16，page 64，8 层，GPU1，对旧默认（4 warp）的时间比�
   ncu：barrier 1.30 → 1.08，但指令 +5%，math-pipe throttle 不变，tensor 38.2% → 36.7%。h128 BM32 卡在 FP32 累加的 tensor 管线上，错开相位不增加吞吐。
   目标 55 TFLOPS 未达到（当前默认 53–54 TFLOPS，eager，b≥64、s_k≥4096）。
 
-### 11.4 第二阶段后的整层（27 层 graph，µs/层，s_k=4096，GPU1，`23dd183`）
+### 11.4 第二阶段后的整层（27 层 graph，µs/层，s_k=4096，GPU1，`997a632`）
 
 | b | bf16 | FP8 | 第一阶段 bf16 / FP8（§5.1） |
 |---|---|---|---|
@@ -419,4 +419,4 @@ bf16 / fp16 kernel 第二阶段没有改动。
 | 第二阶段 B2 | `logs/bench_p2_b2*_4c66d76b2*.csv`、`logs/p2_b2{,g,f,i}_grid_summary.csv`、`ncu/p2_b2_*`、`nsys/p2_b2_*`、`logs/bench_p2_b2_layer_*_23dd183_*.csv` |
 | 第二阶段 B3 / B4 | `logs/bench_p2_b34_*.csv`、`logs/bench_p2_b4pp_*.csv`、`nsys/p2_b3_comb_*`、`ncu/p2_b4pp_ncu_h128_b64_s4096.txt`；未保留的补丁 `b4_pp_uncommitted.patch`、`patch_b3.py`、`patch_b4.py` |
 
-（路径相对 `/data2/LiuJun/tmp/flashmla/`。）
+（路径相对 `/data2/LiuJun/tmp/flashmla/`。文件名里的提交号是历史改写（只改提交信息和作者署名）之前的编号，代码内容相同：`04b3338` = `2af5251`，`1714846` = `3c59398`，`b1a7691` = `acba409`，`4c66d76` = `f5b32bb`，`23dd183` = `997a632`。）
