@@ -82,9 +82,9 @@ inline Plan pick_plan(int M, int page_size) {
     return p;
 }
 
-// Quantized-KV kernels (fp8 e4m3 / int8): rows per CTA, ring stages, CTAs per SM.
+// Quantized-KV kernels (fp8 e4m3 / int8): rows per CTA, ring stages, CTAs per SM, KV groups (warp sets per CTA, BM 16).
 struct PlanQ {
-    int bm, nt, ns, minb;
+    int bm, nt, ns, minb, kg;
 };
 #ifndef FLASH_MLA_SM86_QNT            // tokens per tile of the quantized kernels (16 or 32; clamped to the page size)
 #define FLASH_MLA_SM86_QNT 32
@@ -95,16 +95,23 @@ struct PlanQ {
 #ifndef FLASH_MLA_SM86_QMINB          // CTAs per SM of the quantized kernels with BM=16
 #define FLASH_MLA_SM86_QMINB 1
 #endif
-// FLASH_MLA_SM86_QCFG="bm,ns[,minb[,nt]]" overrides at run time.
+#ifndef FLASH_MLA_SM86_QKG            // KV groups of the quantized kernels with BM=16 (1: 4 warps, 2: 8 warps)
+#define FLASH_MLA_SM86_QKG 2
+#endif
+#ifndef FLASH_MLA_SM86_KGMIN          // with 2 KV groups: launches with a load per part below this (32-token units) use KV group 0 only
+#define FLASH_MLA_SM86_KGMIN 64       // R-057: >= 76 units/part +3..11% (graph), <= 53 units slower with two groups
+#endif
+// FLASH_MLA_SM86_QCFG="bm,ns[,minb[,nt[,kg]]]" overrides at run time.
 inline PlanQ pick_plan_q(int M) {
     PlanQ p;
     p.bm = (M <= 16) ? 16 : 32;
     p.nt = FLASH_MLA_SM86_QNT;
     p.ns = FLASH_MLA_SM86_QNS;   // 2 stages of 32 tokens (BM 16 and 32): measured best on sm_86
     p.minb = p.bm == 16 ? FLASH_MLA_SM86_QMINB : 1;
+    p.kg = p.bm == 16 ? FLASH_MLA_SM86_QKG : 1;
     if (const char *e = std::getenv("FLASH_MLA_SM86_QCFG")) {
-        int bm, ns, mb = 1, nt = p.nt;
-        if (std::sscanf(e, "%d,%d,%d,%d", &bm, &ns, &mb, &nt) >= 2) { p.bm = bm; p.ns = ns; p.minb = mb; p.nt = nt; }
+        int bm, ns, mb = 1, nt = p.nt, kg = 1;
+        if (std::sscanf(e, "%d,%d,%d,%d,%d", &bm, &ns, &mb, &nt, &kg) >= 2) { p.bm = bm; p.ns = ns; p.minb = mb; p.nt = nt; p.kg = kg; }
     }
     return p;
 }
@@ -129,6 +136,8 @@ inline int num_sm_parts_for(int M, int h_k, int sm_count) {
 inline int sched_granule(int /*M*/) { return 32; }
 // Max splits per batch element merged by the fused (last-arriver) combine; larger counts use the combine kernel.
 inline int fuse_max_splits_default() { return env_int("FLASH_MLA_SM86_FUSE", FLASH_MLA_SM86_FUSE); }
+// Min load per part (scheduler units) for the second KV group to work (quantized kernels with kg = 2).  Env FLASH_MLA_SM86_KGMIN.
+inline int kg_min_tiles_default() { return env_int("FLASH_MLA_SM86_KGMIN", FLASH_MLA_SM86_KGMIN); }
 // Tunables of the metadata builder (units = scheduler granules).  Overridable with FLASH_MLA_SM86_OV / _MINBLK.
 inline int sched_overhead_blocks() { return env_int("FLASH_MLA_SM86_OV", FLASH_MLA_SM86_OV); }
 inline int sched_min_blocks_per_part() { return env_int("FLASH_MLA_SM86_MINBLK", FLASH_MLA_SM86_MINBLK); }

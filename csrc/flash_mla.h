@@ -54,6 +54,10 @@ struct Flash_fwd_mla_params {
     const float *__restrict__ kv_scale_ptr = nullptr;
     // One of the kKV* values below.
     int kv_dtype = 0;
+    // Quantized kernels with two KV groups (QCFG kg = 2): the second group works only when the scheduler load per part
+    // (metadata int 6, 32-token units incl. the per-segment overhead; the same for all parts) is >= this, else KV group 0
+    // runs alone.  0 => always both groups.
+    int kg_min_tiles = 0;
 };
 
 // Values for Flash_fwd_mla_params::kv_dtype.

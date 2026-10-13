@@ -7,8 +7,11 @@
 // middle of a batch element (split-KV).  All num_sm_parts ranges are located in parallel by binary search on the
 // prefix sums of the costs, instead of the single-thread serial loop of the original implementation.
 //
-// Output format is identical to the legacy kernels:
-//   tile_scheduler_metadata[p] = {begin_idx, begin_seqlen, end_idx, end_seqlen, begin_n_split_idx, 0, 0, 0}
+// Output format (the legacy kernels read the first five ints):
+//   tile_scheduler_metadata[p] = {begin_idx, begin_seqlen, end_idx, end_seqlen, begin_n_split_idx, seqlen_k[begin_idx],
+//                                 units_per_part, 0}
+// units_per_part = T / P_eff is the same for every part: the 8-bit kernels with two KV groups use it to make one choice for
+// the whole launch (a per-part choice would mix CTAs with 1 and 2 tiles in flight, which starves the former, R-056).
 //   num_splits[i]              = number of splits of all batch elements < i (prefix sum), num_splits[b] = total.
 // A CTA whose range is empty gets begin_idx = b (the main kernels return immediately).
 
@@ -96,6 +99,7 @@ get_mla_metadata_kernel(__grid_constant__ const Mla_metadata_params params) {
         blk = off < ov ? 0 : off - ov;
     };
 
+    const int units_per_part = (int)(total / Pe);
     for (int p = tid; p < P; p += kMetaThreads) {
         int bi, bblk, ei, eblk;
         int *out = params.tile_scheduler_metadata_ptr + p * TileSchedulerMetaDataSize;
@@ -117,7 +121,7 @@ get_mla_metadata_kernel(__grid_constant__ const Mla_metadata_params params) {
             }
         }
         *reinterpret_cast<int4 *>(out) = m0;
-        *reinterpret_cast<int4 *>(out + 4) = make_int4(m4, m5, 0, 0);
+        *reinterpret_cast<int4 *>(out + 4) = make_int4(m4, m5, units_per_part, 0);
     }
 
     // ---- num_splits: splits_i = part(last unit) - part(first block unit) + 1; exclusive scan ----

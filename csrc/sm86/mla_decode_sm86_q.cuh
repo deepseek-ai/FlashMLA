@@ -11,6 +11,13 @@
 //     lane own 4 contiguous output dims in the epilogue).
 //   * The per-token scale is applied in fp32 outside the MMAs:  S = scale_t * (Q_nope . q_t) + Q_rope . k_rope_t   and
 //     O += (P * scale_t) . q_t   (the softmax row sums use the unscaled P).
+//   * KV groups (KG = 2, BM 16): warps 4-7 form a second set of 4 warps that takes the odd tiles of every part (own ring,
+//     own S exchange buffer, named barriers 1+kg / 3+kg instead of the CTA barrier), so each SM sub-partition holds two
+//     warps that interleave HMMA bursts with dequant work (R-048) without doubling the split count; the two (m, l, O)
+//     states are merged through smem in a fixed order at the end of a segment and KV group 0 writes the result.
+//     The second group only works when the load per part (metadata int 6) is >= params.kg_min_tiles: the Q load and the
+//     merge are per-segment costs that short parts do not amortize (R-055).  The choice is made for the whole launch -- a
+//     CTA with one group keeps half the bytes in flight of a CTA with two and gets starved of DRAM bandwidth (R-056).
 #pragma once
 
 #include "mla_decode_sm86.cuh"
@@ -20,13 +27,15 @@ namespace mla_sm86 {
 constexpr int kQRowBytes = 640;   // 512 B latent + 128 B rope
 constexpr int kQChunks = 40;      // 16-byte chunks per row
 
-template <typename T_, int KVQ_, int BM_, int NT_, int NS_, int MINB_ = 1>
+template <typename T_, int KVQ_, int BM_, int NT_, int NS_, int MINB_ = 1, int KG_ = 1>
 struct CfgQ {
     using T = T_;
     static constexpr int kKVQ = KVQ_;   // kKVFp8E4m3 or kKVInt8
     static constexpr int kBM = BM_;
     static constexpr int kGroups = BM_ / 16;
-    static constexpr int kConsWarps = kGroups * 4;
+    static constexpr int kKG = KG_;                      // KV groups (warp sets splitting the tiles of a part)
+    static constexpr int kGrpThreads = kGroups * 128;    // threads of one KV group
+    static constexpr int kConsWarps = kGroups * 4 * KG_;
     static constexpr int kConsThreads = kConsWarps * 32;
     static constexpr int kNThreads = kConsThreads;
     static constexpr int kNt = NT_;
@@ -34,10 +43,13 @@ struct CfgQ {
     static constexpr int kStages = NS_;
     static constexpr int kMinB = MINB_;
     static constexpr int kStageBytes = kNt * kQRowBytes + 128;   // Nt rows + per-token scales (4*Nt <= 128 B)
-    static constexpr int kRingBytes = NS_ * kStageBytes;
-    static constexpr int kSBytes = kGroups * 4 * kNT8 * 32 * 16;
-    static constexpr int kSmem = kRingBytes + kSBytes;
+    static constexpr int kRingBytes = NS_ * kStageBytes;                    // per KV group
+    static constexpr int kSBytes = KG_ * kGroups * 4 * kNT8 * 32 * 16;
+    static constexpr int kMergeBytes = KG_ > 1 ? 4 * 68 * 32 * 4 : 0;       // KV group 1: acc_o (64) + m0 m1 l0 l1 per lane
+    static constexpr int kSmem = KG_ * kRingBytes + kSBytes;
     static_assert(BM_ == 16 || BM_ == 32, "BM must be 16 or 32");
+    static_assert(KG_ == 1 || (KG_ == 2 && BM_ == 16), "KV groups: KG 2 needs BM 16");
+    static_assert(KG_ * kRingBytes >= kMergeBytes, "the merge buffer reuses the ring");
     static_assert(NT_ == 16 || NT_ == 32, "Nt must be 16 or 32");
     static_assert(NS_ >= 2 && NS_ <= 8, "need 2..8 stages");
 };
@@ -178,7 +190,7 @@ __device__ __forceinline__ void pv_stage_q(const uint32_t (&pa)[CQ::kNt / 16][4]
 
 template <typename CQ, typename ET>
 __device__ __forceinline__ void compute_tile_q(
-    const uint32_t sbase, const int tok0, float4 *sS_mine, const float4 *sS_grp, const int grp, const uint32_t (&kqq_off)[4], const uint32_t rope_off,
+    const uint32_t sbase, const int tok0, float4 *sS_mine, const float4 *sS_grp, const int xbar, const uint32_t (&kqq_off)[4], const uint32_t rope_off,
     const uint32_t (&vqq_off)[4], const int t, const float sl2, const uint32_t (&qf)[9][4], float (&acc_o)[16][4], float &m0, float &m1, float &l0,
     float &l1, const int lim0, const int lim1, const int mask_min) {
     constexpr int NT8 = CQ::kNT8;
@@ -192,7 +204,7 @@ __device__ __forceinline__ void compute_tile_q(
     float sacc[NT8][4];
     qk_stage_q<CQ, ET>(sbase, kqq_off, rope_off, qf, sc, sacc);
     exch_store<CQ>(sS_mine, sacc);
-    bar_sync(1 + grp, 128);
+    bar_sync(xbar, 128);
     float s[NT8][4];
     exch_sum<CQ>(sS_grp, s);
     mask_stage<CQ>(s, tok0, t, lim0, lim1, mask_min);
@@ -212,12 +224,16 @@ mla_decode_q_kernel(const __grid_constant__ Flash_fwd_mla_params params) {
     constexpr int NS = C::kStages;
 
     extern __shared__ __align__(128) unsigned char smem_buf[];
-    const uint32_t ring_u32 = smem_u32(smem_buf);
-    float4 *sS_all = reinterpret_cast<float4 *>(smem_buf + C::kRingBytes);
+    float4 *sS_all = reinterpret_cast<float4 *>(smem_buf + C::kKG * C::kRingBytes);
 
     const int tid = threadIdx.x;
     const int warp = tid >> 5, lane = tid & 31;
     const int grp = (warp >> 2) % C::kGroups, j = warp & 3;
+    const int kg = warp / (4 * C::kGroups);              // KV group: takes tiles kg, kg + KG, kg + 2 KG, ... of a part
+    const int gtid = tid - kg * C::kGrpThreads;          // thread index inside the KV group (cp.async issue)
+    const int xbar = 1 + kg * C::kGroups + grp;          // named barrier of the S exchange (128 threads)
+    const bool writer = kg == 0;                         // KV group 0 holds the merged state and writes O / LSE
+    const uint32_t ring_u32 = smem_u32(smem_buf) + kg * C::kRingBytes;
     const int g = lane >> 2, t = lane & 3;
     const int m_block = blockIdx.x, bidh = blockIdx.y, part = blockIdx.z;
 
@@ -227,6 +243,8 @@ mla_decode_q_kernel(const __grid_constant__ Flash_fwd_mla_params params) {
     const int begin_n_split_idx = md2.x;
     const int begin_idx = md.x, begin_seqlen = md.y, end_idx = md.z, end_seqlen = md.w;
     if (begin_idx >= params.b) return;
+    // KV groups at work (uniform over the launch): two only when every part carries at least kg_min_tiles units
+    const int kgs = (C::kKG == 2 && md2.z >= params.kg_min_tiles) ? 2 : 1;
 
     const int M = params.seqlen_q;
     const int row0 = m_block * C::kBM + grp * 16 + g;
@@ -247,8 +265,8 @@ mla_decode_q_kernel(const __grid_constant__ Flash_fwd_mla_params params) {
     }
     const uint32_t rope_off = (8 * (mi >> 1) + ri) * kQRowBytes + (((32 + 2 * j + (mi & 1)) ^ ri) << 4);
 
-    float4 *sS_mine_base = sS_all + ((grp * 4 + j) * NT8) * 32 + lane;
-    const float4 *sS_grp_base = sS_all + (grp * 4 * NT8) * 32 + lane;
+    float4 *sS_mine_base = sS_all + (((kg * C::kGroups + grp) * 4 + j) * NT8) * 32 + lane;
+    const float4 *sS_grp_base = sS_all + ((kg * C::kGroups + grp) * 4 * NT8) * 32 + lane;
 
     const uint8_t *kbase = reinterpret_cast<const uint8_t *>(params.k_ptr) + (int64_t)bidh * params.k_head_stride;
     const int64_t k_row_stride = params.k_row_stride;
@@ -263,16 +281,18 @@ mla_decode_q_kernel(const __grid_constant__ Flash_fwd_mla_params params) {
         const int n_split_idx = (batch_id == begin_idx) ? begin_n_split_idx : 0;
         const bool split = !(tok_begin == 0 && tok_end == seqlen_k);
         const int n_tiles = (tok_end - tok_begin + NT - 1) / NT;
+        const int n_my = (kg < kgs && n_tiles > kg) ? (n_tiles - kg + kgs - 1) / kgs : 0;   // this KV group's tiles
+        auto tile_tok = [&](int i) { return tok_begin + (kg + i * kgs) * NT; };              // first token of local tile i
 
         const int *bt = params.block_table + (int64_t)batch_id * params.block_table_batch_stride;
         const int bt_last = (int)params.block_table_batch_stride - 1;
-        auto load_pg = [&](int n) { return __ldg(bt + min((tok_begin + n * NT) >> ps_shift, bt_last)); };
+        auto load_pg = [&](int i) { return __ldg(bt + min(tile_tok(i) >> ps_shift, bt_last)); };
 
         if (batch_id > begin_idx) __syncthreads();   // previous segment is done with the smem ring
 
         // ---- Q -> registers; fp8 k-steps (i < 8) use the dim permutation (0,2 | 1,3) of the converted K fragments ----
         uint32_t qf[9][4];
-        {
+        if (C::kKG == 1 || n_my > 0) {
             const T *qb = reinterpret_cast<const T *>(params.q_ptr) + (int64_t)batch_id * params.q_batch_stride +
                           (int64_t)bidh * params.q_head_stride;
             const T *q0 = qb + (int64_t)row0 * params.q_row_stride;
@@ -300,11 +320,11 @@ mla_decode_q_kernel(const __grid_constant__ Flash_fwd_mla_params params) {
         for (int s = 0; s < NS; ++s) pgv[s] = load_pg(s);
 #pragma unroll
         for (int s = 0; s < NS - 1; ++s) {
-            if (s < n_tiles) {
-                const int tok0 = tok_begin + s * NT;
+            if (s < n_my) {
+                const int tok0 = tile_tok(s);
                 const uint8_t *src = kbase + (int64_t)pgv[s] * k_batch_stride + (int64_t)(tok0 & ps_mask) * k_row_stride;
                 const float *ssrc = scale_base + (int64_t)pgv[s] * params.page_block_size + (tok0 & ps_mask);
-                issue_tile_copy_q<NT, C::kNThreads>(ring_u32 + s * C::kStageBytes, src, k_row_stride, ssrc, tok0, seqlen_k, tid);
+                issue_tile_copy_q<NT, C::kGrpThreads>(ring_u32 + s * C::kStageBytes, src, k_row_stride, ssrc, tok0, seqlen_k, gtid);
             }
             cp_async_commit();
         }
@@ -325,25 +345,62 @@ mla_decode_q_kernel(const __grid_constant__ Flash_fwd_mla_params params) {
 
         int rd_slot = 0, wr_slot = NS - 1;
 #pragma unroll 1
-        for (int n = 0; n < n_tiles; ++n) {
-            const int tok0 = tok_begin + n * NT;
+        for (int n = 0; n < n_my; ++n) {
+            const int tok0 = tile_tok(n);
             cp_async_wait<NS - 2>();
-            __syncthreads();
+            if constexpr (C::kKG == 1) __syncthreads();
+            else bar_sync(3 + kg, C::kGrpThreads);   // this KV group's ring only: the groups run decoupled
             {
                 const int pg_cur = pg_pending;
                 pg_pending = load_pg(n + NS);
-                if (n + NS - 1 < n_tiles) {
-                    const int tok_p = tok_begin + (n + NS - 1) * NT;
+                if (n + NS - 1 < n_my) {
+                    const int tok_p = tile_tok(n + NS - 1);
                     const uint8_t *src = kbase + (int64_t)pg_cur * k_batch_stride + (int64_t)(tok_p & ps_mask) * k_row_stride;
                     const float *ssrc = scale_base + (int64_t)pg_cur * params.page_block_size + (tok_p & ps_mask);
-                    issue_tile_copy_q<NT, C::kNThreads>(ring_u32 + wr_slot * C::kStageBytes, src, k_row_stride, ssrc, tok_p, seqlen_k, tid);
+                    issue_tile_copy_q<NT, C::kGrpThreads>(ring_u32 + wr_slot * C::kStageBytes, src, k_row_stride, ssrc, tok_p, seqlen_k, gtid);
                 }
             }
             cp_async_commit();
-            compute_tile_q<C, ET>(ring_u32 + rd_slot * C::kStageBytes, tok0, sS_mine_base, sS_grp_base, grp, kqq_off, rope_off, vqq_off, t, sl2, qf,
+            compute_tile_q<C, ET>(ring_u32 + rd_slot * C::kStageBytes, tok0, sS_mine_base, sS_grp_base, xbar, kqq_off, rope_off, vqq_off, t, sl2, qf,
                                   acc_o, m0, m1, l0, l1, lim0, lim1, mask_min);
             rd_slot = (rd_slot + 1 == NS) ? 0 : rd_slot + 1;
             wr_slot = (wr_slot + 1 == NS) ? 0 : wr_slot + 1;
+        }
+
+        if (C::kKG == 2 && kgs == 2) {   // CTA-uniform
+            // merge KV group 1 into group 0 (same lane layout): O = O0 * 2^((m0-m) sl2) + O1 * 2^((m1-m) sl2), l likewise
+            __syncthreads();   // both groups are done with their rings; the merge buffer reuses ring memory
+            float *mb = reinterpret_cast<float *>(smem_buf) + j * (68 * 32) + lane;
+            if (kg == 1) {
+#pragma unroll
+                for (int i = 0; i < 16; ++i)
+#pragma unroll
+                    for (int e = 0; e < 4; ++e) mb[(4 * i + e) * 32] = acc_o[i][e];
+                mb[64 * 32] = m0;
+                mb[65 * 32] = m1;
+                mb[66 * 32] = l0;
+                mb[67 * 32] = l1;
+            }
+            __syncthreads();
+            if (kg == 0) {
+                const float mo0 = mb[64 * 32], mo1 = mb[65 * 32];
+                const float nm0 = fmaxf(m0, mo0), nm1 = fmaxf(m1, mo1);
+                const float ms0 = (nm0 == -INFINITY) ? 0.f : nm0;
+                const float ms1 = (nm1 == -INFINITY) ? 0.f : nm1;
+                const float fa0 = ex2_approx((m0 - ms0) * sl2), fb0 = ex2_approx((mo0 - ms0) * sl2);
+                const float fa1 = ex2_approx((m1 - ms1) * sl2), fb1 = ex2_approx((mo1 - ms1) * sl2);
+                l0 = l0 * fa0 + mb[66 * 32] * fb0;
+                l1 = l1 * fa1 + mb[67 * 32] * fb1;
+#pragma unroll
+                for (int i = 0; i < 16; ++i) {
+                    acc_o[i][0] = acc_o[i][0] * fa0 + mb[(4 * i + 0) * 32] * fb0;
+                    acc_o[i][1] = acc_o[i][1] * fa0 + mb[(4 * i + 1) * 32] * fb0;
+                    acc_o[i][2] = acc_o[i][2] * fa1 + mb[(4 * i + 2) * 32] * fb1;
+                    acc_o[i][3] = acc_o[i][3] * fa1 + mb[(4 * i + 3) * 32] * fb1;
+                }
+                m0 = nm0;
+                m1 = nm1;
+            }
         }
 
         // ---- epilogue: lane owns dims 128j + 16P + 4t + {0..3} of rows g / g+8:  (X.c, Y.c, X.c', Y.c') = acc_o[2P], acc_o[2P+1] ----
@@ -357,7 +414,7 @@ mla_decode_q_kernel(const __grid_constant__ Flash_fwd_mla_params params) {
         const float inv0 = bad0 ? 1.f : 1.f / l0;
         const float inv1 = bad1 ? 1.f : 1.f / l1;
         const int hh = params.h;
-        if (!split) {
+        if (!split && writer) {
             T *ob = reinterpret_cast<T *>(params.o_ptr) + (int64_t)batch_id * params.o_batch_stride + (int64_t)bidh * params.o_head_stride;
             T *o0 = ob + (int64_t)row0 * params.o_row_stride + 128 * j + 4 * t;
             T *o1 = ob + (int64_t)row1 * params.o_row_stride + 128 * j + 4 * t;
@@ -381,7 +438,7 @@ mla_decode_q_kernel(const __grid_constant__ Flash_fwd_mla_params params) {
                 if (rv0) lp[row0] = lse0;
                 if (rv1) lp[row1] = lse1;
             }
-        } else {
+        } else if (split) {
             const int split_offset = __ldg(params.num_splits_ptr + batch_id);
             const int64_t slot = split_offset + n_split_idx;
             float *oa = reinterpret_cast<float *>(params.oaccum_ptr) + ((slot * hh + bidh) * M) * kDV;
@@ -389,14 +446,14 @@ mla_decode_q_kernel(const __grid_constant__ Flash_fwd_mla_params params) {
             float *o1 = oa + (int64_t)row1 * kDV + 128 * j + 4 * t;
 #pragma unroll
             for (int P = 0; P < 8; ++P) {
-                if (rv0)
+                if (writer && rv0)
                     *reinterpret_cast<float4 *>(o0 + 16 * P) =
                         make_float4(acc_o[2 * P][0] * inv0, acc_o[2 * P + 1][0] * inv0, acc_o[2 * P][1] * inv0, acc_o[2 * P + 1][1] * inv0);
-                if (rv1)
+                if (writer && rv1)
                     *reinterpret_cast<float4 *>(o1 + 16 * P) =
                         make_float4(acc_o[2 * P][2] * inv1, acc_o[2 * P + 1][2] * inv1, acc_o[2 * P][3] * inv1, acc_o[2 * P + 1][3] * inv1);
             }
-            if (j == 0 && t == 0) {
+            if (writer && j == 0 && t == 0) {
                 float *la = reinterpret_cast<float *>(params.softmax_lseaccum_ptr) + (slot * hh + bidh) * M;
                 if (rv0) la[row0] = lse0;
                 if (rv1) la[row1] = lse1;
@@ -448,23 +505,27 @@ void mla_sm86_run_q_impl(Flash_fwd_mla_params &p, cudaStream_t stream) {
     PlanQ plan = pick_plan_q(p.seqlen_q);
     if (plan.nt > p.page_block_size) { plan.nt = p.page_block_size; if (plan.ns < 3) plan.ns = 3; }   // tile within one page
     bool launched = false;
-#define MLA_SM86_QCASE(BM_, NT_, NS_, MB_)                                                    \
-    if (plan.bm == BM_ && plan.nt == NT_ && plan.ns == NS_ && plan.minb == MB_) {             \
-        launch_main_q<CfgQ<T, KVQ, BM_, NT_, NS_, MB_>>(p, stream);                           \
-        launched = true;                                                                      \
+#define MLA_SM86_QCASE(BM_, NT_, NS_, MB_, KG_)                                                       \
+    if (plan.bm == BM_ && plan.nt == NT_ && plan.ns == NS_ && plan.minb == MB_ && plan.kg == KG_) {   \
+        launch_main_q<CfgQ<T, KVQ, BM_, NT_, NS_, MB_, KG_>>(p, stream);                              \
+        launched = true;                                                                              \
     }
-    MLA_SM86_QCASE(16, 16, 3, 1)
-    MLA_SM86_QCASE(16, 16, 4, 1)
-    MLA_SM86_QCASE(16, 16, 5, 1)
-    MLA_SM86_QCASE(16, 16, 3, 2)
-    MLA_SM86_QCASE(16, 32, 2, 2)
-    MLA_SM86_QCASE(16, 32, 2, 1)
-    MLA_SM86_QCASE(16, 32, 3, 1)
-    MLA_SM86_QCASE(16, 32, 4, 1)
-    MLA_SM86_QCASE(32, 16, 3, 1)
-    MLA_SM86_QCASE(32, 16, 4, 1)
-    MLA_SM86_QCASE(32, 32, 2, 1)
-    MLA_SM86_QCASE(32, 32, 3, 1)
+    MLA_SM86_QCASE(16, 16, 3, 1, 1)
+    MLA_SM86_QCASE(16, 16, 4, 1, 1)
+    MLA_SM86_QCASE(16, 16, 5, 1, 1)
+    MLA_SM86_QCASE(16, 16, 3, 2, 1)
+    MLA_SM86_QCASE(16, 32, 2, 2, 1)
+    MLA_SM86_QCASE(16, 32, 2, 1, 1)
+    MLA_SM86_QCASE(16, 32, 3, 1, 1)
+    MLA_SM86_QCASE(16, 32, 4, 1, 1)
+    MLA_SM86_QCASE(16, 16, 2, 1, 2)   // two KV groups (8 warps), 1 CTA/SM
+    MLA_SM86_QCASE(16, 16, 3, 1, 2)
+    MLA_SM86_QCASE(16, 16, 4, 1, 2)
+    MLA_SM86_QCASE(16, 32, 2, 1, 2)
+    MLA_SM86_QCASE(32, 16, 3, 1, 1)
+    MLA_SM86_QCASE(32, 16, 4, 1, 1)
+    MLA_SM86_QCASE(32, 32, 2, 1, 1)
+    MLA_SM86_QCASE(32, 32, 3, 1, 1)
 #undef MLA_SM86_QCASE
     FLASH_ASSERT(launched);
 }
@@ -478,6 +539,7 @@ void mla_sm86_run_q(Flash_fwd_mla_params &p, cudaStream_t stream) {
     FLASH_ASSERT(p.k_row_stride == kQRowBytes && (p.k_batch_stride % 128) == 0);
     if (p.combine_counters == nullptr) p.fuse_max_splits = 0;
     if (p.fuse_max_splits > kFuseCap) p.fuse_max_splits = kFuseCap;
+    p.kg_min_tiles = kg_min_tiles_default();
     if (p.kv_dtype == kKVFp8E4m3) mla_sm86_run_q_impl<T, kKVFp8E4m3>(p, stream);
     else if (p.kv_dtype == kKVInt8) mla_sm86_run_q_impl<T, kKVInt8>(p, stream);
     else FLASH_ASSERT(false);
