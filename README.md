@@ -78,18 +78,16 @@ For the NVIDIA platform:
 
 - NVIDIA SM100 / SM103 GPU
 - CUDA 13.1 and above (CUDA 13.2 and above is recommended, since it provides the native `cvt.rn.bf16x2` conversions that the quantized decoding kernels use; on CUDA 13.1 they fall back to a slower widening through FP32)
-- PyTorch 2.13 and above
+- PyTorch 2.10 and above
 
 For the Huawei platform:
 
 - Huawei Ascend 950 NPU
 - CANN 9.2.0 and above (provides the `bisheng` compiler and the Ascend C headers used at build time)
 - `torch_npu`
-- PyTorch 2.13 and above
+- PyTorch 2.10 and above
 
-FlashMLA wheels use PyTorch's Stable C++ ABI and CPython's Limited API (`abi3`, minimum CPython 3.10). A wheel built once can therefore be used with PyTorch 2.13+ and CPython 3.10+ without recompilation. CUDA and
-Ascend remain separate, platform-specific wheels, though they share the same sources, and CUDA wheels remain
-specific to the GPU architectures compiled into them. `torch_npu` will still need to be compatible with the torch version installed at runtime.
+FlashMLA CUDA wheels use PyTorch's Stable C++ ABI and CPython's Limited API (`abi3`, minimum CPython 3.10). A CUDA wheel built once can therefore be used with PyTorch 2.10+ and CPython 3.10+ without recompilation, subject to the GPU architectures compiled into it. Ascend wheels use the same stable APIs except for an Ascend-only bridge that obtains the native stream through `torch_npu`; they must therefore be built for a `torch_npu` version compatible with the PyTorch installation. CUDA and Ascend remain separate, platform-specific wheels.
 
 ## Installation
 
@@ -100,7 +98,7 @@ git submodule update --init --recursive
 pip install -v . --no-build-isolation
 ```
 
-`--no-build-isolation` is required: `setup.py` imports `torch` while building, and this repository does not declare it as a PEP 518 build requirement.
+`--no-build-isolation` is required: `setup.py` imports `torch` (and `torch_npu` for an Ascend build) while building, and this repository does not declare them as PEP 518 build requirements.
 
 The build target platform is detected automatically (`/dev/davinci_manager` means Ascend, anything else means CUDA) and can be overridden with `FLASH_MLA_BUILD_TARGET_PLATFORM=CUDA` or `FLASH_MLA_BUILD_TARGET_PLATFORM=ASCEND`.
 

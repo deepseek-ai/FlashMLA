@@ -27,12 +27,14 @@ EXT_NAME_ASCEND = "flash_mla.npu"
 # sm_103a additionally enables better code generation for `exp`.
 CUDA_ARCHS = ["sm_100a", "sm_103a"]
 
-# Build against PyTorch's stable C++ ABI. PyTorch 2.13 is the first release
-# whose stable accelerator API exposes backend-native stream handles, allowing
-# the same host wrapper to serve CUDA and PrivateUse1 (Ascend).
+# Build against PyTorch's stable C++ ABI. CUDA obtains its native stream from
+# the backend-specific stable C shim available in PyTorch 2.10. Ascend uses a
+# small torch_npu bridge because the generic stable stream API cannot expose a
+# backend-native handle before PyTorch 2.13.
 STABLE_ABI_FLAGS = [
-    "-DTORCH_TARGET_VERSION=0x020d000000000000",  # PyTorch >= 2.13
+    "-DTORCH_TARGET_VERSION=0x020a000000000000",  # PyTorch >= 2.10
 ]
+CUDA_STABLE_ABI_FLAGS = [*STABLE_ABI_FLAGS, "-DUSE_CUDA"]
 
 # Head counts (H_Q) the fused core_attn kernel is instantiated for: 128 (2-CTA cluster) and 64
 HEADS_FOR_FUSED_CORE_ATTN = (64, 128)
@@ -160,7 +162,7 @@ def build_on_cuda_platform():
                 # The host-side (`.cpp`) translation units are not compiled by nvcc, so `__CUDACC__`
                 # is not defined and neither kerutils' nor our own platform switch is set automatically.
                 "cxx": [
-                    *STABLE_ABI_FLAGS,
+                    *CUDA_STABLE_ABI_FLAGS,
                     "-O3",
                     "-std=c++20",
                     "-DNDEBUG",
@@ -168,7 +170,7 @@ def build_on_cuda_platform():
                     "-DFLASH_MLA_IS_BUILD_ON_CUDA",
                     "-DKERUTILS_IS_BUILD_ON_CUDA",
                 ],
-                "nvcc": get_nvcc_thread_args() + STABLE_ABI_FLAGS + [
+                "nvcc": get_nvcc_thread_args() + CUDA_STABLE_ABI_FLAGS + [
                     "-O3",
                     "-std=c++20",
                     "-Wno-deprecated-declarations",
@@ -214,6 +216,8 @@ def build_on_cuda_platform():
 def build_on_ascend_platform():
     from torch.utils.cpp_extension import BuildExtension, CppExtension
 
+    import torch_npu
+
     arch = os.environ.get("ASCEND_NPU_ARCH", "dav-3510")
     asc_home = os.environ.get("ASCEND_HOME_PATH", "/usr/local/Ascend/ascend-toolkit/latest")
     if not os.path.isdir(asc_home):
@@ -235,6 +239,7 @@ def build_on_ascend_platform():
             name=EXT_NAME_ASCEND,
             sources=[
                 *API_SOURCES,
+                "csrc/api/ascend_stream.cpp",
                 *ASCEND_KERNEL_SOURCES,
             ],
             extra_compile_args={
@@ -246,6 +251,7 @@ def build_on_ascend_platform():
                     "-DFLASH_MLA_IS_BUILD_ON_ASCEND",
                     "-isystem", str(Path(asc_home) / "aarch64-linux" / "include"),  # `-isystem` suppresses warnings
                     "-isystem", str(Path(asc_home) / "aarch64-linux" / "asc" / "include"),
+                    "-isystem", str(Path(torch_npu.__file__).parent / "include"),
                     "-mllvm", "-enable-hiipu-vf-loop-unroll",
                     "--cce-res-usage",
                     # Otherwise some `__simd_callee__` are incorrectly marked as "function 'XXX' is not needed and will not be emitted"
@@ -264,10 +270,11 @@ def build_on_ascend_platform():
                 THIS_DIR / "csrc" / "3rdparty" / "kerutils" / "include",
             ],
             libraries=[
-                # common.h calls aclrtGetDevice/aclrtGetDeviceInfo directly.
+                "torch_npu",
                 "ascendcl",
             ],
             library_dirs=[
+                str(Path(torch_npu.__file__).parent / "lib"),
                 str(Path(asc_home) / "aarch64-linux" / "lib64"),
             ],
             # Registration uses STABLE_TORCH_LIBRARY and does not need the

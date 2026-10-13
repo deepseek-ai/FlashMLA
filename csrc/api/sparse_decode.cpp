@@ -370,7 +370,7 @@ sparse_decode_fwd(
         have_extra_kcache ? int64_stride_to_int(extra_indices->stride(0)) : 0,
         have_extra_kcache ? int64_stride_to_int(extra_indices->stride(1)) : 0,
         get_num_sms(),
-        kerutils::get_current_stream<stream_t>(q),
+        get_current_stream(),
 
         enable_split_kv,
     };
@@ -396,7 +396,7 @@ sparse_decode_fwd(
                 ku::get_optional_tensor_ptr<int>(extra_topk_length),
                 (DecodingSchedMeta*)tile_scheduler_metadata->data_ptr(),
                 num_splits->mutable_data_ptr<int>(),
-                kerutils::get_current_stream<stream_t>(q)
+                get_current_stream()
             };
             smxx::decode::run_get_decoding_sched_meta_kernel(get_sched_meta_params);
         }

@@ -173,7 +173,7 @@ static std::vector<Tensor> sparse_prefill_fwd(
 
         SparseAttnFwdMode::Prefill,
         get_num_sms(),
-        kerutils::get_current_stream<stream_t>(q)
+        get_current_stream()
     };
 
     std::vector<SparseFwdFeatures> required_features;

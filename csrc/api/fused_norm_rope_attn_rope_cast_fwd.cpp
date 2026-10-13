@@ -153,7 +153,7 @@ std::vector<Tensor> fused_norm_rope_attn_rope_cast_fwd(
 
         SparseAttnFwdMode::Prefill,
         arch.num_sms,
-        kerutils::get_current_stream<stream_t>(q),
+        get_current_stream(),
 
         enable_q_norm,
         static_cast<float>(rms_norm_eps),
@@ -373,7 +373,7 @@ std::vector<Tensor> fused_norm_rope_attn_rope_cast_decode(
         0,                                              // stride_extra_indices_b is unused since b == 1
         have_extra_kvcache ? int64_stride_to_int(extra_indices->stride(0)) : 0,
         get_num_sms(),
-        kerutils::get_current_stream<stream_t>(q),
+        get_current_stream(),
 
         false,      // enable_split_kv: split-KV is not supported by this kernel
         // The remaining split-KV related fields are zero-initialized
@@ -470,7 +470,7 @@ std::vector<Tensor> permute_q_b_proj(
         (int32_t*)scale_factors_permuted.data_ptr(),
         (uint64_t)scale_factors_permuted.stride(1),
         
-        kerutils::get_current_stream<stream_t>(q_b_proj),
+        get_current_stream(),
     };
 
     sm100::prefill::fused_norm_rope_attn_rope_cast_fwd::permute_q_b_proj::run_permute_q_b_proj_kernel(params);
@@ -538,7 +538,7 @@ std::vector<Tensor> permute_wv_proj(
         (uint64_t)scale_factors_permuted.stride(0),
         (uint64_t)scale_factors_permuted.stride(2),
         
-        kerutils::get_current_stream<stream_t>(wv_proj),
+        get_current_stream(),
     };
 
     sm100::prefill::fused_norm_rope_attn_rope_cast_fwd::permute_wv_proj::run_permute_wv_proj_kernel(params);

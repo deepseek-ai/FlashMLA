@@ -19,10 +19,10 @@
 #include <torch/headeronly/core/ScalarType.h>
 #include <torch/headeronly/util/Exception.h>
 #include <torch/headeronly/util/shim_utils.h>
-#include <kerutils/supplemental/native_stream.h>
 #include <kerutils/supplemental/torch_tensors.h>
 
 #include "cuda_kernels/kv_cache_format.h"
+#include "device_stream.h"
 
 static constexpr float LOG_2_E = 1.44269504f;
 
