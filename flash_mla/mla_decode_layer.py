@@ -11,7 +11,9 @@
 
 Two implementations of the same math (shared weights):
     fused=False  "unfused PyTorch": HF-style elementwise ops for norm / rope / concat / cache write (~30 small kernels)
-    fused=True   the prologue above is ONE kernel (csrc/fused), q_proj+kv_a_proj is one GEMM
+    fused=True   the prologue above is ONE kernel (csrc/fused), q_proj+kv_a_proj is one GEMM, and (gemm="auto"|"skinny", T <= 64)
+                 the four projections run on the weight-streaming skinny GEMM (csrc/fused/skinny_gemm.cu; W_UK / W_UV
+                 pre-transposed, W_UV writes the o_proj input directly); gemm="torch" keeps cuBLAS
 Attention is pluggable (`attn`): "v2" (default; the sm86 kernels of csrc/sm86, bf16 / fp16 / fp8 / int8 KV, any page in {16, 32, 64}),
 "torch" (fp32 reference), "triton" (vendored vLLM/SGLang kernel, benchmarks/baselines),
 "legacy" / "legacy_ws" / "pkg" (flash_mla.flash_mla_with_kvcache with that impl; legacy: page size 32, native bf16 cache only).
@@ -28,6 +30,7 @@ from dataclasses import dataclass
 import torch
 import torch.nn.functional as F
 
+from . import skinny_gemm as _sg
 from .kv_quant import dequantize_kv, kind_id
 from .mla_prologue import apply_rope_ref, make_rope_cache, mla_decode_prologue, rmsnorm_ref
 
@@ -98,10 +101,15 @@ def _rope_hf(x, cos_sin, pos):
 
 class MLADecodeLayer(torch.nn.Module):
     def __init__(self, cfg=None, dtype=torch.bfloat16, device="cuda", seed=0, fused=True, merge_proj=True, attn="v2",
-                 kv_dtype="native"):
+                 kv_dtype="native", gemm="auto"):
         super().__init__()
         self.cfg = cfg = cfg or MLAConfig()
         self.dtype, self.fused, self.merge_proj, self.attn, self.kv_dtype = dtype, fused, merge_proj, attn, kv_dtype
+        if gemm not in ("auto", "skinny", "torch"):
+            raise ValueError(f"gemm={gemm!r}: expected 'auto', 'skinny' or 'torch'")
+        if gemm == "skinny" and not _sg.available():
+            raise RuntimeError("gemm='skinny' needs the flash_mla_fused_cuda extension with skinny_gemm (rebuild)")
+        self.gemm = gemm
         g = torch.Generator(device=device)
         g.manual_seed(seed)
         H = cfg.n_heads
@@ -116,6 +124,13 @@ class MLADecodeLayer(torch.nn.Module):
         self.w_uk = w(H, cfg.qk_nope, cfg.kv_lora, std=0.05)  # absorbed K up-projection  [H, 128, 512]
         self.w_uv = w(H, cfg.kv_lora, cfg.v_head, std=0.05)   # absorbed V up-projection  [H, 512, 128]
         self.w_o = w(cfg.hidden, H * cfg.v_head)
+        if fused and gemm != "torch" and _sg.available():  # [G, N, K] layouts for the skinny GEMM (same values)
+            self.w_uk_t = self.w_uk.transpose(1, 2).contiguous()  # [H, 512, 128]
+            self.w_uv_t = self.w_uv.transpose(1, 2).contiguous()  # [H, 128, 512]
+
+    def _skinny(self, T):
+        return self.fused and self.gemm != "torch" and _sg.available() and 1 <= T <= _sg.MAX_T and \
+            self.dtype in (torch.bfloat16, torch.float16)
 
     # ------------------------------------------------------------------------------------------------------------------
     def _attend(self, q_full, kv_cache, kv_scale, st):
@@ -175,9 +190,10 @@ class MLADecodeLayer(torch.nn.Module):
     # ------------------------------------------------------------------------------------------------------------------
     def forward(self, hidden, kv_cache, st, kv_scale=None):
         cfg, T, H = self.cfg, st.T, self.cfg.n_heads
+        sk = self._skinny(T)
         if self.fused:
             if self.merge_proj:
-                qkv = F.linear(hidden, self.w_qkv_a)
+                qkv = _sg.skinny_linear(hidden, self.w_qkv_a) if sk else F.linear(hidden, self.w_qkv_a)
                 nq = H * cfg.q_head
                 q = qkv[:, :nq].view(T, H, cfg.q_head)
                 kv_c, k_pe = qkv[:, nq:nq + cfg.kv_lora], qkv[:, nq + cfg.kv_lora:]
@@ -185,7 +201,10 @@ class MLADecodeLayer(torch.nn.Module):
                 q = F.linear(hidden, self.w_q).view(T, H, cfg.q_head)
                 kv_a = F.linear(hidden, self.w_kv_a)
                 kv_c, k_pe = kv_a[:, :cfg.kv_lora], kv_a[:, cfg.kv_lora:]
-            q_abs = torch.bmm(q[..., :cfg.qk_nope].transpose(0, 1), self.w_uk).transpose(0, 1)  # [T, H, 512] (strided view)
+            if sk:
+                q_abs = _sg.skinny_bmm(q[..., :cfg.qk_nope], self.w_uk_t)  # [T, H, 512] contiguous
+            else:
+                q_abs = torch.bmm(q[..., :cfg.qk_nope].transpose(0, 1), self.w_uk).transpose(0, 1)  # [T, H, 512] (strided view)
             q_full = mla_decode_prologue(q_abs, q[..., cfg.qk_nope:], kv_c, k_pe, st.cos_sin, st.block_table, st.cache_seqlens,
                                          st.s_q, kv_cache, kv_scale=kv_scale, kv_norm_weight=self.kv_norm_w, eps=cfg.rms_eps,
                                          kv_dtype=self.kv_dtype)
@@ -208,6 +227,10 @@ class MLADecodeLayer(torch.nn.Module):
                 kv_scale.view(-1)[st.slots] = sc
         o = self._attend(q_full, kv_cache, kv_scale, st)                       # [T, H, 512]
         self.last_o = o                                                         # (kept for accuracy evaluation)
+        if sk:
+            y = torch.empty(T, H * cfg.v_head, dtype=o.dtype, device=o.device)
+            _sg.skinny_bmm(o, self.w_uv_t, out=y.view(T, H, cfg.v_head))      # no reshape copy
+            return _sg.skinny_linear(y, self.w_o)
         y = torch.bmm(o.transpose(0, 1), self.w_uv).transpose(0, 1).reshape(T, H * cfg.v_head)
         return F.linear(y, self.w_o)
 

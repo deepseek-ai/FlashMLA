@@ -4,6 +4,7 @@
 #include <c10/cuda/CUDAGuard.h>
 
 #include "mla_decode_prologue.h"
+#include "skinny_gemm.h"
 
 #define CHECK_CUDA_T(x) TORCH_CHECK((x).is_cuda(), #x " must be a CUDA tensor")
 
@@ -102,7 +103,68 @@ void mla_decode_prologue(const at::Tensor &q_nope, const at::Tensor &q_pe, const
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
+// Weight-streaming skinny GEMM (csrc/fused/skinny_gemm.cu): y[t, g, :] = x[t, g, :] @ w[g]^T for 1 <= T <= 64 tokens.
+//   x [T, G, K] (last dim contiguous, 16-byte aligned rows), w [G, N, K] contiguous, y [T, G, N] (last dim contiguous, even strides)
+//   splits > 1 needs ws (fp32, >= G*N*splits*T) and counters (int32, >= G*N/n_tile, all zero; they are left zero).
+//   No allocation, no host sync (CUDA-graph safe); ws / counters must not be shared by GEMMs running concurrently.
+void skinny_gemm(const at::Tensor &x, const at::Tensor &w, at::Tensor &y, int64_t n_tile, int64_t splits,
+                 c10::optional<at::Tensor> ws, c10::optional<at::Tensor> counters) {
+    CHECK_CUDA_T(x);
+    CHECK_CUDA_T(w);
+    CHECK_CUDA_T(y);
+    TORCH_CHECK(x.dim() == 3 && w.dim() == 3 && y.dim() == 3, "skinny_gemm: x [T,G,K], w [G,N,K], y [T,G,N]");
+    const int64_t T = x.size(0), G = x.size(1), K = x.size(2), N = w.size(1);
+    TORCH_CHECK(w.size(0) == G && w.size(2) == K && y.size(0) == T && y.size(1) == G && y.size(2) == N, "skinny_gemm: shape mismatch");
+    const auto dt = x.scalar_type();
+    TORCH_CHECK(dt == at::kBFloat16 || dt == at::kHalf, "skinny_gemm: bf16 or fp16 only");
+    TORCH_CHECK(w.scalar_type() == dt && y.scalar_type() == dt, "skinny_gemm: x, w, y must share one dtype");
+    TORCH_CHECK(T >= 1 && T <= 64, "skinny_gemm: needs 1 <= T <= 64");
+    TORCH_CHECK(n_tile == 16 || n_tile == 32 || n_tile == 64, "skinny_gemm: n_tile must be 16, 32 or 64");
+    TORCH_CHECK(K % 64 == 0 && N % n_tile == 0, "skinny_gemm: needs K % 64 == 0 and N % n_tile == 0");
+    TORCH_CHECK(splits >= 1 && splits <= K / 64, "skinny_gemm: needs 1 <= splits <= K / 64");
+    TORCH_CHECK(G <= 65535, "skinny_gemm: G (grid.z) must be <= 65535");
+    TORCH_CHECK(w.is_contiguous(), "skinny_gemm: w must be contiguous [G,N,K]");
+    TORCH_CHECK(x.stride(2) == 1 && y.stride(2) == 1, "skinny_gemm: x / y last dimension must be contiguous");
+    auto stride_ok = [](const at::Tensor &t, int d, int64_t mult) { return t.size(d) == 1 || t.stride(d) % mult == 0; };
+    TORCH_CHECK(stride_ok(x, 0, 8) && stride_ok(x, 1, 8), "skinny_gemm: x token / group strides must be multiples of 8 elements");
+    TORCH_CHECK(stride_ok(y, 0, 2) && stride_ok(y, 1, 2), "skinny_gemm: y token / group strides must be even");
+    TORCH_CHECK(reinterpret_cast<uintptr_t>(x.data_ptr()) % 16 == 0 && reinterpret_cast<uintptr_t>(w.data_ptr()) % 16 == 0,
+                "skinny_gemm: x and w must be 16-byte aligned");
+    TORCH_CHECK(reinterpret_cast<uintptr_t>(y.data_ptr()) % 4 == 0, "skinny_gemm: y must be 4-byte aligned");
+    SkinnyGemmParams p{};
+    if (splits > 1) {
+        TORCH_CHECK(ws.has_value() && counters.has_value(), "skinny_gemm: splits > 1 needs ws and counters");
+        CHECK_CUDA_T(*ws);
+        CHECK_CUDA_T(*counters);
+        TORCH_CHECK(ws->scalar_type() == at::kFloat && ws->is_contiguous() && ws->numel() >= G * N * splits * T,
+                    "skinny_gemm: ws must be contiguous fp32 with >= G*N*splits*T elements");
+        TORCH_CHECK(counters->scalar_type() == at::kInt && counters->is_contiguous() && counters->numel() >= G * (N / n_tile),
+                    "skinny_gemm: counters must be contiguous int32 with >= G*N/n_tile elements");
+        p.ws = ws->data_ptr<float>();
+        p.counters = counters->data_ptr<int>();
+    }
+    c10::cuda::CUDAGuard guard(x.device());
+    p.x = x.data_ptr();
+    p.w = w.data_ptr();
+    p.y = y.data_ptr();
+    p.x_st = x.stride(0);
+    p.x_sg = x.stride(1);
+    p.y_st = y.stride(0);
+    p.y_sg = y.stride(1);
+    p.T = static_cast<int>(T);
+    p.G = static_cast<int>(G);
+    p.N = static_cast<int>(N);
+    p.K = static_cast<int>(K);
+    p.n_tile = static_cast<int>(n_tile);
+    p.splits = static_cast<int>(splits);
+    p.is_bf16 = dt == at::kBFloat16 ? 1 : 0;
+    launch_skinny_gemm(p, at::cuda::getCurrentCUDAStream().stream());
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.doc() = "FlashMLA fused decode prologue (RoPE + q concat + paged KV write, optional FP8/INT8 quantize-on-write)";
+    m.doc() = "FlashMLA fused decode prologue (RoPE + q concat + paged KV write, optional FP8/INT8 quantize-on-write) "
+              "and the weight-streaming skinny GEMM of the decode layer";
     m.def("mla_decode_prologue", &mla_decode_prologue, "fused MLA decode prologue (in place)");
+    m.def("skinny_gemm", &skinny_gemm, "y[t, g, :] = x[t, g, :] @ w[g]^T for T <= 64 (in place, deterministic)");
 }

@@ -42,6 +42,8 @@ def main():
     ap.add_argument("--page", type=int, default=32)
     ap.add_argument("--attn", default="v2", help="v2 | legacy | pkg | triton | torch")
     ap.add_argument("--kv", default="native", choices=["native", "fp8", "int8"])
+    ap.add_argument("--gemm", default="auto", choices=["auto", "skinny", "torch"],
+                    help="projection GEMMs of the fused layer: skinny kernel (auto: when built and T <= 64) or cuBLAS")
     ap.add_argument("--variants", default="unfused,fused")
     ap.add_argument("--modes", default="eager,graph")
     ap.add_argument("--layers", type=int, default=27)
@@ -56,7 +58,8 @@ def main():
     enable_cooldown(a.cool)
     cfg = MLAConfig()
     out = CsvOut(a.out or default_out(a.tag))
-    print(f"[layer] torch {torch.__version__}; {torch.cuda.get_device_name(0)}; attn={a.attn} page={a.page} kv={a.kv}; out={out.path}", flush=True)
+    print(f"[layer] torch {torch.__version__}; {torch.cuda.get_device_name(0)}; attn={a.attn} page={a.page} kv={a.kv} gemm={a.gemm}; "
+          f"out={out.path}", flush=True)
     fb = flush_buffer()
     for b in parse_int_list(a.b):
         for s_k in parse_int_list(a.sk):
@@ -72,12 +75,12 @@ def main():
                 fused = variant == "fused"
                 cooldown()
                 st, _ = make_state(cfg, b, s_k, a.page, a.sq, attn=a.attn, kv_dtype=a.kv)
-                layers = [MLADecodeLayer(cfg, fused=fused, attn=a.attn, kv_dtype=a.kv, seed=l) for l in range(n_layers)]
+                layers = [MLADecodeLayer(cfg, fused=fused, attn=a.attn, kv_dtype=a.kv, seed=l, gemm=a.gemm) for l in range(n_layers)]
                 cs = [alloc_cache(nblk, a.page, a.kv, seed=l) for l in range(n_layers)]
                 caches, scales = [c[0] for c in cs], [c[1] for c in cs]
                 hidden = hidden0.clone()
                 base = dict(h_q=cfg.n_heads, s_q=a.sq, b=b, s_k=s_k, page=a.page, dtype="bfloat16", kv=a.kv,
-                            impl=f"{variant}/{a.attn}", extra=f"layers={n_layers}")
+                            impl=f"{variant}/{a.attn}", extra=f"layers={n_layers} gemm={a.gemm if fused else 'torch'}")
                 with torch.no_grad():
                     y = layers[0](hidden, caches[0], st, scales[0])
                     torch.cuda.synchronize()
@@ -121,7 +124,7 @@ def main():
             for mode in a.modes.split(","):
                 if ("unfused", mode) in results and ("fused", mode) in results:
                     print(f"   {mode}: fused speedup over unfused = {results[('unfused', mode)] / results[('fused', mode)]:.2f}x", flush=True)
-            if "graph" in a.modes and "eager" in a.modes and ("fused", "graph") in results:
+            if ("unfused", "eager") in results and ("fused", "graph") in results:
                 print(f"   fused graph vs unfused eager = {results[('unfused', 'eager')] / results[('fused', 'graph')]:.2f}x", flush=True)
     out.close()
     print(f"[layer] done -> {out.path}")
