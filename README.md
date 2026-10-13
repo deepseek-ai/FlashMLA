@@ -57,7 +57,7 @@ for i in range(num_layers):
 The original Ampere port cannot launch on a GeForce Ampere card (its tile needs 113 KB of shared memory, the sm_86 limit is 99 KB, and it only
 accepts 32-token pages). This branch adds a native sm_86 decode kernel (`impl="v2"`, the default), a graph-safe API, FP16, 16/32/64-token pages,
 an optional FP8 / INT8 KV cache, a fused decode prologue and a DeepSeek-V2-Lite decode layer. On an RTX 3090 (measured peaks: 873.8 GB/s read-only,
-70 TFLOPS bf16) it reaches 93-99% of the DRAM peak at h_q=16, b>=64 and 71-76% of the bf16 tensor peak at h_q=128; see
+70 TFLOPS bf16) it reaches 93-99% of the DRAM peak at h_q=16, b>=64, s_k>=4096 and 73-75% (eager) / 66-72% (CUDA Graph) of the bf16 tensor peak at h_q=128, b>=16, s_k>=4096; see
 [docs/ampere_opt_report.md](docs/ampere_opt_report.md) for design, measurements and what did not work, and
 [docs/bench_matrix.md](docs/bench_matrix.md) for the full matrix against legacy, Triton and FlashInfer.
 
