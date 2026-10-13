@@ -457,6 +457,7 @@ void mla_sm86_run_q_impl(Flash_fwd_mla_params &p, cudaStream_t stream) {
     MLA_SM86_QCASE(16, 16, 4, 1)
     MLA_SM86_QCASE(16, 16, 5, 1)
     MLA_SM86_QCASE(16, 16, 3, 2)
+    MLA_SM86_QCASE(16, 32, 2, 2)
     MLA_SM86_QCASE(16, 32, 2, 1)
     MLA_SM86_QCASE(16, 32, 3, 1)
     MLA_SM86_QCASE(16, 32, 4, 1)

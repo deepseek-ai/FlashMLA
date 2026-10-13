@@ -120,6 +120,20 @@ def test_quant_varlen_large_batch(kind):
 
 
 @pytest.mark.parametrize("kind", ["fp8", "int8"])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16], ids=["bf16", "fp16"])
+@pytest.mark.parametrize("page", [16, 32, 64])
+def test_quant_two_ctas_per_sm(monkeypatch, kind, dtype, page):
+    # opt-in plan for long contexts (docs/ampere_opt_report.md): 2 CTAs per SM and twice the split parts;
+    # page 16 clamps the tile to 16 tokens / 3 stages
+    monkeypatch.setenv("FLASH_MLA_SM86_QCFG", "16,2,2,32")
+    b = 40
+    seqlens = varlen_seqlens(b, 3000, 1, seed=5)
+    sms = torch.cuda.get_device_properties(DEV).multi_processor_count
+    assert get_mla_metadata(torch.tensor(seqlens, dtype=torch.int32, device=DEV), 16, 1, kind)[0].shape[0] == 2 * sms
+    run_quant_case(b, 1, 16, seqlens, page, dtype, kind, False)
+
+
+@pytest.mark.parametrize("kind", ["fp8", "int8"])
 def test_quant_prealloc_and_fused(monkeypatch, kind):
     monkeypatch.setenv("FLASH_MLA_SM86_FUSE", "4")
     b, s_q, h_q, page = 12, 1, 16, 64
