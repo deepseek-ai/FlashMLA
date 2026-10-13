@@ -12,8 +12,12 @@
 Two implementations of the same math (shared weights):
     fused=False  "unfused PyTorch": HF-style elementwise ops for norm / rope / concat / cache write (~30 small kernels)
     fused=True   the prologue above is ONE kernel (csrc/fused), q_proj+kv_a_proj is one GEMM
-Attention is pluggable (`attn`): "torch" (fp32 reference), "triton" (vendored vLLM/SGLang kernel, benchmarks/baselines),
-"legacy" / "v2" / "pkg" (flash_mla.flash_mla_with_kvcache with that impl; page size 32 for legacy).
+Attention is pluggable (`attn`): "v2" (default; the sm86 kernels of csrc/sm86, bf16 / fp16 / fp8 / int8 KV, any page in {16, 32, 64}),
+"torch" (fp32 reference), "triton" (vendored vLLM/SGLang kernel, benchmarks/baselines),
+"legacy" / "legacy_ws" / "pkg" (flash_mla.flash_mla_with_kvcache with that impl; legacy: page size 32, native bf16 cache only).
+Quantized KV (`kv_dtype="fp8"|"int8"`, docs/kv_quant_format.md): the fused prologue quantizes the new token on write (per-token scale)
+and the v2 attention kernel dequantizes in registers: `flash_mla_with_kvcache(..., kv_scale=scale, kv_dtype="fp8"|"int8")`.
+The softmax scale is passed explicitly as (qk_nope + qk_rope) ** -0.5 = 192 ** -0.5 (NOT 576 ** -0.5, the absorbed head dim).
 The whole step is CUDA-graph capturable (`capture_layer_graph`): metadata, positions and slots are computed on device.
 """
 import math
@@ -52,11 +56,12 @@ class MLAConfig:
 class DecodeState:
     """Per-step data shared by all layers: page table, sequence lengths (incl. the new tokens), rope cache, scheduler metadata."""
 
-    def __init__(self, cfg, block_table, cache_seqlens, s_q=1, max_pos=None, attn="legacy"):
+    def __init__(self, cfg, block_table, cache_seqlens, s_q=1, max_pos=None, attn="v2", kv_dtype="native"):
         self.cfg, self.block_table, self.cache_seqlens, self.s_q = cfg, block_table, cache_seqlens, s_q
         self.B = cache_seqlens.shape[0]
         self.T = self.B * s_q
         self.attn = attn
+        self.kv_dtype = kv_dtype  # only a scheduler hint (the 8-bit kernels pick their own CTA count per SM)
         max_pos = max_pos or (block_table.shape[1] * 64 + 64)
         self.cos_sin = make_rope_cache(max_pos, cfg.qk_rope, cfg.rope_base, device=cache_seqlens.device)
         self.meta = self.nsplit = None
@@ -73,7 +78,8 @@ class DecodeState:
         self.slots = self.block_table[b, self.positions // page].long() * page + self.positions % page
         if self.attn in ("legacy", "legacy_ws", "v2", "pkg"):
             import flash_mla
-            self.meta, self.nsplit = flash_mla.get_mla_metadata(self.cache_seqlens, self.s_q * self.cfg.n_heads, 1)
+            hint = {"kv_dtype": self.kv_dtype} if self.attn in ("v2", "pkg") and self.kv_dtype != "native" else {}
+            self.meta, self.nsplit = flash_mla.get_mla_metadata(self.cache_seqlens, self.s_q * self.cfg.n_heads, 1, **hint)
             if self.workspace is None and self.attn in ("v2", "pkg") and hasattr(flash_mla, "alloc_mla_workspace"):
                 # persistent scratch, allocated once (first call is the eager warm-up, before any graph capture)
                 self.workspace = flash_mla.alloc_mla_workspace(self.B, self.s_q * self.cfg.n_heads, 1, self.meta.shape[0])
@@ -91,7 +97,7 @@ def _rope_hf(x, cos_sin, pos):
 
 
 class MLADecodeLayer(torch.nn.Module):
-    def __init__(self, cfg=None, dtype=torch.bfloat16, device="cuda", seed=0, fused=True, merge_proj=True, attn="legacy",
+    def __init__(self, cfg=None, dtype=torch.bfloat16, device="cuda", seed=0, fused=True, merge_proj=True, attn="v2",
                  kv_dtype="native"):
         super().__init__()
         self.cfg = cfg = cfg or MLAConfig()
@@ -123,7 +129,10 @@ class MLADecodeLayer(torch.nn.Module):
             if st.workspace is not None:
                 kw["workspace"] = st.workspace
             if self.kv_dtype != "native":
+                if a in ("legacy", "legacy_ws"):
+                    raise ValueError(f"attn={a!r} has no 8-bit KV path; use attn='v2' for kv_dtype={self.kv_dtype!r}")
                 kw["kv_scale"] = kv_scale
+                kw["kv_dtype"] = self.kv_dtype
             o, _ = flash_mla.flash_mla_with_kvcache(q_full.view(st.B, st.s_q, H, -1), kv_cache, st.block_table, st.cache_seqlens,
                                                     dv, st.meta, st.nsplit, softmax_scale=cfg.softmax_scale,
                                                     causal=st.s_q > 1, **kw)
@@ -217,7 +226,7 @@ def alloc_cache(num_blocks, page, kv_dtype="native", dtype=torch.bfloat16, devic
     return quantize_kv(x, kv_dtype)
 
 
-def make_state(cfg, b, s_k, page, s_q=1, device="cuda", attn="legacy", scatter=True, seed=0):
+def make_state(cfg, b, s_k, page, s_q=1, device="cuda", attn="v2", scatter=True, seed=0, kv_dtype="native"):
     """Page table for b sequences of length s_k (the last s_q tokens are the new ones) + DecodeState."""
     max_blocks = -(-s_k // page)
     nblk = b * max_blocks
@@ -226,7 +235,7 @@ def make_state(cfg, b, s_k, page, s_q=1, device="cuda", attn="legacy", scatter=T
     perm = torch.randperm(nblk, generator=g, device=device) if scatter else torch.arange(nblk, device=device)
     bt = perm.view(b, max_blocks).to(torch.int32).contiguous()
     lens = torch.full((b,), s_k, dtype=torch.int32, device=device)
-    st = DecodeState(cfg, bt, lens, s_q, max_pos=s_k + 8, attn=attn)
+    st = DecodeState(cfg, bt, lens, s_q, max_pos=s_k + 8, attn=attn, kv_dtype=kv_dtype)
     st.refresh(page)
     return st, nblk
 

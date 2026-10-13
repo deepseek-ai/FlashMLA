@@ -91,6 +91,18 @@ def preset(name):
                     for b in bs:
                         for sk in sks:
                             cs.append(Case(h, sq, b, sk, page))
+    elif name == "full":  # integration matrix: h_q x s_q x b x s_k (+ b=1 at 32k), one page size (set with --page)
+        for h in (8, 16, 32, 64, 128):
+            for sq in (1, 2):
+                for b in (1, 4, 16, 64, 128):
+                    for sk in (1024, 4096, 8192):
+                        cs.append(Case(h, sq, b, sk, 64))
+                cs.append(Case(h, sq, 1, 32768, 64))
+    elif name == "spot":  # page-size spot checks (run with --page 16 / 32)
+        for h in (16, 128):
+            for b, sk in ((1, 4096), (4, 4096), (64, 4096), (128, 8192)):
+                cs.append(Case(h, 1, b, sk, 64))
+        cs.append(Case(16, 2, 16, 4096, 64))
     elif name == "varlen":
         for h in (16, 64, 128):
             for sq in (1, 2):

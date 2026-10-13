@@ -91,6 +91,8 @@ class FlashMLAImpl:
             kw["workspace"] = state["ws"]
         if case.kv != "native":
             kw["kv_scale"] = data.kscale[layer]
+            if self.accepts("kv_dtype"):
+                kw["kv_dtype"] = case.kv  # "fp8" | "int8": uint8 cache dtype cannot be read from the tensor
             kc = data.kq[layer]
         else:
             kc = data.kc[layer]

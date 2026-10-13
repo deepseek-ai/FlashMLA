@@ -1,6 +1,7 @@
 import math
 import random
 
+import pytest
 import torch
 import triton
 
@@ -40,8 +41,10 @@ def cal_diff(x: torch.Tensor, y: torch.Tensor, name: str) -> None:
 
 
 @torch.inference_mode()
-def test_flash_mla(b, s_q, mean_sk, h_q, h_kv, d, dv, causal, varlen):
-    print(f"{b=}, {s_q=}, {mean_sk=}, {h_q=}, {h_kv=}, {d=}, {dv=}, {causal=}, {varlen=}")
+def run_flash_mla(b, s_q, mean_sk, h_q, h_kv, d, dv, causal, varlen, impl="legacy", bench=True):
+    """The fork's original test body (page size 32, bf16, softmax scale 576**-0.5, NaN-padded KV, cos_diff < 8e-5).
+    `impl` selects the kernel: "legacy" (the fork's sm80 kernel, BlockM=16 fallback on sm_86), "legacy_ws" or "v2" (sm86 kernels)."""
+    print(f"{b=}, {s_q=}, {mean_sk=}, {h_q=}, {h_kv=}, {d=}, {dv=}, {causal=}, {varlen=}, {impl=}")
 
     cache_seqlens = torch.full((b,), mean_sk, dtype=torch.int32)
     if varlen:
@@ -67,7 +70,7 @@ def test_flash_mla(b, s_q, mean_sk, h_q, h_kv, d, dv, causal, varlen):
         return flash_mla_with_kvcache(
             q, blocked_k, block_table, cache_seqlens, dv,
             tile_scheduler_metadata, num_splits, causal=causal,
-            warp_spec=False,
+            impl=impl,
         )
 
     def ref_mla():
@@ -93,13 +96,40 @@ def test_flash_mla(b, s_q, mean_sk, h_q, h_kv, d, dv, causal, varlen):
     cal_diff(out_flash, out_torch, "out")
     cal_diff(lse_flash, lse_torch, "lse")
 
-    t = triton.testing.do_bench(flash_mla)
-    FLOPS = s_q * total_seqlens * h_q * (d + dv) * 2
-    bytes = (total_seqlens * h_kv * d + b * s_q * h_q * d + b * s_q * h_q * dv) * (torch.finfo(dtype).bits // 8)
-    print(f"{t:.3f} ms, {FLOPS / 10 ** 9 / t:.0f} TFLOPS, {bytes / 10 ** 6 / t:.0f} GB/s")
+    if bench:
+        t = triton.testing.do_bench(flash_mla)
+        FLOPS = s_q * total_seqlens * h_q * (d + dv) * 2
+        bytes = (total_seqlens * h_kv * d + b * s_q * h_q * d + b * s_q * h_q * dv) * (torch.finfo(q.dtype).bits // 8)
+        print(f"{t:.3f} ms, {FLOPS / 10 ** 9 / t:.0f} TFLOPS, {bytes / 10 ** 6 / t:.0f} GB/s")
+
+
+@pytest.fixture
+def bf16_cuda_defaults():
+    """The test body builds its tensors with the default dtype / device (bf16, cuda:0 of CUDA_VISIBLE_DEVICES)."""
+    if not torch.cuda.is_available():
+        pytest.skip("needs a GPU")
+    torch.set_default_dtype(torch.bfloat16)
+    torch.set_default_device(torch.device("cuda:0"))
+    torch.manual_seed(0)
+    random.seed(0)
+    yield
+    torch.set_default_device(None)
+    torch.set_default_dtype(torch.float32)
+
+
+@pytest.mark.parametrize("impl", ["legacy", "v2"])
+@pytest.mark.parametrize("varlen", [False, True])
+@pytest.mark.parametrize("s_q", [1, 2])
+@pytest.mark.parametrize("h_q", [16, 32, 64, 128])  # TP = 8, 4, 2, 1
+@pytest.mark.parametrize("mean_sk", [4096, 8192])
+def test_flash_mla(bf16_cuda_defaults, mean_sk, h_q, s_q, varlen, impl):
+    """b=128 (about 3-6 GB of KV per case): needs a mostly free GPU."""
+    run_flash_mla(128, s_q, mean_sk, h_q, 1, 576, 512, True, varlen, impl=impl, bench=False)
 
 
 if __name__ == "__main__":
+    import os
+
     dtype = torch.bfloat16
     device = torch.device("cuda:0")
     torch.set_default_dtype(dtype)
@@ -112,10 +142,12 @@ if __name__ == "__main__":
     d, dv = 576, 512
     causal = True
 
-    # test_flash_mla(1, 1, 4096, 16, 1, d, dv, True, True)
+    # FLASH_MLA_TEST_IMPL=legacy (default, the fork's kernel) | v2 | legacy_ws
+    impl = os.environ.get("FLASH_MLA_TEST_IMPL", "legacy")
+    # run_flash_mla(1, 1, 4096, 16, 1, d, dv, True, True, impl=impl)
     for b in [128]:
         for s in [4096, 8192]:
             for h_q in [16, 32, 64, 128]:  # TP = 8, 4, 2, 1
                 for s_q in [1, 2]:  # MTP = 1, 2
                     for varlen in [False, True]:
-                        test_flash_mla(b, s_q, s, h_q, h_kv, d, dv, causal, varlen)
+                        run_flash_mla(b, s_q, s, h_q, h_kv, d, dv, causal, varlen, impl=impl)

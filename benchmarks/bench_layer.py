@@ -39,7 +39,7 @@ def main():
     ap.add_argument("--sk", default="4096")
     ap.add_argument("--sq", type=int, default=1)
     ap.add_argument("--page", type=int, default=32)
-    ap.add_argument("--attn", default="legacy", help="legacy | v2 | pkg | triton | torch")
+    ap.add_argument("--attn", default="v2", help="v2 | legacy | pkg | triton | torch")
     ap.add_argument("--kv", default="native", choices=["native", "fp8", "int8"])
     ap.add_argument("--variants", default="unfused,fused")
     ap.add_argument("--modes", default="eager,graph")
@@ -67,7 +67,7 @@ def main():
             outputs = {}
             for variant in a.variants.split(","):
                 fused = variant == "fused"
-                st, _ = make_state(cfg, b, s_k, a.page, a.sq, attn=a.attn)
+                st, _ = make_state(cfg, b, s_k, a.page, a.sq, attn=a.attn, kv_dtype=a.kv)
                 layers = [MLADecodeLayer(cfg, fused=fused, attn=a.attn, kv_dtype=a.kv, seed=l) for l in range(n_layers)]
                 cs = [alloc_cache(nblk, a.page, a.kv, seed=l) for l in range(n_layers)]
                 caches, scales = [c[0] for c in cs], [c[1] for c in cs]
