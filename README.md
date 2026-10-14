@@ -98,7 +98,7 @@ git submodule update --init --recursive
 pip install -v . --no-build-isolation
 ```
 
-`--no-build-isolation` is required: `setup.py` imports `torch` (and `torch_npu` for an Ascend build) while building, and this repository does not declare them as PEP 518 build requirements.
+`--no-build-isolation` is required: `setup.py` imports `torch` (and `torch_npu` on the Ascend platform) while building, and this repository does not declare them as PEP 518 build requirements.
 
 The build target platform is detected automatically (`/dev/davinci_manager` means Ascend, anything else means CUDA) and can be overridden with `FLASH_MLA_BUILD_TARGET_PLATFORM=CUDA` or `FLASH_MLA_BUILD_TARGET_PLATFORM=ASCEND`.
 
