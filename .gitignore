@@ -1,5 +1,6 @@
 build
 *.so
+flash_mla/_build_info.py
 *.egg-info/
 __pycache__/
 dist/
