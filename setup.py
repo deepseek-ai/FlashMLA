@@ -28,10 +28,7 @@ EXT_NAME_ASCEND = "flash_mla.npu"
 # sm_103a additionally enables better code generation for `exp`.
 CUDA_ARCHS = ["sm_100a", "sm_103a"]
 
-# Build against PyTorch's stable C++ ABI. CUDA obtains its native stream from
-# the backend-specific stable C shim available in PyTorch 2.10. Ascend uses a
-# small torch_npu bridge. These can be unified into one native_handle API call
-# once we update the minimum build version to PyTorch 2.13.
+# Build against PyTorch's stable C++ ABI.
 STABLE_ABI_FLAGS = [
     "-DTORCH_TARGET_VERSION=0x020a000000000000",  # PyTorch >= 2.10
 ]
