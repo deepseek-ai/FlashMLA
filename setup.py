@@ -29,8 +29,8 @@ CUDA_ARCHS = ["sm_100a", "sm_103a"]
 
 # Build against PyTorch's stable C++ ABI. CUDA obtains its native stream from
 # the backend-specific stable C shim available in PyTorch 2.10. Ascend uses a
-# small torch_npu bridge because the generic stable stream API cannot expose a
-# backend-native handle before PyTorch 2.13.
+# small torch_npu bridge. These can be unified into one native_handle API call
+# once we update the minimum build version to PyTorch 2.13.
 STABLE_ABI_FLAGS = [
     "-DTORCH_TARGET_VERSION=0x020a000000000000",  # PyTorch >= 2.10
 ]
@@ -205,7 +205,7 @@ def build_on_cuda_platform():
                 "-lcuda",
             ],
             # Registration uses STABLE_TORCH_LIBRARY and does not need the
-            # Python C API, so one extension serves every CPython >= 3.10.
+            # Python C API, so one extension can serve every CPython >= 3.10.
             py_limited_api=True,
         )
     ]
@@ -278,7 +278,7 @@ def build_on_ascend_platform():
                 str(Path(asc_home) / "aarch64-linux" / "lib64"),
             ],
             # Registration uses STABLE_TORCH_LIBRARY and does not need the
-            # Python C API, so one extension serves every CPython >= 3.10.
+            # Python C API, so one extension can serve every CPython >= 3.10.
             py_limited_api=True,
         )
     ]
