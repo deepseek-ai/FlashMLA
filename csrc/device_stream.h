@@ -7,9 +7,7 @@
 #endif
 
 #ifdef FLASH_MLA_IS_BUILD_ON_ASCEND
-#include <acl/acl.h>
-
-extern "C" aclrtStream flash_mla_get_current_npu_stream();
+#include "api/ascend_stream.h"
 #endif
 
 // For CUDA GPU, return the current `cudaStream_t`; for Ascend NPU, return the
