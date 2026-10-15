@@ -87,7 +87,7 @@ For the Huawei platform:
 - `torch_npu`
 - PyTorch 2.10 and above
 
-FlashMLA CUDA wheels use PyTorch's Stable C++ ABI and CPython's Limited API (`abi3`, minimum CPython 3.10). A CUDA wheel built once can therefore be used with PyTorch 2.10+ and CPython 3.10+ without recompilation, subject to the GPU architectures compiled into it. Ascend wheels use the same stable APIs except for an Ascend-only bridge that obtains the native stream through `torch_npu`; they must therefore be built for a `torch_npu` version compatible with the PyTorch installation. CUDA and Ascend remain separate, platform-specific wheels.
+FlashMLA CUDA wheels use PyTorch's Stable C++ ABI and CPython's Limited API (`abi3`, minimum CPython 3.10). A CUDA wheel built once can therefore be used with PyTorch 2.10+ and CPython 3.10+ without recompilation, subject to the GPU architectures compiled into it. On the Ascend platform, however, the wheel obtains the native device stream through an Ascend-only `torch_npu` bridge, and must therefore be built for a `torch_npu` version compatible with the installed PyTorch.
 
 ## Installation
 
