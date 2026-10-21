@@ -632,7 +632,7 @@ __simd_vf__ void Kernel<CONFIG>::softmax_vf(__ubuf__ UnifiedBufferMemoryPlan& ub
                     if (local_col == 0) {
                         asc_float2bfloat16_rn(s[local_row][local_col], p[local_row][local_col], full_mask);
                     } else {
-                        asc_float2bfloat16_rn_v2_impl(s[local_row][local_col], p[local_row][local_col], full_mask);
+                        asc_float2bfloat16_rn_v2(s[local_row][local_col], p[local_row][local_col], full_mask);
                     }
                 }
             }
@@ -822,7 +822,7 @@ __simd_vf__ void Kernel<CONFIG>::get_final_output_vf(__ubuf__ UnifiedBufferMemor
                 if (i == 0) {
                     asc_float2bfloat16_rn(output_bf16[i][j], output_f32, full_mask);
                 } else {
-                    asc_float2bfloat16_rn_v2_impl(output_bf16[i][j], output_f32, full_mask);    // Use `_impl` since `_v2` is marked as depreciated and I cannot find a alternative
+                    asc_float2bfloat16_rn_v2(output_bf16[i][j], output_f32, full_mask);    // Public API retains round-to-nearest and odd-lane packing.
                 }
             }
         }
