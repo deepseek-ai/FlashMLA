@@ -12,6 +12,14 @@
 
 #include "config.h"
 
+// Shim: the public CANN 9.2.0 headers do not expose the internal
+// asc_float2bfloat16_rn_v2_impl() symbol used below; the deprecated
+// asc_float2bfloat16_rn_v2() has identical write-into-dst semantics.
+[[maybe_unused]] __simd_callee__ inline void asc_float2bfloat16_rn_v2_impl(
+    vector_bfloat16_t &dst, vector_float src, vector_bool mask) {
+    asc_float2bfloat16_rn_v2(dst, src, mask);
+}
+
 // int32 * int32 -> int64
 [[maybe_unused]] __simd_callee__ inline void asc_mul(vector_int64_t &dst0, vector_int64_t &dst1, vector_int32_t src0, vector_int32_t src1, vector_bool mask) {
     vector_int32_t dst_lo32bit, dst_hi32bit;
