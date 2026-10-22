@@ -632,7 +632,7 @@ void tmem_ld_st_decomposed(uint32_t tmem_start, void* data, F&& tmem_ld_st_fn) {
         return;
     } else {
         // Largest power-of-2 <= kNumReplications
-        constexpr int kHighBit = 1 << (31 - __builtin_clz(kNumReplications));
+        constexpr int kHighBit = cute::bit_floor(uint32_t(kNumReplications));
         tmem_ld_st_fn.template operator()<kHighBit>(tmem_start, data);
         // Recurse on the remainder
         constexpr int kRemaining = kNumReplications - kHighBit;

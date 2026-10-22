@@ -343,7 +343,8 @@ KernelTemplate<CONFIG>
                     int col_base = (i >= PV_GEMM_N/O_FOLD/B_EPI ? D_V/2 : 0) + (i*B_EPI%(PV_GEMM_N/O_FOLD));
                     CUTE_UNROLL
                     for (int j = 0; j < B_EPI / 8; ++j)
-                        *(__int128_t*)(sO_bases[j] + col_base*MMA_M) = *(__int128_t*)(&o_bf16[j*4]);
+                        *reinterpret_cast<ku::int128_t*>(sO_bases[j] + col_base*MMA_M) =
+                            *reinterpret_cast<ku::int128_t*>(&o_bf16[j*4]);
                     // Sync
                     fence_view_async_shared();
                     NamedBarrier::arrive_and_wait(128, NamedBarriers::wg0_sync);
@@ -377,7 +378,9 @@ KernelTemplate<CONFIG>
                     int col_base = (idx_in_warpgroup/MMA_M)*(PV_GEMM_N/O_FOLD) + (i >= PV_GEMM_N/O_FOLD/B_EPI ? D_V/2 : 0) + (i*B_EPI%(PV_GEMM_N/O_FOLD));
                     CUTE_UNROLL
                     for (int j = 0; j < B_EPI / 4; ++j)
-                        *(__int128_t*)&sO(idx_in_warpgroup%MMA_M, col_base + j*4) = *(__int128_t*)(&o[j*2]);
+                        *reinterpret_cast<ku::int128_t*>(
+                            &sO(idx_in_warpgroup%MMA_M, col_base + j*4)) =
+                            *reinterpret_cast<ku::int128_t*>(&o[j*2]);
                 }
                 fence_view_async_shared();
                 NamedBarrier::arrive_and_wait(128, NamedBarriers::wg0_sync);
@@ -660,9 +663,21 @@ KernelTemplate<CONFIG>
 #endif
 }
 
+#ifdef _MSC_VER
+template<ModelType Model, ModelType ExtraModel, bool SplitKV,
+         typename Shape_Q_SW128, typename TMA_Q_SW128, typename Shape_O, typename TMA_O>
+__global__ void __launch_bounds__(
+    (KernelTemplate<Config{Model, ExtraModel, SplitKV}>::NUM_THREADS), 1, 1)
+flash_fwd_splitkv_mla_fp8_sparse_kernel(
+    __grid_constant__ const SparseAttnDecodeParams params,
+    __grid_constant__ const typename KernelTemplate<Config{Model, ExtraModel, SplitKV}>::template TmaParams<
+        Shape_Q_SW128, TMA_Q_SW128, Shape_O, TMA_O> tma_params) {
+    using Kernel = KernelTemplate<Config{Model, ExtraModel, SplitKV}>;
+#else
 template<typename Kernel, typename TmaParams>
 __global__ void __launch_bounds__(Kernel::NUM_THREADS, 1, 1)
 flash_fwd_splitkv_mla_fp8_sparse_kernel(__grid_constant__ const SparseAttnDecodeParams params, __grid_constant__ const TmaParams tma_params) {
+#endif
     Kernel::flash_fwd_splitkv_mla_fp8_sparse_kernel_devfunc(params, tma_params);
 }
 
@@ -722,7 +737,14 @@ void KernelTemplate<CONFIG>::run(const SparseAttnDecodeParams &params) {
         tensor_map_kv_quant_part,
         tensor_map_extra_kv_quant_part
     };
+#ifdef _MSC_VER
+    auto mla_kernel = &flash_fwd_splitkv_mla_fp8_sparse_kernel<
+        CONFIG.MODEL_TYPE, CONFIG.EXTRA_MODEL_TYPE, CONFIG.ENABLE_SPLITKV,
+        decltype(shape_Q_SW128), decltype(tma_Q_SW128),
+        decltype(shape_O), decltype(tma_O)>;
+#else
     auto mla_kernel = &flash_fwd_splitkv_mla_fp8_sparse_kernel<KernelTemplate<CONFIG>, decltype(tma_params)>;
+#endif
 
     constexpr size_t smem_size = sizeof(SharedMemoryPlan);
     static_assert(smem_size <= 227*1024);

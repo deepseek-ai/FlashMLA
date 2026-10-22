@@ -1,0 +1,18 @@
+diff --git a/include/cutlass/arch/barrier.h b/include/cutlass/arch/barrier.h
+--- a/include/cutlass/arch/barrier.h
++++ b/include/cutlass/arch/barrier.h
+@@ -40,2 +40,5 @@
++#if !defined(_MSC_VER) || defined(__clang__) || defined(__CUDACC__) || \
++    defined(__CUDACC_RTC__)
+ #include <cutlass/arch/memory_sm75.h>
++#endif
+ #include <cute/arch/cluster_sm90.hpp>
+diff --git a/include/cutlass/cuda_host_adapter.hpp b/include/cutlass/cuda_host_adapter.hpp
+--- a/include/cutlass/cuda_host_adapter.hpp
++++ b/include/cutlass/cuda_host_adapter.hpp
+@@ -406,5 +406,4 @@
+   /// Fills a buffer in Global Memory with a byte sequence copied from host memory
+   template<class FillValueType>
+-  CUTLASS_HOST_DEVICE
+   Status memsetDevice(
+       void* destination,

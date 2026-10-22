@@ -126,7 +126,7 @@ flash_fwd_mla_combine_kernel(__grid_constant__ const SparseAttnDecodeParams para
 
         float global_lse = (sum_lse == 0.f || sum_lse == -INFINITY) ? INFINITY : log2f(sum_lse) + max_lse;
         if (lane_idx == 0)
-            gLse(warp_idx) = global_lse / (float)M_LOG2E;
+            gLse(warp_idx) = global_lse / CUDART_L2E_F;
         
         if (params.attn_sink != nullptr) {
             int q_head_idx = h_block_idx*BLOCK_SIZE_M + warp_idx;

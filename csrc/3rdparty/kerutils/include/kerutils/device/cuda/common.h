@@ -37,6 +37,12 @@ using nve4m3x4 = __nv_fp8x4_e4m3;
 using bf16 = cutlass::bfloat16_t;
 using transac_bar_t = cutlass::arch::ClusterTransactionBarrier;
 
+#ifdef _MSC_VER
+using int128_t = int4;
+#else
+using int128_t = __int128_t;
+#endif
+
 }
 
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800))

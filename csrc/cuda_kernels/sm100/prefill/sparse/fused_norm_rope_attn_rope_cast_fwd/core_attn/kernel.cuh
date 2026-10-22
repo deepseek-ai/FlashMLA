@@ -248,7 +248,7 @@ struct DequantRows {
             uint8_t *row_base = slot_base + row / 4 * K::RAW_KV_GROUP_BYTES + row % 4 * F::RAW_TOKEN_SMEM_STRIDE;
             CUTE_UNROLL
             for (uint32_t g = 0; g < F::NUM_QUANT_CHUNKS_PER_LANE; ++g) {
-                *(__int128_t*)(cached_input[token_idx][g]) = ku::ld_shared(row_base + (get_chunk_base<F>(g / 4) + g % 4) * 16);
+                *reinterpret_cast<ku::int128_t*>(cached_input[token_idx][g]) = ku::ld_shared(row_base + (get_chunk_base<F>(g / 4) + g % 4) * 16);
             }
         });
         NamedBarrier::arrive_and_wait(128, K::barrier_ids::WG1_DEQUANT_SYNC);  // Make sure everyone has finished reading
@@ -981,7 +981,7 @@ void Kernel<CONFIG>::devfunc(const Params &params, const TMAParams &tma_params, 
                 smem.bar_SO_empty.wait(rs.get<1>().second^1);
                 CUTE_UNROLL
                 for (int i = 0; i < NUM_ELEMS_PER_THREAD/8; ++i) {
-                    ku::st_shared(sS_base + i*8*H_Q_PER_CTA, *(__int128_t*)(s + i*8));
+                    ku::st_shared(sS_base + i*8*H_Q_PER_CTA, *reinterpret_cast<ku::int128_t*>(s + i*8));
                 }
 
                 // Rescale O
@@ -1580,11 +1580,24 @@ void Kernel<CONFIG>::devfunc(const Params &params, const TMAParams &tma_params, 
 }
 
 
+#ifdef _MSC_VER
+template<SparseAttnFwdMode Mode, ModelType Model, ModelType ExtraModel, uint32_t Heads, bool Norm>
+__global__ void __launch_bounds__(
+    (Kernel<Config{Mode, Model, ExtraModel, Heads, Norm}>::NUM_THREADS), 1,
+    (Kernel<Config{Mode, Model, ExtraModel, Heads, Norm}>::CLUSTER_SIZE))
+fwd_kernel(
+    __grid_constant__ const typename Kernel<Config{Mode, Model, ExtraModel, Heads, Norm}>::Params params,
+    __grid_constant__ const typename Kernel<Config{Mode, Model, ExtraModel, Heads, Norm}>::TMAParams tma_params,
+    __grid_constant__ const typename Kernel<Config{Mode, Model, ExtraModel, Heads, Norm}>::AuxParams aux_params) {
+    Kernel<Config{Mode, Model, ExtraModel, Heads, Norm}>::devfunc(params, tma_params, aux_params);
+}
+#else
 template<typename Kernel>
 __global__ void __launch_bounds__(Kernel::NUM_THREADS, 1, Kernel::CLUSTER_SIZE)
 fwd_kernel(__grid_constant__ const typename Kernel::Params params, __grid_constant__ const typename Kernel::TMAParams tma_params, __grid_constant__ const typename Kernel::AuxParams aux_params) {
     Kernel::devfunc(params, tma_params, aux_params);
 }
+#endif
 
 
 template<Config CONFIG>
@@ -1658,7 +1671,11 @@ void Kernel<CONFIG>::run(const Params &params) {
         aux_params.fast_divmod_extra_page_block_size = cutlass::FastDivmod(params.extra_kv != nullptr ? params.extra_page_block_size : 1);
     }
 
+#ifdef _MSC_VER
+    auto kernel = &fwd_kernel<CONFIG.FWD_MODE, CONFIG.MODEL_TYPE, CONFIG.EXTRA_MODEL_TYPE, CONFIG.H_Q, CONFIG.ENABLE_Q_NORM>;
+#else
     auto kernel = &fwd_kernel<Kernel>;
+#endif
     constexpr size_t smem_size = sizeof(SharedMemoryPlan);
     KU_CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
 

@@ -97,6 +97,41 @@ def get_nvcc_thread_args():
     return ["--threads", nvcc_threads]
 
 
+def apply_cutlass_windows_patch():
+    if sys.platform != "win32":
+        return
+
+    cutlass_dir = THIS_DIR / "csrc" / "3rdparty" / "cutlass"
+    if not (cutlass_dir / "include" / "cutlass" / "cuda_host_adapter.hpp").is_file():
+        raise RuntimeError(
+            "CUTLASS submodule is missing. Run git submodule update --init --recursive "
+            "before building FlashMLA."
+        )
+
+    patch_path = THIS_DIR / "csrc" / "3rdparty" / "cutlass-windows.patch"
+    patch = patch_path.read_bytes().replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+
+    def run_apply(*options):
+        return subprocess.run(
+            ["git", "apply", *options, "-"],
+            cwd=cutlass_dir,
+            input=patch,
+            capture_output=True,
+        )
+
+    if run_apply("--reverse", "--check").returncode == 0:
+        return
+
+    for options in (("--check",), ()):
+        result = run_apply(*options)
+        if result.returncode != 0:
+            raise RuntimeError(
+                "CUTLASS Windows compatibility patch could not be applied:\n"
+                + result.stderr.decode("utf-8", errors="replace")
+            )
+    print("Applied CUTLASS Windows compatibility patch")
+
+
 # `flash_mla/__init__.py` needs to know which platform this build targets and the exact file
 # name of the extension (which depends on the CPython ABI tag), so the build records both in a
 # generated module instead of having the package guess at import time.
@@ -152,6 +187,8 @@ def build_on_cuda_platform():
     print(f"Compiling using NVCC {major}.{minor}")
     assert major > 13 or (major == 13 and minor >= 1), \
         "Compiling the kernels requires NVCC 13.1 or higher (cvt with .scaled::n2::ue8m0)."
+
+    apply_cutlass_windows_patch()
 
     class BuildExtensionWithPostActions(WriteBuildInfoMixin, BuildExtension):
         """
