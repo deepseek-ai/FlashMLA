@@ -3,6 +3,7 @@
 Run `python tests/test-split-kv-combine.py` with CUDA PyTorch, Ninja, NVCC,
 the CUTLASS submodule initialized, and a GPU with compute capability >= 9.0.
 Only the native combine kernel is compiled; no full FlashMLA build is needed.
+Compilation uses the production build's --use_fast_math flag.
 This does not exercise the public sparse-attention API or the sink path.
 """
 import math
@@ -38,7 +39,7 @@ def main():
                                  str(root / "csrc/3rdparty/kerutils/include")],
             extra_cflags=["-O3", "-std=c++20"],
             extra_cuda_cflags=[
-                "-O3", "-std=c++20", "--expt-relaxed-constexpr", "--expt-extended-lambda",
+                "-O3", "-std=c++20", "--use_fast_math", "--expt-relaxed-constexpr", "--expt-extended-lambda",
                 "-U__CUDA_NO_HALF_OPERATORS__", "-U__CUDA_NO_HALF_CONVERSIONS__",
                 "-U__CUDA_NO_HALF2_OPERATORS__", "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
             ],
