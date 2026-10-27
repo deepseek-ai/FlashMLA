@@ -644,7 +644,7 @@ void run_sparse_fwd_phase1_kernel(const SparseAttnFwdParams& params) {
                 make_stride(params.stride_q_h_q, _1{}, params.stride_q_s_q)
             )
         ),
-        (typename Kernel::SmemLayoutQTiles<Kernel::D_QK/64>){}
+        typename Kernel::SmemLayoutQTiles<Kernel::D_QK/64>{}
     );
 
     auto shape_O = make_shape(params.h_q, params.d_v, params.s_q);
@@ -657,7 +657,7 @@ void run_sparse_fwd_phase1_kernel(const SparseAttnFwdParams& params) {
                 make_stride(params.d_v, _1{}, params.h_q*params.d_v)
             )
         ),
-        (typename Kernel::SmemLayoutOTiles<1>){}
+        typename Kernel::SmemLayoutOTiles<1>{}
     );
 
     CUtensorMap tensor_map_kv;
