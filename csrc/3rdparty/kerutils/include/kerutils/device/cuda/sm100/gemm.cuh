@@ -99,6 +99,7 @@ struct SM100_MMA_F16BF16_WS_TS_NOELECT
       uint32_t const& scaleC,
       uint64_t const& idescE)
   {
+#if defined(CUTE_ARCH_TCGEN05_F16F32_MMA_ENABLED)
     asm volatile(
       "{\n\t"
       ".reg .pred p;\n\t"
@@ -107,6 +108,9 @@ struct SM100_MMA_F16BF16_WS_TS_NOELECT
       "}\n"
       :
       : "r"(tmem_c), "r"(tmem_a), "l"(desc_b), "r"(uint32_t(idescE>>32)), "r"(scaleC));
+#else
+    CUTE_INVALID_CONTROL_PATH("Attempting to use SM100_MMA_F16BF16_WS_TS_NOELECT without CUTE_ARCH_TCGEN05_F16F32_MMA_ENABLED");
+#endif
   }
 };
 
@@ -200,6 +204,7 @@ struct SM100_MMA_F16BF16_WS_SS_NOELECT
       uint32_t const& scaleC,
       uint64_t const& idescE)
   {
+#if defined(CUTE_ARCH_TCGEN05_F16F32_MMA_ENABLED)
     asm volatile(
       "{\n\t"
       ".reg .pred p;\n\t"
@@ -208,6 +213,9 @@ struct SM100_MMA_F16BF16_WS_SS_NOELECT
       "}\n"
       :
       : "r"(tmem_c), "l"(desc_a), "l"(desc_b), "r"(uint32_t(idescE>>32)), "r"(scaleC));
+#else
+    CUTE_INVALID_CONTROL_PATH("Attempting to use SM100_MMA_F16BF16_WS_SS_NOELECT without CUTE_ARCH_TCGEN05_F16F32_MMA_ENABLED");
+#endif
   }
 };
 
@@ -513,6 +521,7 @@ struct SM100_MMA_F16BF16_TS_NOELECT
       uint32_t const& scaleC,
       uint64_t const& idescE)
   {
+#if defined(CUTE_ARCH_TCGEN05_F16F32_MMA_ENABLED)
     uint32_t mask[4] = {0, 0, 0, 0};
     asm volatile(
       "{\n\t"
@@ -523,6 +532,9 @@ struct SM100_MMA_F16BF16_TS_NOELECT
       :
       : "r"(tmem_c), "r"(tmem_a), "l"(desc_b), "r"(uint32_t(idescE>>32)), "r"(scaleC),
         "r"(mask[0]), "r"(mask[1]), "r"(mask[2]), "r"(mask[3]));
+#else
+    CUTE_INVALID_CONTROL_PATH("Attempting to use SM100_MMA_F16BF16_TS_NOELECT without CUTE_ARCH_TCGEN05_F16F32_MMA_ENABLED");
+#endif
   }
 };
 
@@ -614,6 +626,7 @@ struct SM100_MMA_F16BF16_SS_NOELECT
       uint32_t const& scaleC,
       uint64_t const& idescE)
   {
+#if defined(CUTE_ARCH_TCGEN05_F16F32_MMA_ENABLED)
     uint32_t mask[4] = {0, 0, 0, 0};
     asm volatile(
       "{\n\t"
@@ -624,6 +637,9 @@ struct SM100_MMA_F16BF16_SS_NOELECT
       :
       : "r"(tmem_c), "l"(desc_a), "l"(desc_b), "r"(uint32_t(idescE>>32)), "r"(scaleC),
         "r"(mask[0]), "r"(mask[1]), "r"(mask[2]), "r"(mask[3]));
+#else
+    CUTE_INVALID_CONTROL_PATH("Attempting to use SM100_MMA_F16BF16_SS_NOELECT without CUTE_ARCH_TCGEN05_F16F32_MMA_ENABLED");
+#endif
   }
 };
 

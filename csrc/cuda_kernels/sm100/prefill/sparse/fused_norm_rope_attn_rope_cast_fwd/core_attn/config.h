@@ -264,6 +264,223 @@ using TiledMMA_SV = cute::conditional_t<
     decltype(make_tiled_mma(SM100_MMA_F16BF16_WS_SS_NOELECT<bf16, bf16, float, MMA_M, 256, UMMA::Major::K, UMMA::Major::MN>{}))
 >;
 
+#ifdef _MSC_VER
+struct PrefillWithoutNormWithoutPEmptyBarrierStorage {
+    CUTE_ALIGNAS(1024) bf16 kv_slots[NUM_KV_SLOTS][B_TOPK * D_QK / CLUSTER_SIZE];    // Cluster size = 1: the whole KV; cluster size = 2: half KV
+    CUTE_ALIGNAS(1024) bf16 s[H_Q_PER_CTA * B_TOPK];
+    CUTE_ALIGNAS(1024) float p_exchange_buf[4][32*NUM_P_ELEMS_PER_THREAD];
+    CUTE_ALIGNAS(1024) uint8_t is_k_valid[NUM_INDICES_BUFS][ku::find_next_power_of_2(B_TOPK/8)];
+    float rowwise_max_buf[128];
+    float rowwise_mi_buf[H_Q_PER_CTA];
+    float rowwise_li_buf[128];    // 128: warpgroup size
+
+    transac_bar_t bar_kv_slot_full[NUM_KV_SLOTS], bar_kv_slot_empty[NUM_KV_SLOTS];
+    transac_bar_t bar_indices_full[NUM_INDICES_BUFS], bar_indices_empty[NUM_INDICES_BUFS];
+    transac_bar_t bar_tQ_empty, bar_tQ_full;
+    transac_bar_t bar_q_sqr_sum_full;   // Only used for 2-CTA
+    transac_bar_t bar_tO_empty, bar_tO_full;
+    transac_bar_t bar_tP_full[NUM_P_BUFS];
+    transac_bar_t bar_SO_full, bar_SO_empty;
+    transac_bar_t bar_clc_full, bar_clc_empty;
+    transac_bar_t bar_li_mi_full, bar_li_mi_empty;
+
+    ku::CLCResponseObj clc_response_obj;
+    array_aligned<uint32_t, 1> tmem_start_addr;
+};
+
+struct PrefillWithoutNormWithPEmptyBarrierStorage {
+    CUTE_ALIGNAS(1024) bf16 kv_slots[NUM_KV_SLOTS][B_TOPK * D_QK / CLUSTER_SIZE];    // Cluster size = 1: the whole KV; cluster size = 2: half KV
+    CUTE_ALIGNAS(1024) bf16 s[H_Q_PER_CTA * B_TOPK];
+    CUTE_ALIGNAS(1024) float p_exchange_buf[4][32*NUM_P_ELEMS_PER_THREAD];
+    CUTE_ALIGNAS(1024) uint8_t is_k_valid[NUM_INDICES_BUFS][ku::find_next_power_of_2(B_TOPK/8)];
+    float rowwise_max_buf[128];
+    float rowwise_mi_buf[H_Q_PER_CTA];
+    float rowwise_li_buf[128];    // 128: warpgroup size
+
+    transac_bar_t bar_kv_slot_full[NUM_KV_SLOTS], bar_kv_slot_empty[NUM_KV_SLOTS];
+    transac_bar_t bar_indices_full[NUM_INDICES_BUFS], bar_indices_empty[NUM_INDICES_BUFS];
+    transac_bar_t bar_tQ_empty, bar_tQ_full;
+    transac_bar_t bar_q_sqr_sum_full;   // Only used for 2-CTA
+    transac_bar_t bar_tO_empty, bar_tO_full;
+    transac_bar_t bar_tP_full[NUM_P_BUFS], bar_tP_empty[NUM_P_BUFS];
+    transac_bar_t bar_SO_full, bar_SO_empty;
+    transac_bar_t bar_clc_full, bar_clc_empty;
+    transac_bar_t bar_li_mi_full, bar_li_mi_empty;
+
+    ku::CLCResponseObj clc_response_obj;
+    array_aligned<uint32_t, 1> tmem_start_addr;
+};
+
+struct PrefillWithNormWithoutPEmptyBarrierStorage {
+    CUTE_ALIGNAS(1024) bf16 kv_slots[NUM_KV_SLOTS][B_TOPK * D_QK / CLUSTER_SIZE];    // Cluster size = 1: the whole KV; cluster size = 2: half KV
+    CUTE_ALIGNAS(1024) bf16 s[H_Q_PER_CTA * B_TOPK];
+    CUTE_ALIGNAS(1024) float p_exchange_buf[4][32*NUM_P_ELEMS_PER_THREAD];
+    CUTE_ALIGNAS(1024) uint8_t is_k_valid[NUM_INDICES_BUFS][ku::find_next_power_of_2(B_TOPK/8)];
+    float q_sqr_sum_buf[2][128];    // We have 2 q_sqr_sum_buf to save some barriers, as Q[i+2] starts to fetch -> O[i] have finished -> Q[i]'s q_sqr_sum_buf is useless
+    float rowwise_max_buf[128];
+    float rowwise_mi_buf[H_Q_PER_CTA];
+    float rowwise_li_buf[128];    // 128: warpgroup size
+
+    transac_bar_t bar_kv_slot_full[NUM_KV_SLOTS], bar_kv_slot_empty[NUM_KV_SLOTS];
+    transac_bar_t bar_indices_full[NUM_INDICES_BUFS], bar_indices_empty[NUM_INDICES_BUFS];
+    transac_bar_t bar_tQ_empty, bar_tQ_full;
+    transac_bar_t bar_q_sqr_sum_full;   // Only used for 2-CTA
+    transac_bar_t bar_tO_empty, bar_tO_full;
+    transac_bar_t bar_tP_full[NUM_P_BUFS];
+    transac_bar_t bar_SO_full, bar_SO_empty;
+    transac_bar_t bar_clc_full, bar_clc_empty;
+    transac_bar_t bar_li_mi_full, bar_li_mi_empty;
+
+    ku::CLCResponseObj clc_response_obj;
+    array_aligned<uint32_t, 1> tmem_start_addr;
+};
+
+struct PrefillWithNormWithPEmptyBarrierStorage {
+    CUTE_ALIGNAS(1024) bf16 kv_slots[NUM_KV_SLOTS][B_TOPK * D_QK / CLUSTER_SIZE];    // Cluster size = 1: the whole KV; cluster size = 2: half KV
+    CUTE_ALIGNAS(1024) bf16 s[H_Q_PER_CTA * B_TOPK];
+    CUTE_ALIGNAS(1024) float p_exchange_buf[4][32*NUM_P_ELEMS_PER_THREAD];
+    CUTE_ALIGNAS(1024) uint8_t is_k_valid[NUM_INDICES_BUFS][ku::find_next_power_of_2(B_TOPK/8)];
+    float q_sqr_sum_buf[2][128];    // We have 2 q_sqr_sum_buf to save some barriers, as Q[i+2] starts to fetch -> O[i] have finished -> Q[i]'s q_sqr_sum_buf is useless
+    float rowwise_max_buf[128];
+    float rowwise_mi_buf[H_Q_PER_CTA];
+    float rowwise_li_buf[128];    // 128: warpgroup size
+
+    transac_bar_t bar_kv_slot_full[NUM_KV_SLOTS], bar_kv_slot_empty[NUM_KV_SLOTS];
+    transac_bar_t bar_indices_full[NUM_INDICES_BUFS], bar_indices_empty[NUM_INDICES_BUFS];
+    transac_bar_t bar_tQ_empty, bar_tQ_full;
+    transac_bar_t bar_q_sqr_sum_full;   // Only used for 2-CTA
+    transac_bar_t bar_tO_empty, bar_tO_full;
+    transac_bar_t bar_tP_full[NUM_P_BUFS], bar_tP_empty[NUM_P_BUFS];
+    transac_bar_t bar_SO_full, bar_SO_empty;
+    transac_bar_t bar_clc_full, bar_clc_empty;
+    transac_bar_t bar_li_mi_full, bar_li_mi_empty;
+
+    ku::CLCResponseObj clc_response_obj;
+    array_aligned<uint32_t, 1> tmem_start_addr;
+};
+
+struct DecodeWithoutNormWithoutPEmptyBarrierStorage {
+    CUTE_ALIGNAS(1024) bf16 kv_slots[NUM_KV_SLOTS][B_TOPK * D_QK / CLUSTER_SIZE];    // Cluster size = 1: the whole KV; cluster size = 2: half KV
+    CUTE_ALIGNAS(1024) bf16 s[H_Q_PER_CTA * B_TOPK];
+    CUTE_ALIGNAS(1024) float p_exchange_buf[4][32*NUM_P_ELEMS_PER_THREAD];
+    CUTE_ALIGNAS(1024) uint8_t is_k_valid[NUM_INDICES_BUFS][ku::find_next_power_of_2(B_TOPK/8)];
+    CUTE_ALIGNAS(16) int decode_tma_coords[NUM_INDICES_BUFS][B_TOPK];
+    float rowwise_max_buf[128];
+    float rowwise_mi_buf[H_Q_PER_CTA];
+    float rowwise_li_buf[128];    // 128: warpgroup size
+
+    transac_bar_t bar_kv_slot_full[NUM_KV_SLOTS], bar_kv_slot_empty[NUM_KV_SLOTS];
+    transac_bar_t bar_indices_full[NUM_INDICES_BUFS], bar_indices_empty[NUM_INDICES_BUFS];
+    transac_bar_t bar_tQ_empty, bar_tQ_full;
+    transac_bar_t bar_q_sqr_sum_full;   // Only used for 2-CTA
+    transac_bar_t bar_tO_empty, bar_tO_full;
+    transac_bar_t bar_tP_full[NUM_P_BUFS];
+    transac_bar_t bar_SO_full, bar_SO_empty;
+    transac_bar_t bar_clc_full, bar_clc_empty;
+    transac_bar_t bar_li_mi_full, bar_li_mi_empty;
+    transac_bar_t bar_raw_kv_full[NUM_RAW_BARS];
+    transac_bar_t bar_wg1_past_raw[NUM_RAW_BARS];
+
+    ku::CLCResponseObj clc_response_obj;
+    array_aligned<uint32_t, 1> tmem_start_addr;
+};
+
+struct DecodeWithoutNormWithPEmptyBarrierStorage {
+    CUTE_ALIGNAS(1024) bf16 kv_slots[NUM_KV_SLOTS][B_TOPK * D_QK / CLUSTER_SIZE];    // Cluster size = 1: the whole KV; cluster size = 2: half KV
+    CUTE_ALIGNAS(1024) bf16 s[H_Q_PER_CTA * B_TOPK];
+    CUTE_ALIGNAS(1024) float p_exchange_buf[4][32*NUM_P_ELEMS_PER_THREAD];
+    CUTE_ALIGNAS(1024) uint8_t is_k_valid[NUM_INDICES_BUFS][ku::find_next_power_of_2(B_TOPK/8)];
+    CUTE_ALIGNAS(16) int decode_tma_coords[NUM_INDICES_BUFS][B_TOPK];
+    float rowwise_max_buf[128];
+    float rowwise_mi_buf[H_Q_PER_CTA];
+    float rowwise_li_buf[128];    // 128: warpgroup size
+
+    transac_bar_t bar_kv_slot_full[NUM_KV_SLOTS], bar_kv_slot_empty[NUM_KV_SLOTS];
+    transac_bar_t bar_indices_full[NUM_INDICES_BUFS], bar_indices_empty[NUM_INDICES_BUFS];
+    transac_bar_t bar_tQ_empty, bar_tQ_full;
+    transac_bar_t bar_q_sqr_sum_full;   // Only used for 2-CTA
+    transac_bar_t bar_tO_empty, bar_tO_full;
+    transac_bar_t bar_tP_full[NUM_P_BUFS], bar_tP_empty[NUM_P_BUFS];
+    transac_bar_t bar_SO_full, bar_SO_empty;
+    transac_bar_t bar_clc_full, bar_clc_empty;
+    transac_bar_t bar_li_mi_full, bar_li_mi_empty;
+    transac_bar_t bar_raw_kv_full[NUM_RAW_BARS];
+    transac_bar_t bar_wg1_past_raw[NUM_RAW_BARS];
+
+    ku::CLCResponseObj clc_response_obj;
+    array_aligned<uint32_t, 1> tmem_start_addr;
+};
+
+struct DecodeWithNormWithoutPEmptyBarrierStorage {
+    CUTE_ALIGNAS(1024) bf16 kv_slots[NUM_KV_SLOTS][B_TOPK * D_QK / CLUSTER_SIZE];    // Cluster size = 1: the whole KV; cluster size = 2: half KV
+    CUTE_ALIGNAS(1024) bf16 s[H_Q_PER_CTA * B_TOPK];
+    CUTE_ALIGNAS(1024) float p_exchange_buf[4][32*NUM_P_ELEMS_PER_THREAD];
+    CUTE_ALIGNAS(1024) uint8_t is_k_valid[NUM_INDICES_BUFS][ku::find_next_power_of_2(B_TOPK/8)];
+    CUTE_ALIGNAS(16) int decode_tma_coords[NUM_INDICES_BUFS][B_TOPK];
+    float q_sqr_sum_buf[2][128];    // We have 2 q_sqr_sum_buf to save some barriers, as Q[i+2] starts to fetch -> O[i] have finished -> Q[i]'s q_sqr_sum_buf is useless
+    float rowwise_max_buf[128];
+    float rowwise_mi_buf[H_Q_PER_CTA];
+    float rowwise_li_buf[128];    // 128: warpgroup size
+
+    transac_bar_t bar_kv_slot_full[NUM_KV_SLOTS], bar_kv_slot_empty[NUM_KV_SLOTS];
+    transac_bar_t bar_indices_full[NUM_INDICES_BUFS], bar_indices_empty[NUM_INDICES_BUFS];
+    transac_bar_t bar_tQ_empty, bar_tQ_full;
+    transac_bar_t bar_q_sqr_sum_full;   // Only used for 2-CTA
+    transac_bar_t bar_tO_empty, bar_tO_full;
+    transac_bar_t bar_tP_full[NUM_P_BUFS];
+    transac_bar_t bar_SO_full, bar_SO_empty;
+    transac_bar_t bar_clc_full, bar_clc_empty;
+    transac_bar_t bar_li_mi_full, bar_li_mi_empty;
+    transac_bar_t bar_raw_kv_full[NUM_RAW_BARS];
+    transac_bar_t bar_wg1_past_raw[NUM_RAW_BARS];
+
+    ku::CLCResponseObj clc_response_obj;
+    array_aligned<uint32_t, 1> tmem_start_addr;
+};
+
+struct DecodeWithNormWithPEmptyBarrierStorage {
+    CUTE_ALIGNAS(1024) bf16 kv_slots[NUM_KV_SLOTS][B_TOPK * D_QK / CLUSTER_SIZE];    // Cluster size = 1: the whole KV; cluster size = 2: half KV
+    CUTE_ALIGNAS(1024) bf16 s[H_Q_PER_CTA * B_TOPK];
+    CUTE_ALIGNAS(1024) float p_exchange_buf[4][32*NUM_P_ELEMS_PER_THREAD];
+    CUTE_ALIGNAS(1024) uint8_t is_k_valid[NUM_INDICES_BUFS][ku::find_next_power_of_2(B_TOPK/8)];
+    CUTE_ALIGNAS(16) int decode_tma_coords[NUM_INDICES_BUFS][B_TOPK];
+    float q_sqr_sum_buf[2][128];    // We have 2 q_sqr_sum_buf to save some barriers, as Q[i+2] starts to fetch -> O[i] have finished -> Q[i]'s q_sqr_sum_buf is useless
+    float rowwise_max_buf[128];
+    float rowwise_mi_buf[H_Q_PER_CTA];
+    float rowwise_li_buf[128];    // 128: warpgroup size
+
+    transac_bar_t bar_kv_slot_full[NUM_KV_SLOTS], bar_kv_slot_empty[NUM_KV_SLOTS];
+    transac_bar_t bar_indices_full[NUM_INDICES_BUFS], bar_indices_empty[NUM_INDICES_BUFS];
+    transac_bar_t bar_tQ_empty, bar_tQ_full;
+    transac_bar_t bar_q_sqr_sum_full;   // Only used for 2-CTA
+    transac_bar_t bar_tO_empty, bar_tO_full;
+    transac_bar_t bar_tP_full[NUM_P_BUFS], bar_tP_empty[NUM_P_BUFS];
+    transac_bar_t bar_SO_full, bar_SO_empty;
+    transac_bar_t bar_clc_full, bar_clc_empty;
+    transac_bar_t bar_li_mi_full, bar_li_mi_empty;
+    transac_bar_t bar_raw_kv_full[NUM_RAW_BARS];
+    transac_bar_t bar_wg1_past_raw[NUM_RAW_BARS];
+
+    ku::CLCResponseObj clc_response_obj;
+    array_aligned<uint32_t, 1> tmem_start_addr;
+};
+
+using PrefillStorage = std::conditional_t<
+    ENABLE_Q_NORM,
+    std::conditional_t<NEED_TP_EMPTY_BAR, PrefillWithNormWithPEmptyBarrierStorage, PrefillWithNormWithoutPEmptyBarrierStorage>,
+    std::conditional_t<NEED_TP_EMPTY_BAR, PrefillWithoutNormWithPEmptyBarrierStorage, PrefillWithoutNormWithoutPEmptyBarrierStorage>
+>;
+
+using DecodeStorage = std::conditional_t<
+    ENABLE_Q_NORM,
+    std::conditional_t<NEED_TP_EMPTY_BAR, DecodeWithNormWithPEmptyBarrierStorage, DecodeWithNormWithoutPEmptyBarrierStorage>,
+    std::conditional_t<NEED_TP_EMPTY_BAR, DecodeWithoutNormWithPEmptyBarrierStorage, DecodeWithoutNormWithoutPEmptyBarrierStorage>
+>;
+
+using SharedMemoryPlan = std::conditional_t<
+    IS_DECODE, DecodeStorage, PrefillStorage
+>;
+#else
 struct SharedMemoryPlan {
     CUTE_ALIGNAS(1024) bf16 kv_slots[NUM_KV_SLOTS][B_TOPK * D_QK / CLUSTER_SIZE];    // Cluster size = 1: the whole KV; cluster size = 2: half KV
     CUTE_ALIGNAS(1024) bf16 s[H_Q_PER_CTA * B_TOPK];
@@ -294,6 +511,7 @@ struct SharedMemoryPlan {
     ku::CLCResponseObj clc_response_obj;
     array_aligned<uint32_t, 1> tmem_start_addr;
 };
+#endif
 static_assert(sizeof(SharedMemoryPlan) <= 227 * 1024);
 
 struct TMAParams {

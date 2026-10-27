@@ -73,13 +73,13 @@ __global__ void permute_wv_proj_kernel(__grid_constant__ const Params params) {
     bar.wait(0);
     for (uint32_t i = threadIdx.x; i < params.wv_group_size * (D_O / CHUNK_SIZE); i += 32) {
         fp8_e4m3 data[CHUNK_SIZE];
-        *(__int128_t*)(data +  0) = ku::ld_shared(row_buf + i * CHUNK_SIZE);
-        *(__int128_t*)(data + 16) = ku::ld_shared(row_buf + i * CHUNK_SIZE + 16);
+        *reinterpret_cast<ku::int128_t*>(data +  0) = ku::ld_shared(row_buf + i * CHUNK_SIZE);
+        *reinterpret_cast<ku::int128_t*>(data + 16) = ku::ld_shared(row_buf + i * CHUNK_SIZE + 16);
         uint32_t head_idx = i / (D_O / CHUNK_SIZE);
         uint32_t head_dim_chunk_idx = i % (D_O / CHUNK_SIZE);
         uint32_t chunk_idx_in_permuted_row = head_dim_chunk_idx * params.wv_group_size + head_idx;
-        ku::st_shared(permuted_row_buf + chunk_idx_in_permuted_row * CHUNK_SIZE +  0, *(__int128_t*)(data +  0));
-        ku::st_shared(permuted_row_buf + chunk_idx_in_permuted_row * CHUNK_SIZE + 16, *(__int128_t*)(data + 16));
+        ku::st_shared(permuted_row_buf + chunk_idx_in_permuted_row * CHUNK_SIZE +  0, *reinterpret_cast<ku::int128_t*>(data +  0));
+        ku::st_shared(permuted_row_buf + chunk_idx_in_permuted_row * CHUNK_SIZE + 16, *reinterpret_cast<ku::int128_t*>(data + 16));
     }
 
     // Store the row

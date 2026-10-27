@@ -100,6 +100,8 @@ pip install -v . --no-build-isolation
 
 `--no-build-isolation` is required: `setup.py` imports `torch` (and `torch_npu` on the Ascend platform) while building, and this repository does not declare them as PEP 518 build requirements.
 
+Windows CUDA builds automatically apply `csrc/3rdparty/cutlass-windows.patch` to the initialized CUTLASS submodule. Git must be available on `PATH`. The patch is idempotent, and the build stops if the submodule is missing or its contents are incompatible with the patch. These CUTLASS and MSVC kernel compatibility fixes are ported from [vllm-windows commit fa5db29](https://github.com/vortex-captain/vllm-windows/commit/fa5db2970687344ba5fce91f11765f2a15851207); legacy kernels and vLLM-only changes are not included.
+
 The build target platform is detected automatically (`/dev/davinci_manager` means Ascend, anything else means CUDA) and can be overridden with `FLASH_MLA_BUILD_TARGET_PLATFORM=CUDA` or `FLASH_MLA_BUILD_TARGET_PLATFORM=ASCEND`.
 
 On the Ascend platform, `ASCEND_HOME_PATH` must point to the root of the CANN installation (default: `/usr/local/Ascend/ascend-toolkit/latest`).

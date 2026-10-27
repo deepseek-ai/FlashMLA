@@ -390,7 +390,7 @@ KernelTemplate::sparse_attn_fwd_kernel_devfunc(const SparseAttnFwdParams &params
                             o_bf16[j] = __float22bfloat162_rn(o[i*4+j]);
                         }
                         bf16* sO_ptr = sO_addrs[i] + (c*B_EPI_SB + (idx_in_warpgroup/MMA_M)*(B_EPI_SB/(128/MMA_M)) + k*B_EPI)*MMA_M;
-                        ku::st_shared(sO_ptr, *(__int128_t*)(o_bf16));
+                        ku::st_shared(sO_ptr, *reinterpret_cast<ku::int128_t*>(o_bf16));
                     }
     
                     // Sync
@@ -678,4 +678,3 @@ void KernelTemplate::run(const SparseAttnFwdParams& params) {
 }
 
 }
-

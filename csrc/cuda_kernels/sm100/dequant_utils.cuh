@@ -19,7 +19,8 @@ CUTE_DEVICE void copy_bytes(uint8_t *dst, const uint8_t *src) {
     } else {
         CUTE_UNROLL
         for (int i = 0; i < NUM_BYTES / 16; ++i) {
-            *((__int128_t*)dst + i) = *((const __int128_t*)src + i);
+            *(reinterpret_cast<ku::int128_t*>(dst) + i) =
+                *(reinterpret_cast<const ku::int128_t*>(src) + i);
         }
     }
 }
@@ -104,10 +105,19 @@ struct KVBlockDequantizer {
                 if (local_row_idx == 0 && local_col_idx == 0) {
                     before_first_store();
                 }
+#ifdef _MSC_VER
+                auto& packed_bf16 = *reinterpret_cast<ku::int128_t*>(data_bf16);
+                asm volatile ("st.weak.shared::cta.v4.b32 [%0], {%1, %2, %3, %4};\n"
+                    :
+                    : "r"(dst + dst_offset + local_row_idx * NUM_GROUPS * 128 + local_col_idx * B_TOPK * 128),
+                      "r"(packed_bf16.x), "r"(packed_bf16.y), "r"(packed_bf16.z), "r"(packed_bf16.w)
+                );
+#else
                 asm volatile ("st.weak.shared::cta.b128 [%0], %1;\n"
                     :
                     : "r"(dst + dst_offset + local_row_idx * NUM_GROUPS * 128 + local_col_idx * B_TOPK * 128), "q"(*(__int128_t*)data_bf16)
                 );
+#endif
             }
         }
     }

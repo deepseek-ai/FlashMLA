@@ -40,8 +40,15 @@ using FwdMode = SparseAttnFwdMode;
 
 // NOTES. We found out that, if we use kerutils::st_shared, warpgroup 0 suffers from register spilling. However, if we change to this dump implementation with `__cvta_generic_to_shared`, there is no register spilling.
 CUTE_DEVICE
-void st_shared_with_cvta(void* ptr, __int128_t val) {
+void st_shared_with_cvta(void* ptr, ku::int128_t val) {
+#ifdef _MSC_VER
+    asm volatile("st.shared.v4.b32 [%0], {%1, %2, %3, %4};"
+                 :
+                 : "l"(__cvta_generic_to_shared(ptr)), "r"(val.x), "r"(val.y),
+                   "r"(val.z), "r"(val.w));
+#else
     asm volatile("st.shared.b128 [%0], %1;" :: "l"(__cvta_generic_to_shared(ptr)), "q"(val));
+#endif
 }
 
 template<FwdMode FWD_MODE, ModelType MODEL_TYPE, ModelType EXTRA_MODEL_TYPE>
@@ -269,7 +276,7 @@ KernelTemplate<FWD_MODE, MODEL_TYPE, EXTRA_MODEL_TYPE>::sparse_attn_fwd_kernel_d
                         if (k == 0 && i == 0) {
                             smem.bar_tQ_full.wait(args.outer_loop_phase^1^is_last_o);    // Wait for sQ's availability
                         }
-                        st_shared_with_cvta(o_addr, *(__int128_t*)o_bf16);
+                        st_shared_with_cvta(o_addr, *reinterpret_cast<ku::int128_t*>(o_bf16));
                     }
                 }
 
@@ -311,7 +318,7 @@ KernelTemplate<FWD_MODE, MODEL_TYPE, EXTRA_MODEL_TYPE>::sparse_attn_fwd_kernel_d
                         }
                         st_shared_with_cvta(
                             sO_accum_addrs[i] + cur_buf_idx*((H_Q/2)*B_EPI_SPLITKV*2),
-                            *(__int128_t*)(o + i*4)
+                            *reinterpret_cast<ku::int128_t*>(o + i*4)
                         );
                     }
 
@@ -826,7 +833,7 @@ KernelTemplate<FWD_MODE, MODEL_TYPE, EXTRA_MODEL_TYPE>::sparse_attn_fwd_kernel_d
                 smem.bar_SV_done.wait(bar_phase^1);
                 CUTE_UNROLL
                 for (int i = 0; i < NUM_ELEMS_PER_THREAD/8; ++i) {
-                    ku::st_shared(sS_base + i*8*(H_Q/2), *(__int128_t*)(s + i*4));
+                    ku::st_shared(sS_base + i*8*(H_Q/2), *reinterpret_cast<float4*>(s + i*4));
                 }
 
                 // Rescale O

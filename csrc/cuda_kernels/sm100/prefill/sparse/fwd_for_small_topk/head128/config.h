@@ -97,7 +97,33 @@ struct tmem_cols {
     static constexpr int P = 384;
 };
 
-struct SharedMemoryPlan {
+struct alignas(128) PrefillSharedMemoryPlan {
+    array_aligned<bf16, B_TOPK*(D_K/2)> K[NUM_K_BUFS];
+    array_aligned<bf16, (H_Q/2)*B_TOPK> S;
+    array_aligned<bf16, (H_Q/2)*D_Q> Q;
+    float P_exchange[4][(H_Q/2/2)*(B_TOPK/2)];
+    float rowwise_max_buf[128], rowwise_li_buf[128];
+
+    CUTE_ALIGNAS(16) char is_k_valid[NUM_INDEX_BUFS][B_TOPK/8];
+    CUTE_ALIGNAS(16) int tma_coord[NUM_INDEX_BUFS][B_TOPK];
+
+    transac_bar_t bar_sQ_full, bar_tQ_empty, bar_tQ_full;
+    transac_bar_t bar_tOut_full, bar_tOut_empty;
+    transac_bar_t bar_KV_full[NUM_K_BUFS], bar_KV_empty[NUM_K_BUFS];
+    transac_bar_t bar_P_empty;
+    transac_bar_t bar_QK_done, bar_SV_done;
+    transac_bar_t bar_S_O_full;
+    transac_bar_t bar_li_full, bar_li_empty;
+    transac_bar_t bar_clc_full, bar_clc_empty;
+    transac_bar_t bar_valid_coord_full[NUM_INDEX_BUFS], bar_valid_coord_empty[NUM_INDEX_BUFS];
+
+    ku::CLCResponseObj clc_response_obj;
+    array_aligned<uint32_t, 1> tmem_start_addr;
+};
+
+template<int RawBufferCount>
+struct DecodeSharedMemoryPlan {
+    static constexpr int NUM_RAW_K_BUFS = RawBufferCount;
     array_aligned<bf16, B_TOPK*(D_K/2)> K[NUM_K_BUFS];
     array_aligned<bf16, (H_Q/2)*B_TOPK> S;
     array_aligned<bf16, (H_Q/2)*D_Q> Q; // Will be output for epilogue
@@ -126,6 +152,12 @@ struct SharedMemoryPlan {
     ku::CLCResponseObj clc_response_obj;
     array_aligned<uint32_t, 1> tmem_start_addr;
 };
+
+using SharedMemoryPlan = std::conditional_t<
+    IS_DECODE,
+    DecodeSharedMemoryPlan<NUM_RAW_K_BUFS>,
+    PrefillSharedMemoryPlan
+>;
 
 using TiledMMA_P = decltype(make_tiled_mma(
     SM100_MMA_F16BF16_2x1SM_TS_NOELECT<bf16, bf16, float, H_Q, B_TOPK*2, UMMA::Major::K, UMMA::Major::K>{}
