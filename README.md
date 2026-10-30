@@ -129,9 +129,10 @@ for i in range(num_layers):
 
 Where
 
-- `s_q` is the number of q tokens per q sequence. If MTP (speculative decoding) is disabled, it should be 1.
-- `h_kv` is the number of key-value heads.
-- `h_q` is the number of query heads.
+- `dv` is `head_dim_v`, the head dimension of V; it must be 512.
+- `q_i` has shape `(batch_size, s_q, h_q, 512)`, where `s_q` is the number of q tokens per q sequence (1 when MTP is disabled) and `h_q` is the number of query heads (64 or 128).
+- `kvcache_i` has shape `(num_blocks, page_block_size, 1, bytes_per_token)` (MQA only: a single KV head).
+- `indices` has shape `(batch_size, s_q, topk)`.
 
 **FP8 / FP4 KV Cache Format**
 
