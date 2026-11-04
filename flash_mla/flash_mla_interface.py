@@ -90,6 +90,8 @@ def flash_mla_with_kvcache(
                 values of topk_length and extra_topk_length remain the same. Note that the values are NOT
                 checked at runtime: reusing it with different `topk_length` / `extra_topk_length` values
                 silently reuses stale split-KV scheduling metadata.
+                Its cached scheduling tensors must be on the same device as q; use a separate metadata object
+                for each device when split-KV metadata is present.
                 `cache_seqlens` is not part of this contract: the decoding path ignores it.
         num_splits: must be None (kept for compatibility with the old interface; the split counts are
                 returned inside `tile_scheduler_metadata`).
@@ -129,6 +131,14 @@ def flash_mla_with_kvcache(
     assert indices_in_kvcache is not None, "Sparse attention is required: `indices` must be provided"
     assert not causal, "causal must be False when sparse attention is enabled"
     assert is_fp8_kvcache, "is_fp8_kvcache must be True, since only sparse attention with a quantized KV cache is supported"
+
+    for name, tensor in (("tile_scheduler_metadata", sched_meta.tile_scheduler_metadata),
+                         ("num_splits", sched_meta.num_splits)):
+        if tensor is not None and tensor.device != q.device:
+            raise ValueError(
+                f"Cached {name} is on {tensor.device}, but q is on {q.device}; "
+                "use a separate FlashMLASchedMeta for each device."
+            )
 
     topk = indices_in_kvcache.shape[-1]
     extra_k_page_block_size = extra_k_cache.shape[1] if extra_k_cache is not None else None
