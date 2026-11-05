@@ -12,6 +12,17 @@ using Params = sm100::prefill::fused_norm_rope_attn_rope_cast_fwd::core_attn::Pa
 using DecodeParams = sm100::prefill::fused_norm_rope_attn_rope_cast_fwd::core_attn::ParamT<SparseAttnFwdMode::Decode>;
 using Config = sm100::prefill::fused_norm_rope_attn_rope_cast_fwd::core_attn::Config;
 
+#ifdef FLASH_MLA_IS_BUILD_ON_CUDA
+// The kernels receive raw pointers, so a tensor from another device reaches them
+// as a pointer from a foreign address space. Check every tensor against the query,
+// which selects the device for the whole call.
+static void require_same_device(const char arg_name[], const Tensor &tensor, const Tensor &reference) {
+    STD_TORCH_CHECK(tensor.get_device_index() == reference.get_device_index(),
+                    arg_name, " must be on the same device as q (", reference.get_device_index(),
+                    "), got ", tensor.get_device_index());
+}
+#endif  // FLASH_MLA_IS_BUILD_ON_CUDA
+
 static Tensor allocate_scale_factor(uint32_t batch_size, uint32_t hidden_dim, uint32_t scale_gran, const Tensor &like, std::optional<uint32_t> extra_dim = std::nullopt) {
     // Allocate a scale factor tensor, which should have shape ([extra_dim], batch_size, hidden_dim / (scale_gran*4))
     // Meet DeepGEMM's SF requirement under use_tma_aligned_col_major_sf == True, round_sf == True, and use_packed_ue8m0 == True
@@ -91,6 +102,12 @@ std::vector<Tensor> fused_norm_rope_attn_rope_cast_fwd(
     KU_CHECK_DEVICE(topk_length);
     KU_CHECK_DEVICE(token_positions);
     KU_CHECK_DEVICE(cos_sin_cache);
+    require_same_device("kv", kv, q);
+    require_same_device("indices", indices, q);
+    if (attn_sink.has_value()) require_same_device("attn_sink", *attn_sink, q);
+    if (topk_length.has_value()) require_same_device("topk_length", *topk_length, q);
+    require_same_device("token_positions", token_positions, q);
+    require_same_device("cos_sin_cache", cos_sin_cache, q);
     
     KU_CHECK_DTYPE(q, ScalarType::BFloat16);
     KU_CHECK_DTYPE(kv, ScalarType::BFloat16);
@@ -279,6 +296,15 @@ std::vector<Tensor> fused_norm_rope_attn_rope_cast_decode(
     KU_CHECK_DEVICE(extra_topk_length);
     KU_CHECK_DEVICE(token_positions);
     KU_CHECK_DEVICE(cos_sin_cache);
+    require_same_device("kv", kv, q);
+    require_same_device("indices", indices, q);
+    if (attn_sink.has_value()) require_same_device("attn_sink", *attn_sink, q);
+    if (topk_length.has_value()) require_same_device("topk_length", *topk_length, q);
+    if (extra_kv.has_value()) require_same_device("extra_kv", *extra_kv, q);
+    if (extra_indices.has_value()) require_same_device("extra_indices", *extra_indices, q);
+    if (extra_topk_length.has_value()) require_same_device("extra_topk_length", *extra_topk_length, q);
+    require_same_device("token_positions", token_positions, q);
+    require_same_device("cos_sin_cache", cos_sin_cache, q);
 
     // Check data type
     KU_CHECK_DTYPE(q, ScalarType::BFloat16);
