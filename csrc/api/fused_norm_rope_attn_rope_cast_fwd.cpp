@@ -432,6 +432,7 @@ std::vector<Tensor> permute_q_b_proj(
     int h_q_d_q = h_q * d_q;
     int q_lora_rank = q_b_proj.size(1);
 
+    STD_TORCH_CHECK(scale_factors.size(1) > 0, "q_b_proj scale_factors must have a nonzero second dimension");
     int gran = q_lora_rank / (4 * scale_factors.size(1));
     STD_TORCH_CHECK(gran == 32 || gran == 128, "gran must be 32 or 128, got ", gran);
     STD_TORCH_CHECK(q_lora_rank % (gran * 4) == 0, "q_lora_rank must be divisible by gran * 4");
@@ -502,6 +503,7 @@ std::vector<Tensor> permute_wv_proj(
     int d_proj_out = wv_proj.size(1);
     KU_CHECK_SHAPE(wv_proj, n_wv_group, d_proj_out, wv_group_size * d_o);
 
+    STD_TORCH_CHECK(scale_factors.size(2) > 0, "wv_proj scale_factors must have a nonzero third dimension");
     int input_gran = wv_group_size * d_o / (4 * scale_factors.size(2));
     int output_gran = 32;   // Fixed to 32, otherwise permution between chunk (which has 32 elements) will be impossible
     STD_TORCH_CHECK(input_gran == 32, "input scale granularity must be 32, got ", input_gran);
