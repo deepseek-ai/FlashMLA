@@ -12,6 +12,17 @@ using Params = sm100::prefill::fused_norm_rope_attn_rope_cast_fwd::core_attn::Pa
 using DecodeParams = sm100::prefill::fused_norm_rope_attn_rope_cast_fwd::core_attn::ParamT<SparseAttnFwdMode::Decode>;
 using Config = sm100::prefill::fused_norm_rope_attn_rope_cast_fwd::core_attn::Config;
 
+#ifdef FLASH_MLA_IS_BUILD_ON_CUDA
+// The kernels below receive raw pointers, so a tensor from another device reaches
+// them as a pointer from a foreign address space. Check every tensor against the
+// one that selects the device before launching.
+static void require_same_device(const char arg_name[], const Tensor &tensor, const Tensor &reference) {
+    STD_TORCH_CHECK(tensor.get_device_index() == reference.get_device_index(),
+                    arg_name, " must be on the same device as q (", reference.get_device_index(),
+                    "), got ", tensor.get_device_index());
+}
+#endif  // FLASH_MLA_IS_BUILD_ON_CUDA
+
 static Tensor allocate_scale_factor(uint32_t batch_size, uint32_t hidden_dim, uint32_t scale_gran, const Tensor &like, std::optional<uint32_t> extra_dim = std::nullopt) {
     // Allocate a scale factor tensor, which should have shape ([extra_dim], batch_size, hidden_dim / (scale_gran*4))
     // Meet DeepGEMM's SF requirement under use_tma_aligned_col_major_sf == True, round_sf == True, and use_packed_ue8m0 == True
@@ -438,6 +449,7 @@ std::vector<Tensor> permute_q_b_proj(
 
     KU_CHECK_DEVICE(q_b_proj);
     KU_CHECK_DEVICE(scale_factors);
+    require_same_device("scale_factors", scale_factors, q_b_proj);
 
     KU_CHECK_DTYPE(q_b_proj, ScalarType::Float8_e4m3fn);
     KU_CHECK_DTYPE(scale_factors, ScalarType::Int);
@@ -494,7 +506,8 @@ std::vector<Tensor> permute_wv_proj(
 
     KU_CHECK_DEVICE(wv_proj);
     KU_CHECK_DEVICE(scale_factors);
-    
+    require_same_device("scale_factors", scale_factors, wv_proj);
+
     KU_CHECK_DTYPE(wv_proj, ScalarType::Float8_e4m3fn);
     KU_CHECK_DTYPE(scale_factors, ScalarType::Int);
     
