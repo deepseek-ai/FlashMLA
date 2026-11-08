@@ -45,7 +45,6 @@ KernelTemplate<CONFIG>
     const int s_q_idx = blockIdx.x;
     const int partition_idx = blockIdx.y;
     const int warpgroup_idx = cutlass::canonical_warp_group_idx();
-    const int idx_in_warpgroup = threadIdx.x % 128;
     const int warp_idx = cutlass::canonical_warp_idx_sync();
     const int lane_idx = threadIdx.x % 32;
 
@@ -166,6 +165,7 @@ KernelTemplate<CONFIG>
         // Scale & Exp warpgroup
         // The same technique (and highly similar code) as the sm100 sparse prefill head64 kernel
         cutlass::arch::warpgroup_reg_alloc<224>();
+        const int idx_in_warpgroup = threadIdx.x % 128;
 
         constexpr int B_EPI = 64;   // Must be equal to the size of the swizzle atom
         Tensor sO = make_tensor(make_smem_ptr(plan.u.qo.o.o_buf.data()), SmemLayoutOBuf{});
@@ -177,10 +177,6 @@ KernelTemplate<CONFIG>
         const float2 scale = float2 {params.sm_scale_div_log2, params.sm_scale_div_log2};
         bf16* sS_base = plan.s_p.s.data() + lane_idx*8 + (warp_idx&1)*(MMA_M/2)*8 + (warp_idx/2)*MMA_M*(B_TOPK/2);
 
-        // NOTE Padding rows (idx%MMA_M >= h_q) must not read
-        // attn_sink (OOB); their output is discarded anyway.
-        float attn_sink = (params.attn_sink == nullptr || idx_in_warpgroup%MMA_M >= params.h_q)
-            ? -CUDART_INF_F : __ldg((float*)params.attn_sink + (idx_in_warpgroup%MMA_M)) * CUDART_L2E_F;
         constexpr int NUM_ELEMS_PER_THREAD = B_TOPK / (128/MMA_M);
         
         run_main_loop([&](const MainLoopArgs &args) {
@@ -284,6 +280,12 @@ KernelTemplate<CONFIG>
                 li = 0.0f;
                 mi = -CUDART_INF_F;
             }
+
+            // Only no-split requests need attn_sink here; for split requests the combine kernel applies it.
+            // NOTE Padding rows (idx%MMA_M >= h_q) must not read
+            // attn_sink (OOB); their output is discarded anyway.
+            const float attn_sink = (!args.is_no_split || params.attn_sink == nullptr || idx_in_warpgroup%MMA_M >= params.h_q)
+                ? -CUDART_INF_F : __ldg((float*)params.attn_sink + (idx_in_warpgroup%MMA_M)) * CUDART_L2E_F;
 
             // Exchange li
             NamedBarrier::arrive_and_wait(128, NamedBarriers::wg0_sync);
@@ -620,6 +622,7 @@ KernelTemplate<CONFIG>
     } else {
         // Dequant warpgroup
         cutlass::arch::warpgroup_reg_alloc<208>();
+        const int idx_in_warpgroup = threadIdx.x % 128;
 
         // Turns the raw (fp8 / fp4) rows of each KV block into the bf16 K tile, see KVBlockDequantizer. The format of a block is
         // that of the cache it comes from, resolved at compile time by for_each_kv_block
