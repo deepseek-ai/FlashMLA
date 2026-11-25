@@ -632,7 +632,7 @@ __simd_vf__ void Kernel<CONFIG>::softmax_vf(__ubuf__ UnifiedBufferMemoryPlan& ub
                     if (local_col == 0) {
                         asc_float2bfloat16_rn(s[local_row][local_col], p[local_row][local_col], full_mask);
                     } else {
-                        asc_float2bfloat16_rn_v2_impl(s[local_row][local_col], p[local_row][local_col], full_mask);
+                        asc_float2bfloat16_rn_v2(s[local_row][local_col], p[local_row][local_col], full_mask);
                     }
                 }
             }
@@ -822,7 +822,7 @@ __simd_vf__ void Kernel<CONFIG>::get_final_output_vf(__ubuf__ UnifiedBufferMemor
                 if (i == 0) {
                     asc_float2bfloat16_rn(output_bf16[i][j], output_f32, full_mask);
                 } else {
-                    asc_float2bfloat16_rn_v2_impl(output_bf16[i][j], output_f32, full_mask);    // Use `_impl` since `_v2` is marked as depreciated and I cannot find a alternative
+                    asc_float2bfloat16_rn_v2(output_bf16[i][j], output_f32, full_mask);
                 }
             }
         }
@@ -1376,11 +1376,13 @@ __aicore__ void Kernel<CONFIG>::sparse_attn_fwd_kernel_devfunc(const Params para
             }
             uint32_t num_valid_q_heads_part0 = min(H_Q, MMA_M_PER_V);
             uint32_t num_valid_q_heads_part1 = max((int)H_Q-(int)MMA_M_PER_V, 0);
+            // Q is read once per token and reused little, so keep it out of L2 instead of letting it
+            // compete with the KV cache.
             asc_copy_gm2l1_nd2nz(
                 l1_q_buf_lo + q_l1_buf_idx * (MMA_M_PER_V * D_QK),
                 q_base,
                 params.stride_q_h_q * sizeof(bf16),
-                (uint32_t)LD_L2CacheType::L2_CACHE_HINT_NORMAL_FV,
+                (uint32_t)LD_L2CacheType::L2_CACHE_HINT_NOTALLOC_CLEAN,
                 num_valid_q_heads_part0,
                 D_QK,
                 0u,
@@ -1390,7 +1392,7 @@ __aicore__ void Kernel<CONFIG>::sparse_attn_fwd_kernel_devfunc(const Params para
                 l1_q_buf_hi + q_l1_buf_idx * (MMA_M_PER_V * D_QK),
                 q_base + (uint64_t)(MMA_M_PER_V) * params.stride_q_h_q,
                 params.stride_q_h_q * sizeof(bf16),
-                (uint32_t)LD_L2CacheType::L2_CACHE_HINT_NORMAL_FV,
+                (uint32_t)LD_L2CacheType::L2_CACHE_HINT_NOTALLOC_CLEAN,
                 num_valid_q_heads_part1,
                 D_QK,
                 0u,
