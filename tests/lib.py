@@ -76,6 +76,10 @@ class TestParam:
                 return self.h_q in (64, 128) and self.d_qk == 512
             elif test_target == TestTarget.DECODE:
                 assert self.decode is not None
+                # The Ascend kernel pads the topk axis in B_TOPK-sized blocks and asserts
+                # `extra_topk % B_TOPK == 0` in `run()`
+                if self.decode.extra_topk is not None and self.decode.extra_topk % 64 != 0:
+                    return False
                 if self.h_q not in (64, 128) or self.d_qk != 512:
                     return False
                 if self.decode.block_size == 1 or self.decode.extra_block_size == 1:

@@ -159,7 +159,9 @@ protected:
                         640,
                         HAVE_ATTN_SINK,
                         MODEL_TYPE,
-                        EXTRA_MODEL_TYPE
+                        EXTRA_MODEL_TYPE,
+                        /*HAVE_Q_O_ROPE_AND_O_CAST=*/false,
+                        /*HAVE_Q_NORM=*/false
                     };
                     ascend::prefill::sparse_fwd::run_sparse_fwd_kernel<CONFIG>(params);
                 }));

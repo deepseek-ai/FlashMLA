@@ -72,11 +72,13 @@ CUDA_KERNEL_SOURCES = [
 
 # The Ascend instantiations are explicit template instantiations of `run_sparse_fwd_kernel`.
 # Kept for: h{64,128} x {prefill, decode} x {V4.1 fp8, V4.1 fp4 (decode only)} x {sink, nosink}
+# x {plain, fused norm+RoPE+attn+RoPE+cast (with and without Q norm)}
 ASCEND_KERNEL_SOURCES = [
-    *[f"csrc/ascend_kernels/prefill/sparse/instantiations/{format_name}_h{h_q}_{mode_name}_{sink_name}.asc"
+    *[f"csrc/ascend_kernels/prefill/sparse/instantiations/{format_name}_h{h_q}_{mode_name}_{sink_name}{suffix}.asc"
       for h_q in (64, 128)
       for format_name, mode_name in (("v41", "prefill"), ("v41", "decode"), ("v41fp4", "decode"))
-      for sink_name in ("nosink", "sink")],
+      for sink_name in ("nosink", "sink")
+      for suffix in ("", "_nonorm", "_norm")],
 ]
 
 def get_cuda_arch_flags():
@@ -290,6 +292,9 @@ def build_on_ascend_platform():
                     "-Wno-deprecated-declarations",
                     # Disable argument preload at the beginning of kernels to avoid a hardware bug
                     "-mllvm", "-cce-aicore-dcpreload-args=false",
+                    # Raise a compilation error when a VF spills instead of silently reserving UB for its stack, so
+                    # that the 256 KB UB budget asserted in the kernel config holds
+                    "--cce-disable-vf-stack-reserved-ubuf",
                 ],
             },
             extra_link_args=[

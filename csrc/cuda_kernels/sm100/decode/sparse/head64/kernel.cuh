@@ -16,6 +16,8 @@ NUM_THREADS=384 (3 warpgroups)
 
 I/O: See SparseAttnDecodeParams in csrc/params.h
 */
+#pragma once
+
 #include "kernel.h"
 
 #include <math_constants.h>
