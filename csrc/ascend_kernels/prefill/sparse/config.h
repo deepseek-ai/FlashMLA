@@ -25,7 +25,11 @@ static constexpr SparseAttnFwdMode FWD_MODE = CONFIG.FWD_MODE;
 static constexpr ModelType MODEL_TYPE = CONFIG.MODEL_TYPE;
 static constexpr ModelType EXTRA_MODEL_TYPE = CONFIG.EXTRA_MODEL_TYPE;
 static constexpr uint32_t H_Q = CONFIG.H_Q;
-static constexpr uint32_t MMA_M = ku::ceil(H_Q, 32u);   // Pad MMA_M to multiples of 32 because 1) MMA_M = 32 is already memory-bound (L2 bw bound) 2) MMA_M = 32 corresponds to MMA_M_PER_V = 16 which is the height of one L0C fractal. MMA_M smaller than 32 will cause strange problems when copying from FixPipe to UB
+static constexpr uint32_t NUM_HEAD_SPLITS = ku::ceil_div(H_Q, 64u);    // Number of AI cores that share one q token
+static constexpr uint32_t H_Q_PER_AI_CORE = H_Q / NUM_HEAD_SPLITS;   // Number of query heads handled by one AI core
+static_assert(H_Q % NUM_HEAD_SPLITS == 0);
+static_assert(H_Q_PER_AI_CORE % 8 == 0);
+static constexpr uint32_t MMA_M = ku::ceil(H_Q_PER_AI_CORE, 32u);   // Pad MMA_M to multiples of 32 because 1) MMA_M = 32 is already memory-bound (L2 bw bound) 2) MMA_M = 32 corresponds to MMA_M_PER_V = 16 which is the height of one L0C fractal. MMA_M smaller than 32 will cause strange problems when copying from FixPipe to UB
 static constexpr uint32_t INDEX_BLOCK_SIZE = CONFIG.INDEX_BLOCK_SIZE;
 static constexpr bool HAVE_ATTN_SINK = CONFIG.HAVE_ATTN_SINK;
 static_assert(FWD_MODE == SparseAttnFwdMode::Prefill || FWD_MODE == SparseAttnFwdMode::Decode);
@@ -72,6 +76,11 @@ static constexpr uint32_t FRACTAL_H = 16;   // In number of rows
 static constexpr uint32_t FRACTAL_W = 16;   // In number of elements
 
 static constexpr uint32_t GRID_SHAPE = 32;
+static_assert(GRID_SHAPE % NUM_HEAD_SPLITS == 0);
+// Number of q tokens by which the outer loop advances on one AI core. With a head split the GRID_SHAPE
+// cores are paired up (core 2i and core 2i+1 handle the same q tokens), so each core only walks
+// GRID_SHAPE / NUM_HEAD_SPLITS q tokens per step
+static constexpr uint32_t Q_TOKENS_PER_JOB_STEP = GRID_SHAPE / NUM_HEAD_SPLITS;
 
 using gathered_kv_t = std::conditional_t<IS_DECODE, float8_e4m3_t, bf16>;
 struct UnifiedBufferMemoryPlan {

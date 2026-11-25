@@ -129,6 +129,7 @@ protected:
 class SparseDecodeImpl : public SparseDecodeImplBase {
     DECLARE_SUPPORTED_FEATURES(
         SparseDecodeFeatures::HEAD_64,
+        SparseDecodeFeatures::HEAD_128,
         SparseDecodeFeatures::ATTN_SINK,
         SparseDecodeFeatures::TOPK_LENGTH,
         SparseDecodeFeatures::EXTRA_KVCACHE,
@@ -150,16 +151,18 @@ public:
 protected:
     void run_(const SparseAttnDecodeParams &params, const std::vector<FeatureT> &required_features) override {
         dispatch_kv_formats(SupportedKVFormats{}, params.model_type, params.extra_model_type, [&]<ModelType MODEL_TYPE, ModelType EXTRA_MODEL_TYPE>() {
-            DISPATCH_BOOLEAN_FLAG(params.attn_sink != nullptr, HAVE_ATTN_SINK, ([&]() {
-                static constexpr ascend::prefill::sparse_fwd::Config CONFIG = {
-                    SparseAttnFwdMode::Decode,
-                    64,
-                    640,
-                    HAVE_ATTN_SINK,
-                    MODEL_TYPE,
-                    EXTRA_MODEL_TYPE
-                };
-                ascend::prefill::sparse_fwd::run_sparse_fwd_kernel<CONFIG>(params);
+            DISPATCH_NUM_HEADS(params.h_q, H_Q, ([&]() {
+                DISPATCH_BOOLEAN_FLAG(params.attn_sink != nullptr, HAVE_ATTN_SINK, ([&]() {
+                    static constexpr ascend::prefill::sparse_fwd::Config CONFIG = {
+                        SparseAttnFwdMode::Decode,
+                        H_Q,
+                        640,
+                        HAVE_ATTN_SINK,
+                        MODEL_TYPE,
+                        EXTRA_MODEL_TYPE
+                    };
+                    ascend::prefill::sparse_fwd::run_sparse_fwd_kernel<CONFIG>(params);
+                }));
             }));
         });
     }

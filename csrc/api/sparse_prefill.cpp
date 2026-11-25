@@ -54,22 +54,25 @@ protected:
 class SparseFwdImpl : public SparseFwdImplBase {
     DECLARE_SUPPORTED_FEATURES(
         SparseFwdFeatures::HEAD_64,
+        SparseFwdFeatures::HEAD_128,
         SparseFwdFeatures::ATTN_SINK,
         SparseFwdFeatures::TOPK_LENGTH
     )
 
 protected:
     void run_(const SparseAttnFwdParams &params, const std::vector<FeatureT> &required_features) override {
-        DISPATCH_BOOLEAN_FLAG(params.attn_sink != nullptr, HAVE_ATTN_SINK, ([&]() {
-            static constexpr ascend::prefill::sparse_fwd::Config CONFIG = {
-                SparseAttnFwdMode::Prefill,
-                64,
-                640,
-                HAVE_ATTN_SINK,
-                ModelType::V41,
-                ModelType::V41
-            };
-            ascend::prefill::sparse_fwd::run_sparse_fwd_kernel<CONFIG>(params);
+        DISPATCH_NUM_HEADS(params.h_q, H_Q, ([&]() {
+            DISPATCH_BOOLEAN_FLAG(params.attn_sink != nullptr, HAVE_ATTN_SINK, ([&]() {
+                static constexpr ascend::prefill::sparse_fwd::Config CONFIG = {
+                    SparseAttnFwdMode::Prefill,
+                    H_Q,
+                    640,
+                    HAVE_ATTN_SINK,
+                    ModelType::V41,
+                    ModelType::V41
+                };
+                ascend::prefill::sparse_fwd::run_sparse_fwd_kernel<CONFIG>(params);
+            }));
         }));
     }
 };

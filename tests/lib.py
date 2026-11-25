@@ -67,11 +67,16 @@ class TestParam:
 
     def can_run_on_and_clamp(self, test_target: TestTarget) -> bool:
         if kk.is_on_ascend_platform():
+            # The Ascend kernels process the topk in B_TOPK (= 64) sized blocks and assert
+            # `topk % B_TOPK == 0` in `run()`, so mirror that restriction here instead of letting the
+            # device-side assert abort the process
+            if self.topk is not None and self.topk % 64 != 0:
+                return False
             if test_target == TestTarget.SPARSE_FWD:
-                return self.h_q == 64 and self.d_qk == 512
+                return self.h_q in (64, 128) and self.d_qk == 512
             elif test_target == TestTarget.DECODE:
                 assert self.decode is not None
-                if self.h_q != 64 or self.d_qk != 512:
+                if self.h_q not in (64, 128) or self.d_qk != 512:
                     return False
                 if self.decode.block_size == 1 or self.decode.extra_block_size == 1:
                     return False

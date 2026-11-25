@@ -500,15 +500,15 @@ __simd_vf__ void Kernel<CONFIG>::softmax_vf(__ubuf__ UnifiedBufferMemoryPlan& ub
 
     // Create a mask whose first "num valid heads in this subblock" * 2 rows are set to 1
     vector_bool valid_rows_mask_for_row_max;
-    if constexpr (H_Q == 64) {
+    if constexpr (H_Q_PER_AI_CORE == 64) {
         // MMA_M is 64. Each AIV is responsible for 32 heads, occupying all 32 * 2 lanes in SIMD reg (*2 since every row-max is repeated twice)
         valid_rows_mask_for_row_max = full_mask;
-    } else if constexpr (H_Q == 32) {
+    } else if constexpr (H_Q_PER_AI_CORE == 32) {
         // MMA_M is 32. Each AIV is responsible for 16 heads, occupying the first 16 * 2 = 32 lanes in SIMD reg
         valid_rows_mask_for_row_max = asc_create_mask_b32(PAT_VL32);
     } else {
         uint32_t my_subblock_start_head_idx = subblock_idx * MMA_M_PER_V;
-        uint32_t num_valid_heads = H_Q >= my_subblock_start_head_idx ? H_Q - my_subblock_start_head_idx : 0u;
+        uint32_t num_valid_heads = H_Q_PER_AI_CORE >= my_subblock_start_head_idx ? H_Q_PER_AI_CORE - my_subblock_start_head_idx : 0u;
         num_valid_heads = min(num_valid_heads, MMA_M_PER_V);
         vector_int32_t arange_vec;
         asc_arange(arange_vec, 0);
@@ -850,6 +850,15 @@ template<Config CONFIG>
 __aicore__ void Kernel<CONFIG>::sparse_attn_fwd_kernel_devfunc(const Params params, const AuxParams aux_params) {
     AscendC::InitSocState();
 
+    // An AI core processes head [this_ai_core_start_head_idx, this_ai_core_start_head_idx + H_Q_PER_AI_CORE)
+    // Bisheng doesn't optimize get_block_idx()%1, hence the lazy initialization of the two offsets.
+    uint32_t head_split_idx = 0;
+    uint32_t this_ai_core_start_head_idx = 0;
+    if constexpr (NUM_HEAD_SPLITS > 1) {
+        head_split_idx = (uint32_t)get_block_idx() % NUM_HEAD_SPLITS;
+        this_ai_core_start_head_idx = head_split_idx * H_Q_PER_AI_CORE;
+    }
+
     struct OuterLoopArgs {
         uint32_t job_idx;
         uint32_t batch_or_s_q_idx;  // For prefill, it's s_q_idx; for decoding, it's batch_idx (since params.s_q must be 1)
@@ -876,7 +885,7 @@ __aicore__ void Kernel<CONFIG>::sparse_attn_fwd_kernel_devfunc(const Params para
     };
 
     auto get_first_job = [&]() __aicore__ -> OuterLoopArgs {
-        return _get_outer_loop_args(0u, (uint32_t)get_block_idx(), 0u);
+        return _get_outer_loop_args(0u, (uint32_t)get_block_idx() / NUM_HEAD_SPLITS, 0u);
     };
 
     auto get_next_job = [&](const OuterLoopArgs &cur_job) __aicore__ -> OuterLoopArgs {
@@ -886,7 +895,7 @@ __aicore__ void Kernel<CONFIG>::sparse_attn_fwd_kernel_devfunc(const Params para
         } else {
             total_q = (uint32_t)params.s_q;
         }
-        uint32_t nxt_s_q_idx = cur_job.batch_or_s_q_idx + GRID_SHAPE;
+        uint32_t nxt_s_q_idx = cur_job.batch_or_s_q_idx + Q_TOKENS_PER_JOB_STEP;
         if (nxt_s_q_idx >= total_q) {
             return OuterLoopArgs {
                 cur_job.job_idx + 1,
@@ -916,8 +925,8 @@ __aicore__ void Kernel<CONFIG>::sparse_attn_fwd_kernel_devfunc(const Params para
     if ASC_IS_AIV {
         // VECTOR Core
         uint32_t subblock_idx = (uint32_t)get_subblockid();
-        uint32_t this_subblock_start_head_idx = subblock_idx * MMA_M_PER_V;
-        uint32_t num_this_subblock_valid_heads = H_Q >= this_subblock_start_head_idx ? min(H_Q - this_subblock_start_head_idx, MMA_M_PER_V) : 0;   // AIV0 processes head [0, MMA_M_PER_V) and AIV1 processes head [MMA_M_PER_V, MMA_M)
+        uint32_t this_subblock_start_head_idx = this_ai_core_start_head_idx + subblock_idx * MMA_M_PER_V;
+        uint32_t num_this_subblock_valid_heads = H_Q_PER_AI_CORE >= subblock_idx * MMA_M_PER_V ? min(H_Q_PER_AI_CORE - subblock_idx * MMA_M_PER_V, MMA_M_PER_V) : 0;   // AIV0 processes head [this_ai_core_start_head_idx, this_ai_core_start_head_idx + MMA_M_PER_V) and AIV1 processes the rest of this AI core's head half
         asc_set_gm2ub_loop_size(1ul, 1ul);
         asc_set_ub2gm_loop_size(1ul, 1ul);
         asc_set_ctrl(0ull); // Don't let the scalar core to use dcache to load from UB since 1) it's not faster 2) cache refreshing leads to some overhead or even hazards if not carefully analysed
@@ -1251,7 +1260,7 @@ __aicore__ void Kernel<CONFIG>::sparse_attn_fwd_kernel_devfunc(const Params para
                     }
                     get_buf(PIPE_MTE3, VectorCoreBufIDs::O_ACCUM + i, false);
                     asc_copy_ub2gm_align(
-                        params.out + (uint64_t)args.batch_or_s_q_idx * stride_o_batch_or_s_q + subblock_idx * (MMA_M_PER_V*D_VO) + i*OUTPUT_FRAG_D_VO,
+                        params.out + (uint64_t)this_subblock_start_head_idx * D_VO + (uint64_t)args.batch_or_s_q_idx * stride_o_batch_or_s_q + i*OUTPUT_FRAG_D_VO,
                         (__ubuf__ bf16*)ub_buf.output_accum + i*(OUTPUT_FRAG_D_VO*2),
                         num_this_subblock_valid_heads,
                         OUTPUT_FRAG_D_VO * sizeof(bf16),
@@ -1374,8 +1383,9 @@ __aicore__ void Kernel<CONFIG>::sparse_attn_fwd_kernel_devfunc(const Params para
             } else {
                 q_base = params.q + (uint64_t)args.batch_or_s_q_idx * params.stride_q_s_q;
             }
-            uint32_t num_valid_q_heads_part0 = min(H_Q, MMA_M_PER_V);
-            uint32_t num_valid_q_heads_part1 = max((int)H_Q-(int)MMA_M_PER_V, 0);
+            q_base += (uint64_t)this_ai_core_start_head_idx * params.stride_q_h_q;
+            uint32_t num_valid_q_heads_part0 = min(H_Q_PER_AI_CORE, MMA_M_PER_V);
+            uint32_t num_valid_q_heads_part1 = max((int)H_Q_PER_AI_CORE-(int)MMA_M_PER_V, 0);
             // Q is read once per token and reused little, so keep it out of L2 instead of letting it
             // compete with the KV cache.
             asc_copy_gm2l1_nd2nz(
@@ -1689,7 +1699,7 @@ void Kernel<CONFIG>::run(const Params& params) {
     } else {
         total_q = (uint32_t)params.s_q;
     }
-    uint32_t num_ctas = min(total_q, GRID_SHAPE);
+    uint32_t num_ctas = min(total_q * NUM_HEAD_SPLITS, GRID_SHAPE);
     sparse_attn_fwd_kernel<Kernel<CONFIG>><<<num_ctas, 0, params.stream>>>(params, aux_params);
     KU_ACLRT_CHECK_NPU(aclrtGetLastError(aclrtLastErrLevel::ACL_RT_THREAD_LEVEL));
 }

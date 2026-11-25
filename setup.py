@@ -71,14 +71,12 @@ CUDA_KERNEL_SOURCES = [
 ]
 
 # The Ascend instantiations are explicit template instantiations of `run_sparse_fwd_kernel`.
-# Kept for: h64 x {prefill, decode} x {V4.1 fp8, V4.1 fp4 (decode only)} x {sink, nosink}
+# Kept for: h{64,128} x {prefill, decode} x {V4.1 fp8, V4.1 fp4 (decode only)} x {sink, nosink}
 ASCEND_KERNEL_SOURCES = [
-    "csrc/ascend_kernels/prefill/sparse/instantiations/v41_h64_prefill_nosink.asc",
-    "csrc/ascend_kernels/prefill/sparse/instantiations/v41_h64_prefill_sink.asc",
-    "csrc/ascend_kernels/prefill/sparse/instantiations/v41_h64_decode_nosink.asc",
-    "csrc/ascend_kernels/prefill/sparse/instantiations/v41_h64_decode_sink.asc",
-    "csrc/ascend_kernels/prefill/sparse/instantiations/v41fp4_h64_decode_nosink.asc",
-    "csrc/ascend_kernels/prefill/sparse/instantiations/v41fp4_h64_decode_sink.asc",
+    *[f"csrc/ascend_kernels/prefill/sparse/instantiations/{format_name}_h{h_q}_{mode_name}_{sink_name}.asc"
+      for h_q in (64, 128)
+      for format_name, mode_name in (("v41", "prefill"), ("v41", "decode"), ("v41fp4", "decode"))
+      for sink_name in ("nosink", "sink")],
 ]
 
 def get_cuda_arch_flags():
