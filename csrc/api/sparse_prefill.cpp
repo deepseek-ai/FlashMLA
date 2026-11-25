@@ -17,7 +17,6 @@ class SparseFwdImplBase : public ImplBase<
 #ifdef FLASH_MLA_IS_BUILD_ON_CUDA
 
 #include "cuda_kernels/sm100/prefill/sparse/fwd/head64/phase1.h"
-#include "cuda_kernels/sm100/prefill/sparse/fwd/head128/phase1.h"
 #include "cuda_kernels/sm100/prefill/sparse/fwd_for_small_topk/head128/phase1.h"
 
 class SparseFwd_Sm100_Head64_Impl : public SparseFwdImplBase {
@@ -30,19 +29,6 @@ class SparseFwd_Sm100_Head64_Impl : public SparseFwdImplBase {
 protected:
     void run_(const SparseAttnFwdParams &params, const std::vector<FeatureT> &required_features) override {
         sm100::prefill::sparse_fwd::head64::run_sparse_fwd_phase1_kernel(params);
-    }
-};
-
-class SparseFwd_Sm100_Head128_Impl : public SparseFwdImplBase {
-    DECLARE_SUPPORTED_FEATURES(
-        SparseFwdFeatures::HEAD_128,
-        SparseFwdFeatures::ATTN_SINK,
-        SparseFwdFeatures::TOPK_LENGTH
-    )
-
-protected:
-    void run_(const SparseAttnFwdParams &params, const std::vector<FeatureT> &required_features) override {
-        sm100::prefill::sparse_fwd::head128::run_sparse_fwd_phase1_kernel(params);
     }
 };
 
@@ -198,20 +184,8 @@ static std::vector<Tensor> sparse_prefill_fwd(
         SparseFwd_Sm100_Head64_Impl fwd_impl;
         fwd_impl.run(params, required_features);
     } else {
-        SparseFwd_Sm100_Head128_Small_TopK_Impl small_topk_impl;
-        SparseFwd_Sm100_Head128_Impl regular_impl;
-        bool use_small_topk_impl = false;
-        if (
-            (topk <= 1280 && small_topk_impl.check_if_all_features_are_supported(required_features)) ||
-            !regular_impl.check_if_all_features_are_supported(required_features)
-        ) {
-            use_small_topk_impl = true;
-        }
-        if (use_small_topk_impl) {
-            small_topk_impl.run(params, required_features);
-        } else {
-            regular_impl.run(params, required_features);
-        }
+        SparseFwd_Sm100_Head128_Small_TopK_Impl fwd_impl;
+        fwd_impl.run(params, required_features);
     }
 #endif  // FLASH_MLA_IS_BUILD_ON_CUDA
 

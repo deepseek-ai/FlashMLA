@@ -46,11 +46,8 @@ CUDA_KERNEL_SOURCES = [
     "csrc/cuda_kernels/smxx/decode/get_decoding_sched_meta/get_decoding_sched_meta.cu",
     "csrc/cuda_kernels/smxx/decode/combine/combine.cu",
 
-    # sm100 sparse prefill
+    # sm100 sparse prefill (head64), and the head128 prefill/decoding kernel
     "csrc/cuda_kernels/sm100/prefill/sparse/fwd/head64/instantiations/phase1_h64_k512.cu",
-    "csrc/cuda_kernels/sm100/prefill/sparse/fwd/head128/instantiations/phase1_k512.cu",
-
-    # sm100 sparse prefill for small topk, and head128 decoding
     "csrc/cuda_kernels/sm100/prefill/sparse/fwd_for_small_topk/head128/instantiations/phase1_k512.cu",
     "csrc/cuda_kernels/sm100/prefill/sparse/fwd_for_small_topk/head128/instantiations/phase1_decode_k512_v41.cu",
     "csrc/cuda_kernels/sm100/prefill/sparse/fwd_for_small_topk/head128/instantiations/phase1_decode_k512_v41_splitkv.cu",

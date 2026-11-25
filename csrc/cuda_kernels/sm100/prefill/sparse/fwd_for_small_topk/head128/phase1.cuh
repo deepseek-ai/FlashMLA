@@ -1,10 +1,9 @@
 /*
-Sparse Attention Forward Pass (Small TopK) — SM100, h_q=128
+Sparse Attention Forward Pass — SM100, h_q=128
 
-Specialized forward kernel optimized for small topk values (topk <= 1280), with 128
-query heads. Uses a different tiling strategy than the standard forward kernel.
-Supports prefill and decode (including split-KV). Decode reads interleaved FP8/FP4
-token rows and dequantizes each CTA's half.
+Forward kernel for 128 query heads, using a different tiling strategy than the head64
+kernel. It is the only head128 prefill kernel, and also serves head128 decode (including
+split-KV). Decode reads interleaved FP8/FP4 token rows and dequantizes each CTA's half.
 
 Template parameters:
   FWD_MODE — Forward mode (Prefill / Decode / DecodeWithSplitKV)
