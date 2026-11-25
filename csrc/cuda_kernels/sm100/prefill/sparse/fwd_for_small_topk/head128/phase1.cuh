@@ -634,7 +634,11 @@ KernelTemplate<FWD_MODE, MODEL_TYPE, EXTRA_MODEL_TYPE>::sparse_attn_fwd_kernel_d
                         if constexpr (!IS_EXTRA_BLOCK) {
                             return __ldg((int2*)(indices + block_idx*B_TOPK + lane_idx*2));
                         } else {
-                            return __ldg((int2*)(extra_indices + (block_idx-args.num_orig_kv_blocks)*B_TOPK + lane_idx*2));
+                            // `extra_topk` need not be a multiple of B_TOPK, so the last extra block can run past the
+                            // end of `extra_indices`; treat those slots as invalid tokens (cur_idx == -1 below).
+                            int extra_abs_pos = (block_idx-args.num_orig_kv_blocks)*B_TOPK + lane_idx*2;
+                            if (extra_abs_pos >= params.extra_topk) return make_int2(-1, -1);
+                            return __ldg((int2*)(extra_indices + extra_abs_pos));
                         }
                     };
                     auto process_one_block = [&](int block_idx, int2 my_indices, auto is_extra_block_t) {
@@ -783,8 +787,8 @@ KernelTemplate<FWD_MODE, MODEL_TYPE, EXTRA_MODEL_TYPE>::sparse_attn_fwd_kernel_d
                 retrieve_mask_and_reduce_p<
                     128/2,
                     NUM_ELEMS_PER_THREAD,
-                    barrier_ids::WG2_WARP02_SYNC,
-                    barrier_ids::WG2_WARP13_SYNC
+                    barrier_ids::WG4_WARP02_SYNC,
+                    barrier_ids::WG4_WARP13_SYNC
                 >(
                     tmem_cols::P,
                     smem.is_k_valid[indices_buf_idx],
@@ -800,7 +804,7 @@ KernelTemplate<FWD_MODE, MODEL_TYPE, EXTRA_MODEL_TYPE>::sparse_attn_fwd_kernel_d
                 cur_pi_max *= params.sm_scale_div_log2;
 
                 smem.rowwise_max_buf[idx_in_warpgroup] = cur_pi_max;
-                NamedBarrier::arrive_and_wait(64, barrier_ids::WG2_WARP02_SYNC + (local_warp_idx&1));
+                NamedBarrier::arrive_and_wait(64, barrier_ids::WG4_WARP02_SYNC + (local_warp_idx&1));
                 cur_pi_max = max(cur_pi_max, smem.rowwise_max_buf[idx_in_warpgroup^64]);
                 real_mi = max(real_mi, cur_pi_max);
                 bool should_scale_o = __any_sync(0xffffffff, cur_pi_max - mi > 6.0f);
@@ -853,7 +857,7 @@ KernelTemplate<FWD_MODE, MODEL_TYPE, EXTRA_MODEL_TYPE>::sparse_attn_fwd_kernel_d
             // Reduce li
             smem.bar_li_empty.wait(args.outer_loop_phase^1);
             smem.rowwise_li_buf[idx_in_warpgroup^64] = li;
-            NamedBarrier::arrive_and_wait(128, barrier_ids::WG2_SYNC);
+            NamedBarrier::arrive_and_wait(128, barrier_ids::WG4_SYNC);
             li += smem.rowwise_li_buf[idx_in_warpgroup];
 
             if (idx_in_warpgroup < H_Q/2) {

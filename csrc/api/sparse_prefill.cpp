@@ -119,6 +119,8 @@ static std::vector<Tensor> sparse_prefill_fwd(
 
     STD_TORCH_CHECK(d_qk == 512, "Invalid d_qk: ", d_qk);
     STD_TORCH_CHECK(d_v == 512, "Invalid d_v", d_v);
+    // The kernels walk the topk axis in B_TOPK-sized blocks and skip the bound check on `indices`
+    STD_TORCH_CHECK(topk % 64 == 0, "topk must be a multiple of 64, got ", topk);
 
     KU_CHECK_DEVICE(q);
     KU_CHECK_DEVICE(kv);

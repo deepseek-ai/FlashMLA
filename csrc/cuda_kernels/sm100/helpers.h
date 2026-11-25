@@ -229,4 +229,20 @@ ku::nvbf16x2 e4m3x2_to_bf16x2(uint16_t packed) {
     return fp8x2_to_bf16x2(*(ku::nve4m3x2*)&packed);
 }
 
+// Convert a packed bf16x2 (low 16 bits = element 0, high 16 bits = element 1) to float2.
+// A bf16 is the upper half of a float32, so each element needs only one shift or one bitwise and;
+// CUDA's __bfloat1622float2 instead spends one PRMT and two SHF.L.U32 on the same conversion.
+CUTE_DEVICE
+float2 bf16x2_to_float2(uint32_t packed) {
+    float2 f;
+    f.x = __uint_as_float(packed << 16);
+    f.y = __uint_as_float(packed & 0xffff0000u);
+    return f;
+}
+
+CUTE_DEVICE
+float2 bf16x2_to_float2(const ku::nvbf16x2 &packed) {
+    return bf16x2_to_float2(*(const uint32_t*)&packed);
+}
+
 }

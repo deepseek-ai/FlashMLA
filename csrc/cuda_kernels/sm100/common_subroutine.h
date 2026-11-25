@@ -112,10 +112,24 @@ void retrieve_mask_and_reduce_p(
         *(uint16_t*)(is_k_valid_masks + 2) = *(uint16_t*)(k_validness_base + k_validness_offset + 2);
         *(uint16_t*)(is_k_valid_masks + 4) = *(uint16_t*)(k_validness_base + k_validness_offset + 4);
     }
-    CUTE_UNROLL
-    for (int i = 0; i < NUM_ELEMS_PER_THREAD; i += 1) {
-        if (!(is_k_valid_masks[i/8] >> (i%8) & 1))
-            p[i] = -CUDART_INF_F;
+    // If every one of this thread's tokens is valid the loop below writes nothing, so skip it
+    bool is_all_valid;
+    if constexpr (NUM_ELEMS_PER_THREAD == 32) {
+        uint32_t mask_word;
+        __builtin_memcpy(&mask_word, is_k_valid_masks, sizeof(mask_word));
+        is_all_valid = (mask_word == 0xFFFFFFFFu);
+    } else {
+        static_assert(NUM_ELEMS_PER_THREAD == 48);
+        uint64_t mask_word = 0;
+        __builtin_memcpy(&mask_word, is_k_valid_masks, 6);
+        is_all_valid = (mask_word & 0xFFFFFFFFFFFFull) == 0xFFFFFFFFFFFFull;
+    }
+    if (!is_all_valid) {
+        CUTE_UNROLL
+        for (int i = 0; i < NUM_ELEMS_PER_THREAD; i += 1) {
+            if (!(is_k_valid_masks[i/8] >> (i%8) & 1))
+                p[i] = -CUDART_INF_F;
+        }
     }
 
     // Reduce P within the cluster
