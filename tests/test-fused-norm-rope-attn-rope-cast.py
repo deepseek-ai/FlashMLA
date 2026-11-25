@@ -14,53 +14,68 @@ import lib
 import quant
 import ref
 
-import flash_mla
+import flash_mla.fused_norm_rope_attn_rope_cast as fused_api
 
-# FMA with double precision is necessary for numerical consistency of fused ref
+# Explicit FMA is necessary for numerical consistency of fused ref
 _GET_FMA_KERNEL = None
 def _fma(a: torch.Tensor, b: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
-    global _GET_FMA_KERNEL
     assert a.numel() == b.numel() == c.numel()
+    if kk.is_on_cuda_platform():
+        return torch.addcmul(c, a, b, value=1.0)    # CUDA's `addcmul` with `value=1.0` follows IEEE's rounding rule, but Ascend's does not
+    global _GET_FMA_KERNEL
     if _GET_FMA_KERNEL is None:
         import tilelang
-        from tilelang import language as T
-        @tilelang.jit(
-            pass_configs={
-                tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
-                tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True,
-            },
-        )
+        from tilelang.ascend import language as T
+        @tilelang.jit(target="ascend")
         def _get_fma_kernel():
-            num_threads = 256
-            numel_per_cta = 1024
-            numel = T.symbolic("numel")
+            num_vec_cores = tile_kernels.get_num_vec_cores()   # Two vector cores per AI core
+            numel_per_core = 4096
+            # Four tiles (a, b, c, out) of numel_per_core fp32 per stage; at most 3 stages, i.e. 192KB of the 216KB UB
+            num_stages = min(3, tile_kernels.get_max_ub_per_vector_core(use_simt=True) // (4 * 4 * numel_per_core))
+            numel = T.dynamic("numel", T.int64)
+
             @T.prim_func
             def fma_kernel(
-                out: T.Tensor[(numel,), torch.float32],
-                a: T.Tensor[(numel,), torch.float32],
-                b: T.Tensor[(numel,), torch.float32],
-                c: T.Tensor[(numel,), torch.float32]
+                out: T.Tensor[(numel,), T.float32],
+                a: T.Tensor[(numel,), T.float32],
+                b: T.Tensor[(numel,), T.float32],
+                c: T.Tensor[(numel,), T.float32]
             ):
-                # numel is a multiple of numel_per_cta only for some head counts (the RoPE part has s_q * h_q * 32 elements);
-                # T.copy predicates the last CTA's loads and stores against numel
-                with T.Kernel(T.ceildiv(numel, numel_per_cta), threads=num_threads) as (tid_x, ):
-                    a_fragment = T.alloc_fragment((numel_per_cta, ), torch.float32)
-                    b_fragment = T.alloc_fragment((numel_per_cta, ), torch.float32)
-                    c_fragment = T.alloc_fragment((numel_per_cta, ), torch.float32)
-                    out_fragment = T.alloc_fragment((numel_per_cta, ), torch.float32)
+                with T.Kernel(num_vec_cores) as core_id:
+                    a_ub = T.alloc_shared((numel_per_core, ), T.float32)
+                    b_ub = T.alloc_shared((numel_per_core, ), T.float32)
+                    c_ub = T.alloc_shared((numel_per_core, ), T.float32)
+                    out_ub = T.alloc_shared((numel_per_core, ), T.float32)
+                    T.annotate_buffer_versions({a_ub: num_stages, b_ub: num_stages, c_ub: num_stages, out_ub: num_stages})
 
-                    T.copy(a[tid_x * numel_per_cta], a_fragment)
-                    T.copy(b[tid_x * numel_per_cta], b_fragment)
-                    T.copy(c[tid_x * numel_per_cta], c_fragment)
-                    for i in T.Parallel(numel_per_cta):
-                        out_fragment[i] = a_fragment[i] * b_fragment[i] + c_fragment[i]
-                    T.copy(out_fragment, out[tid_x * numel_per_cta])
+                    # numel is a multiple of numel_per_core only for some head counts (the RoPE part has
+                    # s_q * h_q * 32 elements); the dynamic `valid` predicates the last tile's loads and stores
+                    for pid in T.Persistent(
+                        [T.ceildiv(numel, numel_per_core)], num_vec_cores, core_id, group_size=1, num_stages=num_stages
+                    ):
+                        base = T.int64(pid) * numel_per_core
+                        valid = T.min(numel_per_core, numel - base)
+                        T.copy(a[base : base + valid], a_ub[:valid])
+                        T.copy(b[base : base + valid], b_ub[:valid])
+                        T.copy(c[base : base + valid], c_ub[:valid])
+                        with T.SimtVF(threads=128):
+                            a_fragment = T.alloc_fragment((numel_per_core, ), T.float32)
+                            b_fragment = T.alloc_fragment((numel_per_core, ), T.float32)
+                            c_fragment = T.alloc_fragment((numel_per_core, ), T.float32)
+                            out_fragment = T.alloc_fragment((numel_per_core, ), T.float32)
+
+                            T.copy(a_ub, a_fragment)
+                            T.copy(b_ub, b_fragment)
+                            T.copy(c_ub, c_fragment)
+                            for i in T.Parallel(numel_per_core):
+                                out_fragment[i] = a_fragment[i] * b_fragment[i] + c_fragment[i]
+                            T.copy(out_fragment, out_ub)
+                        T.copy(out_ub[:valid], out[base : base + valid])
             return fma_kernel
         _GET_FMA_KERNEL = _get_fma_kernel
     out = torch.empty_like(a).flatten()
     _GET_FMA_KERNEL()(out, a.flatten(), b.flatten(), c.flatten())
     return out.view_as(a)
-
 
 def _rope_inplace(q_or_o: torch.Tensor, conjugate: bool, cos_sin_table: torch.Tensor, token_positions: torch.Tensor, rope_dim: int = 64):
     # cos_sin_table: [*, rope_dim]; token_positions: [s_q] (prefill) or [b, s_q] (decode)
@@ -75,14 +90,19 @@ def _rope_inplace(q_or_o: torch.Tensor, conjugate: bool, cos_sin_table: torch.Te
     rope_part = q_or_o[..., -rope_dim:]
     rope_part_x0 = rope_part[..., 0::2]
     rope_part_x1 = rope_part[..., 1::2]
-    new_rope_part_x0 = _fma(rope_part_x0, cos.expand_as(rope_part_x0), -rope_part_x1 * sin)
-    new_rope_part_x1 = _fma(rope_part_x0, sin.expand_as(rope_part_x0), rope_part_x1 * cos)
+    # Try the best effort to simulate kernel's behaviour
+    if kk.is_on_cuda_platform():
+        new_rope_part_x0 = _fma(rope_part_x0, cos.expand_as(rope_part_x0), -rope_part_x1 * sin)
+        new_rope_part_x1 = _fma(rope_part_x0, sin.expand_as(rope_part_x0), rope_part_x1 * cos)
+    else:
+        new_rope_part_x0 = _fma(rope_part_x0, cos.expand_as(rope_part_x0), -rope_part_x1 * sin)
+        new_rope_part_x1 = _fma(rope_part_x1, cos.expand_as(rope_part_x1), rope_part_x0 * sin)
     rope_part[..., 0::2] = new_rope_part_x0
     rope_part[..., 1::2] = new_rope_part_x1
 
-def ref_fused_norm_rope_attn_rope_cast_fwd(p: TestParam, t: Testcase, enable_q_norm: bool, cos_sin_table: torch.Tensor, token_positions: torch.Tensor):
+def ref_fused_norm_rope_attn_rope_cast_fwd(p: TestParam, t: Testcase, cos_sin_table: torch.Tensor, token_positions: torch.Tensor):
     # Q norm
-    if enable_q_norm:
+    if p.enable_q_norm:
         q_float32 = t.q.float()
         rms_norm_scale_factor = torch.rsqrt(torch.sum(q_float32*q_float32, dim=-1) / p.d_qk + rms_norm_eps)
     else:
@@ -96,7 +116,10 @@ def ref_fused_norm_rope_attn_rope_cast_fwd(p: TestParam, t: Testcase, enable_q_n
     # Core attention
     old_q = t.q
     t.q = q
+    previous_precision = torch.get_float32_matmul_precision()
+    torch.set_float32_matmul_precision('highest')
     _, out, max_logits, lse = ref.ref_sparse_attn_fwd(p, t, rms_norm_scale_factor)
+    torch.set_float32_matmul_precision(previous_precision)
     t.q = old_q
 
     # O RoPE
@@ -107,7 +130,6 @@ def ref_fused_norm_rope_attn_rope_cast_fwd(p: TestParam, t: Testcase, enable_q_n
 def ref_fused_norm_rope_attn_rope_cast_decode(
     p: TestParam,
     t: TestcaseForDecode,
-    enable_q_norm: bool,
     cos_sin_table: torch.Tensor,
     token_positions: torch.Tensor   # [b*s_q]
 ):
@@ -118,7 +140,7 @@ def ref_fused_norm_rope_attn_rope_cast_decode(
     b, s_q, h_q, d_qk = t.q.shape
 
     # Q norm
-    if enable_q_norm:
+    if p.enable_q_norm:
         q_float32 = t.q.float()
         rms_norm_scale_factor = torch.rsqrt(torch.sum(q_float32*q_float32, dim=-1) / p.d_qk + rms_norm_eps)
     else:
@@ -157,23 +179,28 @@ def build_cos_sin_cache(max_token_position: int, device: torch.device):
     sin = freqs_cis.imag.to(device) * mscale
     return torch.cat((cos, sin), dim=-1)
 
-default_device = torch.device("cuda:0") if kk.get_current_platform() == kk.Platform.CUDA else torch.device("npu:0")
+default_device = torch.device("cuda:0") if kk.is_on_cuda_platform() else torch.device("npu:0")
+scale_pack_size, scale_pack_dtype = (4, torch.int32) if kk.is_on_cuda_platform() else (2, torch.int16)  # Must align with DeepGEMM's SF pack granularity
+profile_target_kernel_name = "fused_norm_rope_attn_rope_cast_fwd" if kk.is_on_cuda_platform() else "sparse_attn_fwd_kernel"
+# The fused kernel fuses `wv_group_size` (the number of heads that share one weight group) into its compile-time
+# configuration and currently only instantiates WV_GROUP_SIZE = 8 (see the `KU_ASSERT` in the CUDA core attention
+# kernel). Supporting other values is pending.
+WV_GROUP_SIZE = 8
 max_token_position = 131072
 cos_sin_cache = build_cos_sin_cache(max_token_position, default_device)
 rms_norm_eps = 1e-4
 
 @functools.lru_cache(maxsize=None)  # To avoid generating q weight and permuted q weight for multiple times, we cache previously generated q_weight and use them later
 def get_q_b_weight(h_q: int, d_q: int, q_lora_rank: int, scale_gran: int):
-    kk.utils.set_random_seed(0)
     q_weight = torch.randn((h_q*d_q, q_lora_rank), dtype=torch.bfloat16) / 10
     q_weight_quanted = tile_kernels.quant.per_token_cast(q_weight, 'e4m3', scale_gran, use_tma_aligned_col_major_sf=True, round_sf=True, use_packed_ue8m0=True)
-    q_weight_quanted_permuted = flash_mla.fused_norm_rope_attn_rope_cast.permute_q_b_proj(q_weight_quanted, h_q, d_q)
+    q_weight_quanted_permuted = fused_api.permute_q_b_proj(q_weight_quanted, h_q, d_q)
     return q_weight_quanted, q_weight_quanted_permuted
 
 @functools.lru_cache(maxsize=None)
 def get_wb_weight(n_wv_group: int, wv_group_size: int, d_o: int, scale_gran: int, wv_proj_out_dim: int):
-    kk.utils.set_random_seed(0)
-    o_weight = torch.randn((n_wv_group*wv_proj_out_dim, wv_group_size * d_o), dtype=torch.bfloat16) / 10
+    o_weight_shape = (n_wv_group*wv_proj_out_dim, wv_group_size * d_o)
+    o_weight = torch.randn(o_weight_shape, dtype=torch.bfloat16) / 10
     o_weight_quanted = tile_kernels.quant.per_token_cast(o_weight, 'e4m3', scale_gran, use_tma_aligned_col_major_sf=False, round_sf=True, use_packed_ue8m0=False)
     o_weight_quanted_sf = deep_gemm.transform_sf_into_required_layout(
         o_weight_quanted[1].view(n_wv_group, wv_proj_out_dim, wv_group_size * d_o // scale_gran),
@@ -184,7 +211,7 @@ def get_wb_weight(n_wv_group: int, wv_group_size: int, d_o: int, scale_gran: int
         is_sfa=False,
     )
     o_weight_quanted = (o_weight_quanted[0].view(n_wv_group, wv_proj_out_dim, wv_group_size * d_o), o_weight_quanted_sf)
-    o_weight_quanted_permuted = flash_mla.fused_norm_rope_attn_rope_cast.permute_wv_proj(o_weight_quanted, wv_group_size, d_o)
+    o_weight_quanted_permuted = fused_api.permute_wv_proj(o_weight_quanted, wv_group_size, d_o)
     return o_weight_quanted, o_weight_quanted_permuted
 
 _counter = kk.Counter()
@@ -202,27 +229,38 @@ def run_test(p: TestParam) -> bool:
     lib.device_synchronize()
 
     q_lora_rank = random.choice([1024, 1536])
-    q_b_proj_scale_gran = random.choice([32, 128])
-    q_lora = torch.randn((p.s_q, q_lora_rank)) / 10
+    q_b_proj_scale_gran = 32
+    o_scale_gran = 32
+    wv_group_size = WV_GROUP_SIZE
+    n_wv_group = p.h_q // wv_group_size
+    wv_proj_out_dim = random.choice([256, 512, 1024])
+    wv_proj_scale_gran = 32
+    token_positions = torch.randint(0, max_token_position, (p.s_q, ), dtype=torch.int32)
+
+    def run_fused(q_for_fused: torch.Tensor):
+        return fused_api.prefill(
+            p.enable_q_norm,
+            rms_norm_eps,
+            token_positions,
+            False, 64, cos_sin_cache,
+            n_wv_group, o_scale_gran, True, True, True,
+            q_for_fused, t.kv, t.indices,
+            sm_scale=t.sm_scale,
+            attn_sink=t.attn_sink,
+            topk_length=t.topk_length,
+        )
+
+    q_lora = torch.randn((p.s_q, q_lora_rank)) * 0.1
     q_lora = tile_kernels.quant.per_token_cast(q_lora, 'e4m3', q_b_proj_scale_gran, None, use_tma_aligned_col_major_sf=True, round_sf=True, use_packed_ue8m0=True)
     q_b_proj, q_b_proj_permuted = get_q_b_weight(p.h_q, p.d_qk, q_lora_rank, q_b_proj_scale_gran)
     # TODO Make q weight non-contiguous
 
-    o_scale_gran = 32
-    enable_q_norm = random.choice([False, True])
-    token_positions = torch.randint(0, max_token_position, (p.s_q, ), dtype=torch.int32)
-
-    wv_group_size = 8
-    n_wv_group = p.h_q // 8
-    wv_proj_out_dim = random.choice([256, 512, 1024])
-    wv_proj_scale_gran = 32
     wv_proj, wv_proj_permuted = get_wb_weight(n_wv_group, wv_group_size, p.d_v, wv_proj_scale_gran, wv_proj_out_dim)
-    
+
     def calculate_q_b_proj(weight) -> torch.Tensor:
         q = torch.empty((p.s_q, p.h_q*p.d_qk), dtype=torch.bfloat16)
         deep_gemm.fp8_gemm_nt(q_lora, weight, q, recipe_a=(1, q_b_proj_scale_gran), recipe_b=(1, q_b_proj_scale_gran))
         return q.view(p.s_q, p.h_q, p.d_qk)
-    q_for_fused = calculate_q_b_proj(q_b_proj_permuted)
 
     def calculate_wv_proj(output, weight) -> torch.Tensor:
         wv_proj_out = torch.empty((p.s_q, n_wv_group, wv_proj_out_dim), dtype=torch.bfloat16)
@@ -234,19 +272,11 @@ def run_test(p: TestParam) -> bool:
             recipe=(1, 1, 32),
         )
         return wv_proj_out
-    
+
+    q_for_fused = calculate_q_b_proj(q_b_proj_permuted)
+
     def run_fused_norm_rope_attn_rope_cast_fwd():
-        return flash_mla.fused_norm_rope_attn_rope_cast.prefill(
-            enable_q_norm,
-            rms_norm_eps,
-            token_positions,
-            False, 64, cos_sin_cache,
-            n_wv_group, o_scale_gran, True, True, True,
-            q_for_fused, t.kv, t.indices,
-            sm_scale=t.sm_scale,
-            attn_sink=t.attn_sink,
-            topk_length=t.topk_length
-        )
+        return run_fused(q_for_fused)
     
     lib.device_synchronize()
     ans_out_fp8, ans_out_sf, ans_max_logits, ans_lse = run_fused_norm_rope_attn_rope_cast_fwd()
@@ -255,7 +285,7 @@ def run_test(p: TestParam) -> bool:
 
     if p.num_runs > 0:
         flops_and_mem_vol = lib.count_flop_and_mem_vol(p, t)
-        fused_time = kk.bench(run_fused_norm_rope_attn_rope_cast_fwd, num_tests=p.num_runs).get_kernel_time("fused_norm_rope_attn_rope_cast_fwd")
+        fused_time = kk.bench(run_fused_norm_rope_attn_rope_cast_fwd, num_tests=p.num_runs).get_kernel_time(profile_target_kernel_name)
         fused_flops = flops_and_mem_vol.fwd_flop/fused_time/1e12
         fused_mem_bw = flops_and_mem_vol.fwd_prefill_with_fp8_out_mem_vol/fused_time/1e12
         print(f"Fused:    {fused_time*1e6:4.0f} us, {fused_flops:6.1f} TFlops, {fused_mem_bw:4.2f} TBps")
@@ -266,7 +296,7 @@ def run_test(p: TestParam) -> bool:
         max_logits_criteria = {'abs_tol': 1e-5, 'rel_tol': 4.01/65536} if p.k_amplifier_portion == 0.0 else {'abs_tol': 1.0, 'rel_tol': 1.0}
         lse_criteria = {'abs_tol': 1e-5, 'rel_tol': 4.01/65536} if p.k_amplifier_portion == 0 else {'abs_tol': 1e-4, 'rel_tol': 8.01/65536}
         t.q = calculate_q_b_proj(q_b_proj)
-        ref_out, ref_max_logits, ref_lse = ref_fused_norm_rope_attn_rope_cast_fwd(p, t, enable_q_norm, cos_sin_cache, token_positions)
+        ref_out, ref_max_logits, ref_lse = ref_fused_norm_rope_attn_rope_cast_fwd(p, t, cos_sin_cache, token_positions)
         ref_lse[ref_lse == float("-inf")] = float("+inf")
 
         ans_out_sf_2d = ans_out_sf.view(p.s_q, -1)
@@ -276,22 +306,26 @@ def run_test(p: TestParam) -> bool:
             # so we restore the token-dim stride to 1 manually here
             assert p.s_q == 1
             ans_out_sf_2d = ans_out_sf_2d.as_strided(ans_out_sf_2d.shape, (1, ans_out_sf_2d.stride(1)))
-        ans_wv_out_dequantized = tile_kernels.quant.per_token_cast_back((ans_out_fp8.view(p.s_q, -1), ans_out_sf_2d), 'fp32', 32)
-        ans_wv_out_dequantized = ans_wv_out_dequantized \
-            .view(p.s_q, n_wv_group, p.d_v // o_scale_gran, wv_group_size, o_scale_gran) \
-            .transpose(2, 3) \
-            .reshape(p.s_q, p.h_q, p.d_v)
+        ans_out_dequantized = tile_kernels.quant.per_token_cast_back((ans_out_fp8.view(p.s_q, -1), ans_out_sf_2d), 'fp32', 32)
+        if kk.is_on_cuda_platform():
+            ans_out_dequantized = ans_out_dequantized \
+                .view(p.s_q, n_wv_group, p.d_v // o_scale_gran, wv_group_size, o_scale_gran) \
+                .transpose(2, 3) \
+                .reshape(p.s_q, p.h_q, p.d_v)
+        else:
+            # The Ascend epilogue stores each token's O in natural order, i.e. [head_in_group][d_v]
+            ans_out_dequantized = ans_out_dequantized.reshape(p.s_q, p.h_q, p.d_v)
 
         assert o_scale_gran == 32
         ref_out_fp8, ref_out_sf = tile_kernels.quant.per_token_cast(ref_out.view(p.s_q, -1), 'e4m3', 32, round_sf=True, use_tma_aligned_col_major_sf=True, use_packed_ue8m0=True)
         ref_wv_proj_out = calculate_wv_proj(
-            (ref_out_fp8.view(p.s_q, n_wv_group, wv_group_size * p.d_v), ref_out_sf.view(p.s_q, n_wv_group, wv_group_size * p.d_v // (32*4))),
+            (ref_out_fp8.view(p.s_q, n_wv_group, wv_group_size * p.d_v), ref_out_sf.view(p.s_q, n_wv_group, wv_group_size * p.d_v // (32*scale_pack_size))),
             wv_proj
         )
         
         is_correct = True
-        is_correct &= kk.check_is_allclose("out", ans_wv_out_dequantized, ref_out, **out_criteria)
-        is_correct &= kk.check_is_allclose("wv_proj_out", ans_wv_proj_out, ref_wv_proj_out, **wv_proj_out_criteria)
+        is_correct &= kk.check_is_allclose("out", ans_out_dequantized, ref_out, dtype_for_cos_diff_calc=torch.float32, **out_criteria)
+        is_correct &= kk.check_is_allclose("wv_proj_out", ans_wv_proj_out, ref_wv_proj_out, dtype_for_cos_diff_calc=torch.float32, **wv_proj_out_criteria)
         is_correct &= kk.check_is_allclose("max_logits", ans_max_logits, ref_max_logits, **max_logits_criteria)
         is_correct &= kk.check_is_allclose("lse", ans_lse, ref_lse, **lse_criteria)
 
@@ -315,28 +349,17 @@ def run_decode_test(p: TestParam) -> bool:
     s_q = p.s_q
 
     q_lora_rank = random.choice([1024, 1536])
-    q_b_proj_scale_gran = random.choice([32, 128])
-    q_lora = torch.randn((b*s_q, q_lora_rank)) / 10
-    q_lora = tile_kernels.quant.per_token_cast(q_lora, 'e4m3', q_b_proj_scale_gran, None, use_tma_aligned_col_major_sf=True, round_sf=True, use_packed_ue8m0=True)
-    q_b_proj, q_b_proj_permuted = get_q_b_weight(p.h_q, p.d_qk, q_lora_rank, q_b_proj_scale_gran)
-
+    q_b_proj_scale_gran = 32
     o_scale_gran = 32
-    enable_q_norm = random.choice([False, True])
-    wv_group_size = 8
-    n_wv_group = p.h_q // 8
-
-    def calculate_q_b_proj(weight) -> torch.Tensor:
-        q = torch.empty((b*s_q, p.h_q*p.d_qk), dtype=torch.bfloat16)
-        deep_gemm.fp8_gemm_nt(q_lora, weight, q, recipe_a=(1, q_b_proj_scale_gran), recipe_b=(1, q_b_proj_scale_gran))
-        return q.view(b*s_q, p.h_q, p.d_qk)
-    q_for_fused = calculate_q_b_proj(q_b_proj_permuted)
+    wv_group_size = WV_GROUP_SIZE
+    n_wv_group = p.h_q // wv_group_size
     token_positions = torch.randint(0, max_token_position, (b*s_q, ), dtype=torch.int32)
 
-    def run_fused_norm_rope_attn_rope_cast_decode():
+    def run_fused_decode(q_for_fused: torch.Tensor):
         # NOTE The kernel interface does not have the batch dimension (batch size is always 1),
         # so we squeeze the batch dimension out of every per-request tensor here
-        return flash_mla.fused_norm_rope_attn_rope_cast.decode(
-            enable_q_norm=enable_q_norm,
+        return fused_api.decode(
+            enable_q_norm=p.enable_q_norm,
             rms_norm_eps=rms_norm_eps,
             token_positions=token_positions,
             is_rope_neox_style=False,
@@ -359,13 +382,27 @@ def run_decode_test(p: TestParam) -> bool:
             extra_topk_length=t.extra_kv_scope.topk_length.repeat_interleave(s_q, 0) if t.extra_kv_scope is not None and t.extra_kv_scope.topk_length is not None else None,
         )
 
+    q_lora = torch.randn((b*s_q, q_lora_rank)) * 0.1
+    q_lora = tile_kernels.quant.per_token_cast(q_lora, 'e4m3', q_b_proj_scale_gran, None, use_tma_aligned_col_major_sf=True, round_sf=True, use_packed_ue8m0=True)
+    q_b_proj, q_b_proj_permuted = get_q_b_weight(p.h_q, p.d_qk, q_lora_rank, q_b_proj_scale_gran)
+
+
+    def calculate_q_b_proj(weight) -> torch.Tensor:
+        q = torch.empty((b*s_q, p.h_q*p.d_qk), dtype=torch.bfloat16)
+        deep_gemm.fp8_gemm_nt(q_lora, weight, q, recipe_a=(1, q_b_proj_scale_gran), recipe_b=(1, q_b_proj_scale_gran))
+        return q.view(b*s_q, p.h_q, p.d_qk)
+    q_for_fused = calculate_q_b_proj(q_b_proj_permuted)
+
+    def run_fused_norm_rope_attn_rope_cast_decode():
+        return run_fused_decode(q_for_fused)
+
     lib.device_synchronize()
     ans_out_fp8, ans_out_sf, ans_lse = run_fused_norm_rope_attn_rope_cast_decode()
     lib.device_synchronize()
 
     if p.num_runs > 0:
         flops_and_mem_vol = lib.count_flop_and_mem_vol_for_decode(p, t)
-        fused_time = kk.bench(run_fused_norm_rope_attn_rope_cast_decode, num_tests=p.num_runs).get_kernel_time("fused_norm_rope_attn_rope_cast_fwd")
+        fused_time = kk.bench(run_fused_norm_rope_attn_rope_cast_decode, num_tests=p.num_runs).get_kernel_time(profile_target_kernel_name)
         fused_flops = flops_and_mem_vol.flop/fused_time/1e12
         fused_mem_bw = flops_and_mem_vol.mem_vol/fused_time/1e12
         print(f"Fused decode: {fused_time*1e6:4.0f} us, {fused_flops:6.1f} TFlops, {fused_mem_bw:4.2f} TBps")
@@ -376,7 +413,7 @@ def run_decode_test(p: TestParam) -> bool:
         lse_criteria = {'abs_tol': 1e-5, 'rel_tol': 4.01/65536} if p.k_amplifier_portion == 0 else {'abs_tol': 1e-5, 'rel_tol': 4.01/65536}
 
         t.q = calculate_q_b_proj(q_b_proj).view(b, s_q, p.h_q, p.d_qk)
-        ref_out, ref_lse = ref_fused_norm_rope_attn_rope_cast_decode(p, t, enable_q_norm, cos_sin_cache, token_positions)
+        ref_out, ref_lse = ref_fused_norm_rope_attn_rope_cast_decode(p, t, cos_sin_cache, token_positions)
 
         # NOTE Tensors returned by the fused decode kernel do not have the batch dimension (batch size is always 1)
         ans_out_sf_2d = ans_out_sf.view(b*s_q, -1)
@@ -386,19 +423,22 @@ def run_decode_test(p: TestParam) -> bool:
         ans_wv_out_dequantized = tile_kernels.quant.per_token_cast_back(
             (ans_out_fp8.view(b*s_q, -1), ans_out_sf_2d), 'fp32', 32
         )
-        ans_wv_out_dequantized = ans_wv_out_dequantized \
-            .view(b*s_q, n_wv_group, p.d_v // 32, wv_group_size, 32) \
-            .transpose(2, 3) \
-            .reshape(b*s_q, p.h_q, p.d_v)
+        if kk.is_on_cuda_platform():
+            ans_wv_out_dequantized = ans_wv_out_dequantized \
+                .view(b*s_q, n_wv_group, p.d_v // 32, wv_group_size, 32) \
+                .transpose(2, 3) \
+                .reshape(b*s_q, p.h_q, p.d_v)
+        else:
+            # The Ascend epilogue stores each token's O in natural order, i.e. [head_in_group][d_v]
+            ans_wv_out_dequantized = ans_wv_out_dequantized.reshape(b*s_q, p.h_q, p.d_v)
 
-        is_correct &= kk.check_is_allclose("out", ans_wv_out_dequantized, ref_out.to(torch.float32), **out_criteria)
+        is_correct &= kk.check_is_allclose("out", ans_wv_out_dequantized, ref_out.to(torch.float32), dtype_for_cos_diff_calc=torch.float32, **out_criteria)
         is_correct &= kk.check_is_allclose("lse", ans_lse, ref_lse, **lse_criteria)
 
     return is_correct
 
 
 if __name__ == '__main__':
-    assert kk.get_current_platform() == kk.Platform.CUDA, "This test is only supported on CUDA platform"
     torch.set_default_dtype(torch.bfloat16)
     torch.set_default_device(default_device)
     if kk.is_on_cuda_platform():
@@ -416,21 +456,25 @@ if __name__ == '__main__':
     for h_q in args.h_q:
         for s_kv, topk in [
             # Regular shapes
-            (64, 64),
-            (128, 128),
-            (256, 256),
-            (512, 512),
+            (123, 64),
+            (234, 128),
+            (345, 256),
+            (567, 512),
+            (678, 640),
+            (2930, 2048),
 
             # Irregular shapes
             (592, 120),
             (1840, 240),
-            (1521, 600),
+            (1521, 640),
             (3412, 2896),
 
             # Irregular shapes with OOB TopK
             (95, 152),
+            (95, 256),
             (153, 264),
-            (2345, 5136),
+            (153, 512),
+            (2345, 5120),
 
             (32, 2048), # Some block may be fully invalid
         ]:
@@ -449,12 +493,14 @@ if __name__ == '__main__':
                         have_topk_length=have_topk_length,
                         k_amplifier_portion=k_amplifier_portion,
                         k_amplifier_ratio=k_amplifier_ratio,
+                        enable_q_norm=enable_q_norm,
                         num_runs=0
                     )
                         for (k_amplifier_portion, k_amplifier_ratio) in [
                             (0.0, 1.0),
                             (0.02, 2**8)
                         ]
+                        for enable_q_norm in [False, True]
                     ])
                 for (b, s_q) in [(1, 1), (69, 3), (19, 80)]:
                     for extra_s_kv, extra_topk, kvcache_layout, extra_kvcache_layout in [
@@ -472,10 +518,10 @@ if __name__ == '__main__':
                         for have_extra_topk_length in [False, True]:
                             if have_extra_topk_length and extra_s_kv is None:
                                 continue
+                            enable_q_norm = ((s_kv + topk + s_q) & 0x8) > 0
                             correctness_cases_decode.append(RawTestParamForDecode(
                                 b, h_q, s_q, 1, s_kv, False, topk,
                                 is_all_indices_invalid=is_all_indices_invalid,
-                                have_zero_seqlen_k=False,
                                 have_topk_length=have_topk_length,
                                 enable_attn_sink=have_attn_sink,
                                 extra_s_k=extra_s_kv,
@@ -486,12 +532,14 @@ if __name__ == '__main__':
                                 d_qk=512,
                                 kvcache_layout=kvcache_layout,
                                 extra_kvcache_layout=extra_kvcache_layout,
+                                enable_q_norm=enable_q_norm,
                                 num_runs=0)
                             )
 
     performance_case_templates = [
-        (512, 64, 512, 128, [32768], [(quant.KVCacheLayout.V41_FP8Sparse, quant.KVCacheLayout.V41_FP4Sparse)], [(64, 4), (128, 4), (256, 4)]),
-        (512, 128, 512, 128, [32768], [(quant.KVCacheLayout.V41_FP8Sparse, quant.KVCacheLayout.V41_FP4Sparse)], [(64, 4), (128, 4), (256, 4)]),
+        # (d_qk, h_q, extra_topk, topk, s_kv_list, kvcache_layouts, decoding_bsz_and_s_q)
+        (512, 64, 512, 128, [32768], [(quant.KVCacheLayout.V41_FP8Sparse, quant.KVCacheLayout.V41_FP4Sparse)], [(32, 4), (64, 4), (128, 4)]),
+        (512, 128, 512, 128, [32768], [(quant.KVCacheLayout.V41_FP8Sparse, quant.KVCacheLayout.V41_FP4Sparse)], [(32, 4), (64, 4), (128, 4)]),
     ]
 
     performance_cases_prefill = []
@@ -499,21 +547,34 @@ if __name__ == '__main__':
     for (d_qk, h_q, extra_topk, topk, s_kv_list, kvcache_layouts, decoding_bsz_and_s_q) in performance_case_templates:
         for s_kv in s_kv_list:
             for prefill_s_q in [4096]:
-                performance_cases_prefill.append(TestParam(prefill_s_q, s_kv, topk+extra_topk, h_q, d_qk=d_qk, have_attn_sink=True, check_correctness=True))
+                for enable_q_norm in [False, True]:
+                    performance_cases_prefill.append(TestParam(prefill_s_q, s_kv, topk+extra_topk, h_q, d_qk=d_qk, have_attn_sink=True, enable_q_norm=enable_q_norm, check_correctness=True))
             for (decoding_bsz, decoding_s_q) in decoding_bsz_and_s_q:
                 for kvcache_layout, extra_kvcache_layout in kvcache_layouts:
-                    performance_cases_decode.append(RawTestParamForDecode(
-                        decoding_bsz, h_q, decoding_s_q, 1, topk, False, topk, have_topk_length=False,
-                        extra_s_k=s_kv, extra_topk=extra_topk, extra_block_size=128,
-                        d_qk=d_qk, kvcache_layout=kvcache_layout, extra_kvcache_layout=extra_kvcache_layout))
+                    for enable_q_norm in [False, True]:
+                        performance_cases_decode.append(RawTestParamForDecode(
+                            decoding_bsz, h_q, decoding_s_q, 1, topk, False, topk, have_topk_length=False,
+                            extra_s_k=s_kv, extra_topk=extra_topk, extra_block_size=128,
+                            d_qk=d_qk, kvcache_layout=kvcache_layout, extra_kvcache_layout=extra_kvcache_layout,
+                            enable_q_norm=enable_q_norm
+                        ))
 
     # Prefill testcases
-    testcases = correctness_cases_prefill + correctness_cases_decode + performance_cases_prefill + performance_cases_decode
+    if args.perf_only:
+        testcases = performance_cases_prefill + performance_cases_decode
+    else:
+        testcases = correctness_cases_prefill + correctness_cases_decode + performance_cases_prefill + performance_cases_decode
+
     testcases = [
         (t.to_test_param() if isinstance(t, RawTestParamForDecode) else t)
         for t in testcases
     ]
 
+    filtered_testcases = []
+    for t in testcases:
+        if t.can_run_on_and_clamp(lib.TestTarget.FUSED_NORM_ROPE_ATTN_ROPE_CAST):
+            filtered_testcases.append(t)
+    testcases = filtered_testcases
     print(f"{kk.colors['CYAN_BG']}{len(testcases)} testcases to run{kk.colors['CLEAR']}")
 
     failed_cases = []
