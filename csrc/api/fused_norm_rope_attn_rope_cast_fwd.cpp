@@ -1,8 +1,8 @@
 #include "common.h"
 
-#ifdef FLASH_MLA_IS_BUILD_ON_CUDA
-
 #include "params.h"
+
+#ifdef FLASH_MLA_IS_BUILD_ON_CUDA
 
 #include "cuda_kernels/sm100/prefill/sparse/fused_norm_rope_attn_rope_cast_fwd/core_attn/kernel.h"
 #include "cuda_kernels/sm100/prefill/sparse/fused_norm_rope_attn_rope_cast_fwd/permute_q_b_proj/kernel.h"
@@ -12,23 +12,45 @@ using Params = sm100::prefill::fused_norm_rope_attn_rope_cast_fwd::core_attn::Pa
 using DecodeParams = sm100::prefill::fused_norm_rope_attn_rope_cast_fwd::core_attn::ParamT<SparseAttnFwdMode::Decode>;
 using Config = sm100::prefill::fused_norm_rope_attn_rope_cast_fwd::core_attn::Config;
 
+#else
+
+#include "ascend_kernels/prefill/sparse/kernel.h"
+
+// On Ascend the fused kernel is a specialization of the sparse forward kernel, identified by the
+// HAVE_Q_O_ROPE_AND_O_CAST / HAVE_Q_NORM template parameters.
+using Params = ascend::prefill::sparse_fwd::ParamT<SparseAttnFwdMode::Prefill, true>;
+using DecodeParams = ascend::prefill::sparse_fwd::ParamT<SparseAttnFwdMode::Decode, true>;
+
+#endif
+
 static Tensor allocate_scale_factor(uint32_t batch_size, uint32_t hidden_dim, uint32_t scale_gran, const Tensor &like, std::optional<uint32_t> extra_dim = std::nullopt) {
-    // Allocate a scale factor tensor, which should have shape ([extra_dim], batch_size, hidden_dim / (scale_gran*4))
+    // Allocate a scale factor tensor, which should have shape ([extra_dim], batch_size, hidden_dim / (scale_gran*SCALE_PACK_SIZE))
     // Meet DeepGEMM's SF requirement under use_tma_aligned_col_major_sf == True, round_sf == True, and use_packed_ue8m0 == True
-    STD_TORCH_CHECK(hidden_dim % (scale_gran*4) == 0);
-    uint32_t sf_align_requirement = 16u / sizeof(int32_t);
+#ifdef FLASH_MLA_IS_BUILD_ON_CUDA
+    static constexpr uint32_t SCALE_PACK_SIZE = 4;  // How many scale factors are packed in one element, and the dtype used
+    static constexpr uint32_t SCALE_PACK_BYTES = 4;
+    static constexpr auto SCALE_PACK_DTYPE = ScalarType::Int;
+    // DeepGEMM's packed-ue8m0 SF layout wants a 16 B aligned stride along the (transposed) batch dim on CUDA
+    static constexpr uint32_t SF_ALIGN_REQUIREMENT_BYTES = 16;
+#else
+    static constexpr uint32_t SCALE_PACK_SIZE = 2;  // How many scale factors are packed in one element, and the dtype used
+    static constexpr uint32_t SCALE_PACK_BYTES = 2;
+    static constexpr auto SCALE_PACK_DTYPE = ScalarType::Short;
+    // DeepGEMM has no requirement on the SF layout stride on Ascend, but we align it to 32 B for a better MTE3 burst
+    static constexpr uint32_t SF_ALIGN_REQUIREMENT_BYTES = 32;
+#endif
+    STD_TORCH_CHECK(hidden_dim % (scale_gran*SCALE_PACK_SIZE) == 0);
+    uint32_t sf_align_requirement = SF_ALIGN_REQUIREMENT_BYTES / SCALE_PACK_BYTES;
     uint32_t aligned_batch_size_for_sf = (batch_size + sf_align_requirement - 1) / sf_align_requirement * sf_align_requirement;
     uint32_t leading_dim = extra_dim.value_or(1);
-    Tensor sf = torch::stable::new_empty(like, {leading_dim, hidden_dim / (scale_gran * 4), aligned_batch_size_for_sf}, ScalarType::Int);
+    Tensor sf = torch::stable::new_empty(like, {leading_dim, hidden_dim / (scale_gran * SCALE_PACK_SIZE), aligned_batch_size_for_sf}, SCALE_PACK_DTYPE);
     KU_CHECK_CONTIGUOUS(sf);
     sf = torch::stable::transpose(sf, 1, 2);
-    sf = torch::stable::narrow(sf, 1, 0, batch_size);   // [leading_dim, batch_size, hidden_dim / (scale_gran*4)], int32
+    sf = torch::stable::narrow(sf, 1, 0, batch_size);   // [leading_dim, batch_size, hidden_dim / (scale_gran*SCALE_PACK_SIZE)]
     if (!extra_dim.has_value())
         sf = torch::stable::squeeze(sf, 0);
     return sf;
 }
-
-#endif  // FLASH_MLA_IS_BUILD_ON_CUDA
 
 std::vector<Tensor> fused_norm_rope_attn_rope_cast_fwd(
     const Tensor &q,
@@ -55,6 +77,7 @@ std::vector<Tensor> fused_norm_rope_attn_rope_cast_fwd(
     Arch arch = Arch();
     bool is_sm100f = arch.is_sm100f();
     STD_TORCH_CHECK(is_sm100f, "Fused Norm + RoPE + Core Attn + RoPE + Cast (fused_norm_rope_attn_rope_cast_fwd) is only supported on SM100f architectures.");
+#endif
 
     KU_CHECK_NDIM(q, 3);
     KU_CHECK_NDIM(kv, 3);
@@ -120,12 +143,14 @@ std::vector<Tensor> fused_norm_rope_attn_rope_cast_fwd(
 
     STD_TORCH_CHECK(num_per_channels == 32, "num_per_channels must be 32, got ", num_per_channels);
 
+#ifdef FLASH_MLA_IS_BUILD_ON_CUDA
     torch::stable::accelerator::DeviceGuard device_guard(q.get_device_index());
+#endif
     
     STD_TORCH_CHECK(d_v % (num_per_channels * 4) == 0); // 4 is the number of uint8 in uint32, since `use_packed_ue8m0` is `True`
     Tensor out_fp8 = torch::stable::new_empty(q, {s_q, n_wv_group, wv_group_size * d_v}, ScalarType::Float8_e4m3fn);
     uint32_t out_sf_scale_gran = 32; // Since the weight is per-32 scaled and deep_gemm.einsum requires A and B to have the same scale granularity, the output sf is always stored in a per-32 scaled format (num_per_channels is always 32)
-    Tensor out_sf = torch::stable::transpose(allocate_scale_factor(s_q, wv_group_size * d_v, out_sf_scale_gran, q, n_wv_group), 0, 1);   // [s_q, n_wv_group, wv_group_size * d_v / (out_sf_scale_gran*4)]
+    Tensor out_sf = torch::stable::transpose(allocate_scale_factor(s_q, wv_group_size * d_v, out_sf_scale_gran, q, n_wv_group), 0, 1);   // [s_q, n_wv_group, wv_group_size * d_v / (out_sf_scale_gran*SCALE_PACK_SIZE)]
     Tensor max_logits = torch::stable::new_empty(q, {s_q, h_q}, ScalarType::Float);
     Tensor lse = torch::stable::new_empty(q, {s_q, h_q}, ScalarType::Float);
     KU_CHECK_CONTIGUOUS(out_fp8);
@@ -133,6 +158,80 @@ std::vector<Tensor> fused_norm_rope_attn_rope_cast_fwd(
     KU_CHECK_CONTIGUOUS(max_logits);
     KU_CHECK_CONTIGUOUS(lse);
 
+#ifdef FLASH_MLA_IS_BUILD_ON_ASCEND
+    // The Ascend kernel writes the scale factors of a token into num_scales_per_token/4 groups of [heads][4]
+    // first, and transposes them into `out_sf` afterwards, so the last two dims of `out_sf` must be packed
+    Tensor out_sf_scratch = torch::stable::new_empty(q, {s_q, h_q * d_v / out_sf_scale_gran}, ScalarType::Byte);
+    KU_CHECK_CONTIGUOUS(out_sf_scratch);
+    STD_TORCH_CHECK(out_sf.stride(1) == out_sf.stride(2) * out_sf.size(2),
+        "out_sf must be contiguous on its last two dims for the Ascend kernel");
+
+    Params params{};
+    params.s_q = s_q;
+    params.s_kv = s_kv;
+    params.h_q = h_q;
+    params.h_kv = h_kv;
+    params.d_qk = d_qk;
+    params.d_v = static_cast<int>(d_v);
+    params.topk = topk;
+    params.sm_scale = static_cast<float>(sm_scale);
+    params.sm_scale_div_log2 = static_cast<float>(sm_scale * LOG_2_E);
+    params.q = (bf16*)q.data_ptr();
+    params.kv = (bf16*)kv.data_ptr();
+    params.indices = (int*)indices.data_ptr();
+    params.attn_sink = ku::get_optional_tensor_ptr<float>(attn_sink);
+    params.topk_length = ku::get_optional_tensor_ptr<int>(topk_length);
+    params.stride_q_s_q = int64_stride_to_int(q.stride(0));
+    params.stride_q_h_q = int64_stride_to_int(q.stride(1));
+    params.stride_kv_s_kv = int64_stride_to_int(kv.stride(0));
+    params.stride_kv_h_kv = int64_stride_to_int(kv.stride(1));
+    params.stride_indices_s_q = int64_stride_to_int(indices.stride(0));
+    params.stride_indices_h_kv = int64_stride_to_int(indices.stride(1));
+    params.out = nullptr;   // the output goes to out_fp8 + out_sf
+    params.max_logits = (float*)max_logits.data_ptr();
+    params.lse = (float*)lse.data_ptr();
+    params.mode = SparseAttnFwdMode::Prefill;
+    params.num_sm = get_num_sms();
+    params.stream = get_current_stream();
+
+    params.enable_q_norm = enable_q_norm;
+    params.rms_norm_eps = static_cast<float>(rms_norm_eps);
+    params.token_positions = (uint32_t*)token_positions.data_ptr();
+    params.is_rope_neox_style = is_rope_neox_style;
+    params.rope_dim = static_cast<uint32_t>(rope_dim);
+    params.cos_sin_cache = (float*)cos_sin_cache.data_ptr();
+    params.n_wv_group = static_cast<uint32_t>(n_wv_group);
+    params.wv_group_size = wv_group_size;
+    params.num_per_channels = static_cast<uint32_t>(num_per_channels);
+    params.use_tma_aligned_col_major_sf = use_tma_aligned_col_major_sf;
+    params.round_sf = round_sf;
+    params.use_packed_ue8m0 = use_packed_ue8m0;
+    params.out_fp8 = (fp8_e4m3*)out_fp8.data_ptr();
+    params.out_sf = (uint32_t*)out_sf.data_ptr();
+    params.stride_out_sf_wv_group = static_cast<uint32_t>(int64_stride_to_int(out_sf.stride(1)));
+    params.stride_out_sf_head_dim = static_cast<uint32_t>(int64_stride_to_int(out_sf.stride(2)));
+    params.out_sf_scratchpad = (uint8_t*)out_sf_scratch.data_ptr();
+
+    DISPATCH_NUM_HEADS(h_q, H_Q, ([&]() {
+        DISPATCH_BOOLEAN_FLAG(attn_sink.has_value(), HAVE_ATTN_SINK, ([&]() {
+            DISPATCH_BOOLEAN_FLAG(enable_q_norm, HAVE_Q_NORM, ([&]() {
+                static constexpr ascend::prefill::sparse_fwd::Config CONFIG = {
+                    SparseAttnFwdMode::Prefill,
+                    H_Q,
+                    640,
+                    HAVE_ATTN_SINK,
+                    ModelType::V41,
+                    ModelType::V41,
+                    /*HAVE_Q_O_ROPE_AND_O_CAST=*/true,
+                    HAVE_Q_NORM
+                };
+                ascend::prefill::sparse_fwd::run_sparse_fwd_kernel<CONFIG>(params);
+            }));
+        }));
+    }));
+
+    return {out_fp8, out_sf, max_logits, lse};
+#else
     Params params = {
         s_q, s_kv, h_q, h_kv, d_qk, static_cast<int>(d_v), topk,
         static_cast<float>(sm_scale), static_cast<float>(sm_scale * LOG_2_E),
@@ -182,8 +281,6 @@ std::vector<Tensor> fused_norm_rope_attn_rope_cast_fwd(
     }));
 
     return {out_fp8, out_sf, max_logits, lse};
-#else
-    STD_TORCH_CHECK(false, "fused_norm_rope_attn_rope_cast_fwd is only supported on CUDA GPUs.");
 #endif
 }
 
@@ -215,6 +312,7 @@ std::vector<Tensor> fused_norm_rope_attn_rope_cast_decode(
 #ifdef FLASH_MLA_IS_BUILD_ON_CUDA
     Arch arch = Arch();
     STD_TORCH_CHECK(arch.is_sm100f(), "Fused Norm + RoPE + Core Attn + RoPE + Cast (fused_norm_rope_attn_rope_cast_decode) is only supported on SM100f architectures.");
+#endif
 
     KU_CHECK_NDIM(q, 3);
     KU_CHECK_NDIM(kv, 4);
@@ -332,17 +430,130 @@ std::vector<Tensor> fused_norm_rope_attn_rope_cast_decode(
     KU_CHECK_SHAPE(token_positions, s_q);
     KU_CHECK_SHAPE(cos_sin_cache, cos_sin_cache.size(0), rope_dim);
 
+#ifdef FLASH_MLA_IS_BUILD_ON_CUDA
     torch::stable::accelerator::DeviceGuard device_guard(q.get_device_index());
+#endif
 
     STD_TORCH_CHECK(d_v % (num_per_channels * 4) == 0); // 4 is the number of uint8 in uint32, since `use_packed_ue8m0` is `True`
     Tensor out_fp8 = torch::stable::new_empty(q, {s_q, n_wv_group, wv_group_size * d_v}, ScalarType::Float8_e4m3fn);
     uint32_t out_sf_scale_gran = 32; // Since the weight is per-32 scaled and deep_gemm.einsum requires A and B to have the same scale granularity, the output sf is always stored in a per-32 scaled format (num_per_channels is always 32)
-    Tensor out_sf = torch::stable::transpose(allocate_scale_factor(s_q, wv_group_size * d_v, out_sf_scale_gran, q, n_wv_group), 0, 1);   // [s_q, n_wv_group, wv_group_size * d_v / (out_sf_scale_gran*4)]
+    Tensor out_sf = torch::stable::transpose(allocate_scale_factor(s_q, wv_group_size * d_v, out_sf_scale_gran, q, n_wv_group), 0, 1);   // [s_q, n_wv_group, wv_group_size * d_v / (out_sf_scale_gran*SCALE_PACK_SIZE)]
     Tensor lse = torch::stable::new_empty(q, {s_q, h_q}, ScalarType::Float);
     KU_CHECK_CONTIGUOUS(out_fp8);
     STD_TORCH_CHECK(out_sf.stride(0) == 1);
     KU_CHECK_CONTIGUOUS(lse);
 
+#ifdef FLASH_MLA_IS_BUILD_ON_ASCEND
+    // Same scale-factor handling as the prefill entry point
+    Tensor out_sf_scratch = torch::stable::new_empty(q, {s_q, h_q * d_v / out_sf_scale_gran}, ScalarType::Byte);
+    KU_CHECK_CONTIGUOUS(out_sf_scratch);
+    STD_TORCH_CHECK(out_sf.stride(1) == out_sf.stride(2) * out_sf.size(2),
+        "out_sf must be contiguous on its last two dims for the Ascend kernel");
+
+    DecodeParams params{};
+    // The Ascend decode kernel runs one token per job (`params.s_q == 1`) and takes the job count from
+    // `params.b`, so the [s_q, h_q, d_qk] tensors of the flattened batch are addressed through the `*_b` strides
+    params.b = s_q;
+    params.s_q = 1;
+    params.h_q = h_q;
+    params.h_kv = h_kv;
+    params.d_qk = d_qk;
+    params.d_v = static_cast<int>(d_v);
+    params.sm_scale = static_cast<float>(sm_scale);
+    params.sm_scale_div_log2 = static_cast<float>(sm_scale * LOG_2_E);
+    params.num_blocks = num_blocks;
+    params.page_block_size = page_block_size;
+    params.topk = topk;
+    params.model_type = model_type;
+    params.extra_model_type = extra_model_type;
+    params.q = (bf16*)q.data_ptr();
+    params.kv = (bf16*)kv.data_ptr();
+    params.indices = (int*)indices.data_ptr();
+    params.topk_length = ku::get_optional_tensor_ptr<int>(topk_length);
+    params.attn_sink = ku::get_optional_tensor_ptr<float>(attn_sink);
+    params.lse = (float*)lse.data_ptr();
+    params.out = nullptr;   // the output goes to out_fp8 + out_sf
+    params.extra_num_blocks = extra_num_blocks;
+    params.extra_page_block_size = extra_page_block_size;
+    params.extra_topk = extra_topk;
+    params.extra_kv = ku::get_optional_tensor_ptr<bf16>(extra_kv);
+    params.extra_indices = ku::get_optional_tensor_ptr<int>(extra_indices);
+    params.extra_topk_length = ku::get_optional_tensor_ptr<int>(extra_topk_length);
+    params.stride_q_b = int64_stride_to_int(q.stride(0));
+    params.stride_q_s_q = int64_stride_to_int(q.stride(1));
+    params.stride_q_h_q = int64_stride_to_int(q.stride(1));
+    params.stride_kv_block = int64_stride_to_int(kv.stride(0));
+    params.stride_kv_row = int64_stride_to_int(kv.stride(1));
+    params.stride_indices_b = int64_stride_to_int(indices.stride(0));
+    params.stride_indices_s_q = int64_stride_to_int(indices.stride(0));
+    params.stride_lse_b = int64_stride_to_int(lse.stride(0));
+    params.stride_lse_s_q = int64_stride_to_int(lse.stride(0));
+    params.stride_o_b = 0;      // `out` is unused
+    params.stride_o_s_q = 0;
+    params.stride_o_h_q = 0;
+    if (have_extra_kvcache) {
+        params.stride_extra_kv_block = int64_stride_to_int(extra_kv->stride(0));
+        params.stride_extra_kv_row = int64_stride_to_int(extra_kv->stride(1));
+        // The Ascend kernel addresses both index tensors with the flattened token index (`*_b`)
+        params.stride_extra_indices_b = int64_stride_to_int(extra_indices->stride(0));
+        params.stride_extra_indices_s_q = int64_stride_to_int(extra_indices->stride(0));
+    }
+    params.num_sm = get_num_sms();
+    params.stream = get_current_stream();
+    params.enable_split_kv = false;     // split-KV is not supported by this kernel
+
+    params.enable_q_norm = enable_q_norm;
+    params.rms_norm_eps = static_cast<float>(rms_norm_eps);
+    params.token_positions = (uint32_t*)token_positions.data_ptr();
+    params.is_rope_neox_style = is_rope_neox_style;
+    params.rope_dim = static_cast<uint32_t>(rope_dim);
+    params.cos_sin_cache = (float*)cos_sin_cache.data_ptr();
+    params.n_wv_group = static_cast<uint32_t>(n_wv_group);
+    params.wv_group_size = wv_group_size;
+    params.num_per_channels = static_cast<uint32_t>(num_per_channels);
+    params.use_tma_aligned_col_major_sf = use_tma_aligned_col_major_sf;
+    params.round_sf = round_sf;
+    params.use_packed_ue8m0 = use_packed_ue8m0;
+    params.out_fp8 = (fp8_e4m3*)out_fp8.data_ptr();
+    params.out_sf = (uint32_t*)out_sf.data_ptr();
+    params.stride_out_sf_wv_group = static_cast<uint32_t>(int64_stride_to_int(out_sf.stride(1)));
+    params.stride_out_sf_head_dim = static_cast<uint32_t>(int64_stride_to_int(out_sf.stride(2)));
+    params.out_sf_scratchpad = (uint8_t*)out_sf_scratch.data_ptr();
+
+    DISPATCH_NUM_HEADS(h_q, H_Q, ([&]() {
+        DISPATCH_BOOLEAN_FLAG(attn_sink.has_value(), HAVE_ATTN_SINK, ([&]() {
+            DISPATCH_BOOLEAN_FLAG(enable_q_norm, HAVE_Q_NORM, ([&]() {
+                if (extra_model_type == ModelType::V41_FP4) {
+                    static constexpr ascend::prefill::sparse_fwd::Config CONFIG = {
+                        SparseAttnFwdMode::Decode,
+                        H_Q,
+                        640,
+                        HAVE_ATTN_SINK,
+                        ModelType::V41,
+                        ModelType::V41_FP4,
+                        /*HAVE_Q_O_ROPE_AND_O_CAST=*/true,
+                        HAVE_Q_NORM
+                    };
+                    ascend::prefill::sparse_fwd::run_sparse_fwd_kernel<CONFIG>(params);
+                } else {
+                    static constexpr ascend::prefill::sparse_fwd::Config CONFIG = {
+                        SparseAttnFwdMode::Decode,
+                        H_Q,
+                        640,
+                        HAVE_ATTN_SINK,
+                        ModelType::V41,
+                        ModelType::V41,
+                        /*HAVE_Q_O_ROPE_AND_O_CAST=*/true,
+                        HAVE_Q_NORM
+                    };
+                    ascend::prefill::sparse_fwd::run_sparse_fwd_kernel<CONFIG>(params);
+                }
+            }));
+        }));
+    }));
+
+    return {out_fp8, out_sf, lse};
+#else
     SparseAttnDecodeParams base_params = {
         1 /* b */, s_q, h_q, h_kv, d_qk, static_cast<int>(d_v),
         static_cast<float>(sm_scale), static_cast<float>(sm_scale * LOG_2_E),
@@ -413,8 +624,6 @@ std::vector<Tensor> fused_norm_rope_attn_rope_cast_decode(
     }));
 
     return {out_fp8, out_sf, lse};
-#else
-    STD_TORCH_CHECK(false, "fused_norm_rope_attn_rope_cast_decode is only supported on CUDA GPUs.");
 #endif
 }
 
@@ -477,7 +686,8 @@ std::vector<Tensor> permute_q_b_proj(
 
     return {q_b_proj_permuted, scale_factors_permuted};
 #else
-    STD_TORCH_CHECK(false, "permute_q_b_proj is only supported on CUDA GPUs.");
+    // Ascend doesn't need to permute the weights
+    return {q_b_proj, scale_factors};
 #endif
 }
 
@@ -545,13 +755,23 @@ std::vector<Tensor> permute_wv_proj(
 
     return {wv_proj_permuted, scale_factors_permuted};
 #else
-    STD_TORCH_CHECK(false, "permute_wv_proj is only supported on CUDA GPUs.");
+    // Ascend doesn't need to permute the weights
+    return {wv_proj, scale_factors};
 #endif
 }
 
 
 #ifdef FLASH_MLA_IS_BUILD_ON_CUDA
 STABLE_TORCH_LIBRARY_IMPL(flash_mla, CUDA, m) {
+    m.impl("fused_norm_rope_attn_rope_cast_fwd", TORCH_BOX(&fused_norm_rope_attn_rope_cast_fwd));
+    m.impl("fused_norm_rope_attn_rope_cast_decode", TORCH_BOX(&fused_norm_rope_attn_rope_cast_decode));
+    m.impl("permute_q_b_proj", TORCH_BOX(&permute_q_b_proj));
+    m.impl("permute_wv_proj", TORCH_BOX(&permute_wv_proj));
+}
+#endif
+
+#ifdef FLASH_MLA_IS_BUILD_ON_ASCEND
+STABLE_TORCH_LIBRARY_IMPL(flash_mla, PrivateUse1, m) {
     m.impl("fused_norm_rope_attn_rope_cast_fwd", TORCH_BOX(&fused_norm_rope_attn_rope_cast_fwd));
     m.impl("fused_norm_rope_attn_rope_cast_decode", TORCH_BOX(&fused_norm_rope_attn_rope_cast_decode));
     m.impl("permute_q_b_proj", TORCH_BOX(&permute_q_b_proj));

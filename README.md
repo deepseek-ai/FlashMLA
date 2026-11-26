@@ -10,6 +10,10 @@ FlashMLA 是 DeepSeek 的高性能注意力算子库，支撑着 [DeepSeek-V4.1]
 
 ## News
 
+- **2026.11.26 Update of Ascend Attention Kernels**: We've released the fused norm+RoPE+attention+RoPE+cast kernel for the Huawei Ascend 950 NPU. We've also optimized the existing Ascend sparse prefill and decoding kernels, which now achieve up to 425 TFlops (98.5% hardware peak) and 372 TFlops (86.1% hardware peak) during prefill and decoding, respectively.
+
+  我们发布了华为昇腾 NPU 平台上的 fused norm+RoPE+attention+RoPE+cast 融合算子，同时优化了原有昇腾 Prefill、Decoding 算子的性能，在 Prefill 时能够达到 425 TFlops（98.5% 硬件极限），在 Decoding 时能够达到 372 TFlops（86.1% 硬件极限）。
+
 - **2026.09.30 Release of Ascend Attention Kernels**: We've released sparse attention prefill and decoding kernels for the Huawei Ascend 950 NPU, which achieve up to 410 TFlops (95% hardware peak) and 360 TFlops (83% of hardware peak) during prefill and decoding, respectively. We've also released [a deep-dive technical report](docs/20260930-ascend-prefill-deep-dive.md) on the algorithms and optimization techniques behind these kernels.
 
   我们发布了华为昇腾 NPU 平台上的稀疏注意力 Prefill 和 Decoding 算子，其在 Prefill 时能够达到 410 TFlops（95% 硬件极限），在 Decoding 时能达到 360 TFlops（83% 硬件极限）。此外，我们还发布了 [一篇简短的技术报告](docs/20260930-ascend-prefill-deep-dive-zh.md)，介绍了这个算子背后所使用到的算法与优化技术。
@@ -36,11 +40,13 @@ FlashMLA 是 DeepSeek 的高性能注意力算子库，支撑着 [DeepSeek-V4.1]
 python tests/test-fused-norm-rope-attn-rope-cast.py
 ```
 
-[TileLang](https://github.com/tile-ai/tilelang), [Tile-Kernels](https://github.com/deepseek-ai/TileKernels/), and [DeepGEMM](https://github.com/deepseek-ai/DeepGEMM) are required to run this test script.
+[TileLang](https://github.com/tile-ai/tilelang), [Tile-Kernels](https://github.com/deepseek-ai/TileKernels/), and [DeepGEMM](https://github.com/deepseek-ai/DeepGEMM) ([DeepGEMM-Ascend](https://github.com/deepseek-ai/DeepGEMM-Ascend) for Ascend) are required to run this test script.
 
-This kernel fuses Q-norm (only used in V4, not V4.1), Q-RoPE, core attention, O-RoPE (conjugate) and the cast to FP8 into a single kernel, which saves the overhead of those small kernels. Although it fuses many small operations, it still achieves the same or even slightly higher TFlops, at the cost of having to permute the Q_b and Wv weights in advance. It achieves up to 1460 TFlops during prefill and 950 TFlops during decoding on B200 with CUDA 13.3.
+This kernel fuses Q-norm (only used in V4, not V4.1), Q-RoPE, core attention, O-RoPE (conjugate) and the cast to FP8 into a single kernel, which saves the overhead of those small kernels. Although it fuses many small operations, it still achieves the same or even slightly higher TFlops, at the cost of having to permute the `q_b_proj` and `wv_proj` weights in advance (only CUDA needs this permutation).
 
-This kernel currently supports CUDA only; Ascend is not supported.
+On B200 with CUDA 13.3, it achieves up to 1460 TFlops during prefill and 950 TFlops during decoding. On the Ascend 950DT NPU, it achieves up to 406 TFlops during prefill and 350 TFlops during decoding.
+
+This kernel supports both NVIDIA GPUs (sm100 / sm103) and Huawei Ascend NPUs.
 
 ### Test & benchmark MLA prefill (Sparse):
 
@@ -216,7 +222,7 @@ The usage is similar to the `flash_attn` package, with two differences: the two 
 
 In the DeepSeek-V4.1 release, we also provide a fused kernel that combines Q-norm (only used in V4, not in V4.1), Q-RoPE, core attention, O-RoPE (conjugate) and the cast to FP8 into a single kernel. It removes the extra time spent on these small kernels while keeping the same or even slightly higher TFlops, at the cost of having to permute the Q_b and Wv weights in advance.
 
-In DeepSeek-V4.1 attention, Q (`[hidden_size]`) is first projected to `[q_lora_rank]` (the Q_a projection) and then to `[num_attention_heads, head_dim]` (the Q_b projection). After core attention, the output (`[num_attention_heads, head_dim]`) is reshaped to `[o_groups, num_attention_heads // o_groups * head_dim]`, and each of its rows is projected to `[o_lora_rank]` (the Wv projection), giving an `[o_groups, o_lora_rank]` matrix. That matrix is reshaped to `[o_groups * o_lora_rank]` and finally projected to `[hidden_size]` (the Wo projection). This kernel requires the Q_b and Wv weights to be permuted.
+In DeepSeek-V4.1 attention, Q (`[hidden_size]`) is first projected to `[q_lora_rank]` (the Q_a projection) and then to `[num_attention_heads, head_dim]` (the Q_b projection). After core attention, the output (`[num_attention_heads, head_dim]`) is reshaped to `[o_groups, num_attention_heads // o_groups * head_dim]`, and each of its rows is projected to `[o_lora_rank]` (the Wv projection), giving an `[o_groups, o_lora_rank]` matrix. That matrix is reshaped to `[o_groups * o_lora_rank]` and finally projected to `[hidden_size]` (the Wo projection). This kernel requires the Q_b and Wv weights to be permuted on CUDA platform.
 
 To permute the Q_b weight:
 
@@ -367,7 +373,7 @@ The corresponding FlashMLA version can be found at: [AITER/MLA](https://github.c
 ```bibtex
 @misc{flashmla2025,
       title={FlashMLA: Efficient Multi-head Latent Attention Kernels},
-      author={Jiashi Li and Shengyu Liu and Yuanhang Sun},
+      author={Jiashi Li and Shengyu Liu and Yuanhang Sun and Yi Zheng},
       year={2025},
       publisher = {GitHub},
       howpublished = {\url{https://github.com/deepseek-ai/FlashMLA}},

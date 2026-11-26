@@ -8,17 +8,21 @@
 #include <cutlass/bfloat16.h>
 #include <cute/container/alignment.hpp>
 using bf16 = cutlass::bfloat16_t;
+using fp8_e4m3 = cutlass::float_e4m3_t;
 
 #else
 
 #include <acl/acl_base_rt.h>
 #ifdef __NPU_DEVICE__   // If either __NPU_DEVICE__ and __NPU_HOST__ is defined (which means that this file is included by a `.asc` file), we can use `bfloat16_t` as `bf16`. Otherwise (which means that this file is included by a `.cpp` file) we declare `bf16` as a class to pass compilation
     using bf16 = bfloat16_t;
+    using fp8_e4m3 = float8_e4m3_t;
 #else
     #ifdef __NPU_HOST__
         using bf16 = bfloat16_t;
+        using fp8_e4m3 = float8_e4m3_t;
     #else
         struct bf16;
+        struct fp8_e4m3;
     #endif
 #endif
 
@@ -166,6 +170,38 @@ struct SparseAttnDecodeParams {
     DecodingSchedMeta* __restrict__ tile_scheduler_metadata_ptr; // [num_sm_parts], tile scheduling metadata
     int* __restrict__ num_splits_ptr; // [batch_size+1], cumulative split counts per request
     int num_sm_parts;               // Number of SM partitions for split-KV scheduling
+};
+
+// Parameters for the fused Q-b-norm + Q RoPE + Core Attention Forward (prefill/decoding) + O RoPE + O Cast kernel
+template<typename Base>
+struct ParamsTemplateForFusedNormRoPEAttnRoPECast : Base {
+    // Q Norm
+    bool enable_q_norm;
+    float rms_norm_eps;
+
+    // Q/O RoPE
+    FLASH_MLA_GM uint32_t* __restrict__ token_positions;   // [s_q]
+    bool is_rope_neox_style;    // Must be false
+    uint32_t rope_dim;          // Must be 64
+    FLASH_MLA_GM float* __restrict__ cos_sin_cache;  // [*, rope_dim], must be contiguous, from vllm.RotaryEmbedding.cos_sin_cache
+
+    // O Cast
+    uint32_t n_wv_group;
+    uint32_t wv_group_size;
+    uint32_t num_per_channels;          // Must be 32
+    bool use_tma_aligned_col_major_sf;  // Must be true
+    bool round_sf;  // Must be true
+    bool use_packed_ue8m0;  // Must be true
+
+    // Output
+    FLASH_MLA_GM fp8_e4m3* __restrict__ out_fp8; // [s_q, n_wv_group, wv_group_size * d_v]
+    FLASH_MLA_GM uint32_t* __restrict__ out_sf;   // [s_q, n_wv_group, (wv_group_size*d_v) / 32 / 4], contiguous on the first (s_q) dim
+    uint32_t stride_out_sf_wv_group, stride_out_sf_head_dim;
+
+    // Scratchpad
+#ifdef FLASH_MLA_IS_BUILD_ON_ASCEND
+    FLASH_MLA_GM uint8_t* __restrict__ out_sf_scratchpad;  // [s_q, h_q*(d_v/32)]
+#endif
 };
 
 template<SparseAttnFwdMode FWD_MODE>
