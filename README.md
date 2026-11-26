@@ -373,7 +373,7 @@ The corresponding FlashMLA version can be found at: [AITER/MLA](https://github.c
 ```bibtex
 @misc{flashmla2025,
       title={FlashMLA: Efficient Multi-head Latent Attention Kernels},
-      author={Jiashi Li and Shengyu Liu and Yuanhang Sun},
+      author={Jiashi Li and Shengyu Liu and Yuanhang Sun and Yi Zheng},
       year={2025},
       publisher = {GitHub},
       howpublished = {\url{https://github.com/deepseek-ai/FlashMLA}},
