@@ -32,6 +32,7 @@ def device_synchronize():
 class TestTarget(enum.Enum):
     SPARSE_FWD = 0
     DECODE = 1
+    FUSED_NORM_ROPE_ATTN_ROPE_CAST = 2
 
 @dataclasses.dataclass
 class ExtraTestParamForDecode:
@@ -64,14 +65,28 @@ class TestParam:
     k_amplifier_portion: float = 0.0
     k_amplifier_ratio: float = 1.0
     decode: Optional[ExtraTestParamForDecode] = None
+    enable_q_norm: bool = False    # Only used by the fused norm+RoPE+attn+RoPE+cast kernel
 
     def can_run_on_and_clamp(self, test_target: TestTarget) -> bool:
         if kk.is_on_ascend_platform():
+            # The Ascend kernels process the topk in B_TOPK (= 64) sized blocks and assert
+            # `topk % B_TOPK == 0` in `run()`, so mirror that restriction here instead of letting the
+            # device-side assert abort the process
+            if self.topk is not None and self.topk % 64 != 0:
+                return False
             if test_target == TestTarget.SPARSE_FWD:
-                return self.h_q == 64 and self.d_qk == 512
+                return self.h_q in (64, 128) and self.d_qk == 512
+            elif test_target == TestTarget.FUSED_NORM_ROPE_ATTN_ROPE_CAST:
+                if self.decode is not None and self.decode.extra_topk is not None and self.decode.extra_topk % 64 != 0:
+                    return False
+                return self.h_q in (64, 128) and self.d_qk == 512
             elif test_target == TestTarget.DECODE:
                 assert self.decode is not None
-                if self.h_q != 64 or self.d_qk != 512:
+                # The Ascend kernel pads the topk axis in B_TOPK-sized blocks and asserts
+                # `extra_topk % B_TOPK == 0` in `run()`
+                if self.decode.extra_topk is not None and self.decode.extra_topk % 64 != 0:
+                    return False
+                if self.h_q not in (64, 128) or self.d_qk != 512:
                     return False
                 if self.decode.block_size == 1 or self.decode.extra_block_size == 1:
                     return False
@@ -92,6 +107,8 @@ class TestParam:
             if test_target == TestTarget.SPARSE_FWD:
                 if self.topk < 128:
                     self.topk = 128
+                return True
+            elif test_target == TestTarget.FUSED_NORM_ROPE_ATTN_ROPE_CAST:
                 return True
             elif test_target == TestTarget.DECODE:
                 assert self.decode is not None
@@ -128,6 +145,7 @@ class RawTestParamForDecode:
     d_v: int = 512     # V head dim
     kvcache_layout: Optional[quant.KVCacheLayout] = None
     extra_kvcache_layout: Optional[quant.KVCacheLayout] = None
+    enable_q_norm: bool = False    # Only used by the fused norm+RoPE+attn+RoPE+cast kernel
     check_correctness: bool = True
     num_runs: int = 10
     seed: int = -1
@@ -147,6 +165,7 @@ class RawTestParamForDecode:
             num_runs=self.num_runs,
             have_attn_sink=self.enable_attn_sink,
             have_topk_length=self.have_topk_length,
+            enable_q_norm=self.enable_q_norm,
             decode=ExtraTestParamForDecode(
                 b=self.b,
                 is_varlen=self.is_varlen,
@@ -502,3 +521,4 @@ def count_flop_and_mem_vol_for_decode(p: TestParam, t: TestcaseForDecode) -> Flo
 def stick_unit_test_args(parser: argparse.ArgumentParser):
     parser.add_argument("-nc", "--no-cooldown", action="store_true", help="Don't call time.sleep() before performance testcases")
     parser.add_argument("-rf", "--run-to-finish", action="store_true", help="Don't exit when a testcase is failed")
+    parser.add_argument("-pf", "--perf-only", action="store_true", help="Only run performance testcases")

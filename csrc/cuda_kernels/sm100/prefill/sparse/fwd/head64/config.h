@@ -97,10 +97,7 @@ using SmemLayoutS = decltype(coalesce(tile_to_shape(
 ), Shape<_1, _1>{}));
 
 struct SharedMemoryPlan {
-    union {
-        static_assert(MMA_M <= B_TOPK);
-        array_aligned<bf16, B_TOPK*D_V> qko_slots[NUM_BUFS];
-    } u;
+    array_aligned<bf16, B_TOPK*D_V> qko_slots[NUM_BUFS];
     float p_exchange_buf[4][32 * (B_TOPK/(128/MMA_M))];
     bf16 s[MMA_M*B_TOPK];
     char is_k_valid[NUM_BUFS][B_TOPK/8];

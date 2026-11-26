@@ -46,11 +46,8 @@ CUDA_KERNEL_SOURCES = [
     "csrc/cuda_kernels/smxx/decode/get_decoding_sched_meta/get_decoding_sched_meta.cu",
     "csrc/cuda_kernels/smxx/decode/combine/combine.cu",
 
-    # sm100 sparse prefill
+    # sm100 sparse prefill (head64), and the head128 prefill/decoding kernel
     "csrc/cuda_kernels/sm100/prefill/sparse/fwd/head64/instantiations/phase1_h64_k512.cu",
-    "csrc/cuda_kernels/sm100/prefill/sparse/fwd/head128/instantiations/phase1_k512.cu",
-
-    # sm100 sparse prefill for small topk, and head128 decoding
     "csrc/cuda_kernels/sm100/prefill/sparse/fwd_for_small_topk/head128/instantiations/phase1_k512.cu",
     "csrc/cuda_kernels/sm100/prefill/sparse/fwd_for_small_topk/head128/instantiations/phase1_decode_k512_v41.cu",
     "csrc/cuda_kernels/sm100/prefill/sparse/fwd_for_small_topk/head128/instantiations/phase1_decode_k512_v41_splitkv.cu",
@@ -74,14 +71,14 @@ CUDA_KERNEL_SOURCES = [
 ]
 
 # The Ascend instantiations are explicit template instantiations of `run_sparse_fwd_kernel`.
-# Kept for: h64 x {prefill, decode} x {V4.1 fp8, V4.1 fp4 (decode only)} x {sink, nosink}
+# Kept for: h{64,128} x {prefill, decode} x {V4.1 fp8, V4.1 fp4 (decode only)} x {sink, nosink}
+# x {plain, fused norm+RoPE+attn+RoPE+cast (with and without Q norm)}
 ASCEND_KERNEL_SOURCES = [
-    "csrc/ascend_kernels/prefill/sparse/instantiations/v41_h64_prefill_nosink.asc",
-    "csrc/ascend_kernels/prefill/sparse/instantiations/v41_h64_prefill_sink.asc",
-    "csrc/ascend_kernels/prefill/sparse/instantiations/v41_h64_decode_nosink.asc",
-    "csrc/ascend_kernels/prefill/sparse/instantiations/v41_h64_decode_sink.asc",
-    "csrc/ascend_kernels/prefill/sparse/instantiations/v41fp4_h64_decode_nosink.asc",
-    "csrc/ascend_kernels/prefill/sparse/instantiations/v41fp4_h64_decode_sink.asc",
+    *[f"csrc/ascend_kernels/prefill/sparse/instantiations/{format_name}_h{h_q}_{mode_name}_{sink_name}{suffix}.asc"
+      for h_q in (64, 128)
+      for format_name, mode_name in (("v41", "prefill"), ("v41", "decode"), ("v41fp4", "decode"))
+      for sink_name in ("nosink", "sink")
+      for suffix in ("", "_nonorm", "_norm")],
 ]
 
 def get_cuda_arch_flags():
@@ -295,6 +292,9 @@ def build_on_ascend_platform():
                     "-Wno-deprecated-declarations",
                     # Disable argument preload at the beginning of kernels to avoid a hardware bug
                     "-mllvm", "-cce-aicore-dcpreload-args=false",
+                    # Raise a compilation error when a VF spills instead of silently reserving UB for its stack, so
+                    # that the 256 KB UB budget asserted in the kernel config holds
+                    "--cce-disable-vf-stack-reserved-ubuf",
                 ],
             },
             extra_link_args=[

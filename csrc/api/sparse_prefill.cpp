@@ -17,7 +17,6 @@ class SparseFwdImplBase : public ImplBase<
 #ifdef FLASH_MLA_IS_BUILD_ON_CUDA
 
 #include "cuda_kernels/sm100/prefill/sparse/fwd/head64/phase1.h"
-#include "cuda_kernels/sm100/prefill/sparse/fwd/head128/phase1.h"
 #include "cuda_kernels/sm100/prefill/sparse/fwd_for_small_topk/head128/phase1.h"
 
 class SparseFwd_Sm100_Head64_Impl : public SparseFwdImplBase {
@@ -30,19 +29,6 @@ class SparseFwd_Sm100_Head64_Impl : public SparseFwdImplBase {
 protected:
     void run_(const SparseAttnFwdParams &params, const std::vector<FeatureT> &required_features) override {
         sm100::prefill::sparse_fwd::head64::run_sparse_fwd_phase1_kernel(params);
-    }
-};
-
-class SparseFwd_Sm100_Head128_Impl : public SparseFwdImplBase {
-    DECLARE_SUPPORTED_FEATURES(
-        SparseFwdFeatures::HEAD_128,
-        SparseFwdFeatures::ATTN_SINK,
-        SparseFwdFeatures::TOPK_LENGTH
-    )
-
-protected:
-    void run_(const SparseAttnFwdParams &params, const std::vector<FeatureT> &required_features) override {
-        sm100::prefill::sparse_fwd::head128::run_sparse_fwd_phase1_kernel(params);
     }
 };
 
@@ -68,22 +54,27 @@ protected:
 class SparseFwdImpl : public SparseFwdImplBase {
     DECLARE_SUPPORTED_FEATURES(
         SparseFwdFeatures::HEAD_64,
+        SparseFwdFeatures::HEAD_128,
         SparseFwdFeatures::ATTN_SINK,
         SparseFwdFeatures::TOPK_LENGTH
     )
 
 protected:
     void run_(const SparseAttnFwdParams &params, const std::vector<FeatureT> &required_features) override {
-        DISPATCH_BOOLEAN_FLAG(params.attn_sink != nullptr, HAVE_ATTN_SINK, ([&]() {
-            static constexpr ascend::prefill::sparse_fwd::Config CONFIG = {
-                SparseAttnFwdMode::Prefill,
-                64,
-                640,
-                HAVE_ATTN_SINK,
-                ModelType::V41,
-                ModelType::V41
-            };
-            ascend::prefill::sparse_fwd::run_sparse_fwd_kernel<CONFIG>(params);
+        DISPATCH_NUM_HEADS(params.h_q, H_Q, ([&]() {
+            DISPATCH_BOOLEAN_FLAG(params.attn_sink != nullptr, HAVE_ATTN_SINK, ([&]() {
+                static constexpr ascend::prefill::sparse_fwd::Config CONFIG = {
+                    SparseAttnFwdMode::Prefill,
+                    H_Q,
+                    640,
+                    HAVE_ATTN_SINK,
+                    ModelType::V41,
+                    ModelType::V41,
+                    /*HAVE_Q_O_ROPE_AND_O_CAST=*/false,
+                    /*HAVE_Q_NORM=*/false
+                };
+                ascend::prefill::sparse_fwd::run_sparse_fwd_kernel<CONFIG>(params);
+            }));
         }));
     }
 };
@@ -119,6 +110,8 @@ static std::vector<Tensor> sparse_prefill_fwd(
 
     STD_TORCH_CHECK(d_qk == 512, "Invalid d_qk: ", d_qk);
     STD_TORCH_CHECK(d_v == 512, "Invalid d_v", d_v);
+    // The kernels walk the topk axis in B_TOPK-sized blocks and skip the bound check on `indices`
+    STD_TORCH_CHECK(topk % 64 == 0, "topk must be a multiple of 64, got ", topk);
 
     KU_CHECK_DEVICE(q);
     KU_CHECK_DEVICE(kv);
@@ -196,20 +189,8 @@ static std::vector<Tensor> sparse_prefill_fwd(
         SparseFwd_Sm100_Head64_Impl fwd_impl;
         fwd_impl.run(params, required_features);
     } else {
-        SparseFwd_Sm100_Head128_Small_TopK_Impl small_topk_impl;
-        SparseFwd_Sm100_Head128_Impl regular_impl;
-        bool use_small_topk_impl = false;
-        if (
-            (topk <= 1280 && small_topk_impl.check_if_all_features_are_supported(required_features)) ||
-            !regular_impl.check_if_all_features_are_supported(required_features)
-        ) {
-            use_small_topk_impl = true;
-        }
-        if (use_small_topk_impl) {
-            small_topk_impl.run(params, required_features);
-        } else {
-            regular_impl.run(params, required_features);
-        }
+        SparseFwd_Sm100_Head128_Small_TopK_Impl fwd_impl;
+        fwd_impl.run(params, required_features);
     }
 #endif  // FLASH_MLA_IS_BUILD_ON_CUDA
 

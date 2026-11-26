@@ -30,7 +30,9 @@ def prefill(
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     A fused kernel for Q Norm + Q RoPE + Core Attn (sparse attention) + O RoPE + O cast to FP8, for DeepSeek-V4.1
-    Only support sm100 / sm103 GPU architecture.
+    Supports sm100 / sm103 NVIDIA GPUs and Huawei Ascend NPUs. On Ascend, `permute_q_b_proj` and
+    `permute_wv_proj` are no-ops, and the returned scale factors are packed two per int16 instead of
+    four per int32, i.e. in the layout the Ascend DeepGEMM consumes.
 
     Args (Norm):
         enable_q_norm: bool, whether to apply Q RMSNorm
@@ -107,7 +109,9 @@ def decode(
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Fused Decoding kernel: Q Norm + Q RoPE + Core Attn (decode, with paged FP8 KV cache) + O RoPE + O cast to FP8, for DeepSeek-V4.1
-    Only support sm100 / sm103 GPU architecture.
+    Supports sm100 / sm103 NVIDIA GPUs and Huawei Ascend NPUs. On Ascend, `permute_q_b_proj` and
+    `permute_wv_proj` are no-ops, and the returned scale factors are packed two per int16 instead of
+    four per int32, i.e. in the layout the Ascend DeepGEMM consumes.
 
     The batch size is always 1, and the batch dimension is not included in any tensor shape below.
 

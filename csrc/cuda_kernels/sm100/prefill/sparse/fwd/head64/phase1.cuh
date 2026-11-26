@@ -124,52 +124,6 @@ KernelTemplate::sparse_attn_fwd_kernel_devfunc(const SparseAttnFwdParams &params
         int topk_length;
     };
 
-    auto issue_q_tma = [&](int s_q_idx, int qko_slot_idx) {
-        Tensor gQ = tma_params.tma_Q.get_tma_tensor(tma_params.shape_Q)(_, _, s_q_idx);
-        Tensor sQ = make_tensor(make_smem_ptr(plan.u.qko_slots[qko_slot_idx].data()), SmemLayoutQ{});
-        ku::launch_tma_copy(tma_params.tma_Q, gQ, sQ, plan.bar_prologue_q, TMA::CacheHintSm90::EVICT_FIRST);
-    };
-
-    auto issue_q_utccp = [&](bool outer_loop_phase, int qko_slot_idx) {
-        plan.bar_prologue_q.arrive_and_expect_tx(MMA_M*D_V*sizeof(bf16));
-        plan.bar_prologue_q.wait(outer_loop_phase);
-        ku::tcgen05_after_thread_sync();
-        UMMA::SmemDescriptor sQ_desc = UMMA::make_umma_desc<UMMA::Major::K>(
-            make_tensor(
-                make_smem_ptr(plan.u.qko_slots[qko_slot_idx].data()),
-                tile_to_shape(
-                    UMMA::Layout_K_SW128_Atom<bf16>{},
-                    Shape<Int<MMA_M*2>, Int<64>>{}    // TODO Explain this layout and dual gemm
-                )
-            )
-        );
-        
-        CUTE_UNROLL
-        for (int tile_idx = 0; tile_idx < D_V/64/2; ++tile_idx) {
-            // A tile is (2*MMA_M) (possibly x2 for MMA_M=32) rows * 64 cols (128B) (in UTCCP's view), or MMA_M rows * 128 cols (in our view)
-            if constexpr (MMA_M == 64) {
-                CUTE_UNROLL
-                for (int subtile_idx = 0; subtile_idx < 4; ++subtile_idx) {
-                    // A subtile is 128 rows * 16 cols (256b, 32B) (in UTCCP's view), or 64 rows * 16 cols * 2 (in our view)
-                    SM100_UTCCP_128dp256bit_1cta::copy(
-                        sQ_desc + (tile_idx*(MMA_M*128*2) + subtile_idx*32) / 16,   // Remember that 4 LSBs are not included
-                        tmem_cols::Q + tile_idx*32 + subtile_idx*8
-                    );
-                }
-            } else {
-                CUTE_UNROLL
-                for (int subtile_idx = 0; subtile_idx < 8; ++subtile_idx) {
-                    // A subtile is 64x2 rows * 8 cols (128b, 16B) (in UTCCP's view), or 32 rows * 8 cols * 2 (in our view)
-                    SM100_UTCCP_2x64dp128bitlw0123_1cta::copy(
-                        sQ_desc + (tile_idx*(MMA_M*128*2) + subtile_idx*16) / 16,
-                        tmem_cols::Q + tile_idx*32 + subtile_idx*4
-                    );
-                }
-            }
-        }
-        ku::umma_arrive_noelect(plan.bar_prologue_utccp);
-    };
-
     auto run_outer_loop = [&](auto loop_body) {
         int outer_loop_phase = false;
         ku::CLCResult next_job = {true, (int)blockIdx.x, 0, 0};
@@ -330,7 +284,7 @@ KernelTemplate::sparse_attn_fwd_kernel_devfunc(const SparseAttnFwdParams &params
             float attn_sink = (params.attn_sink == nullptr || idx_in_warpgroup%MMA_M >= params.h_q)
                 ? -CUDART_INF_F : __ldg(params.attn_sink + (idx_in_warpgroup%MMA_M))*CUDART_L2E_F;
             float output_scale = __fdividef(1.0f, li + exp2f(attn_sink - mi));
-            Tensor sO = make_tensor(make_smem_ptr(plan.u.qko_slots[o_slot_idx].data()), SmemLayoutO{});
+            Tensor sO = make_tensor(make_smem_ptr(plan.qko_slots[o_slot_idx].data()), SmemLayoutO{});
             Tensor tma_gO = flat_divide(
                 tma_params.tma_O.get_tma_tensor(tma_params.shape_O)(_, _, args.s_q_idx),
                 Shape<Int<MMA_M>, Int<B_EPI>>{}
@@ -445,7 +399,7 @@ KernelTemplate::sparse_attn_fwd_kernel_devfunc(const SparseAttnFwdParams &params
                     // Copy K
                     auto [buf_idx, bar_phase] = rs.get<NUM_BUFS>();
                     plan.bar_sv_done[buf_idx].wait(bar_phase^1);
-                    bf16* sK_base = plan.u.qko_slots[buf_idx].data() + warp_idx*4*64;
+                    bf16* sK_base = plan.qko_slots[buf_idx].data() + warp_idx*4*64;
     
                     auto load_kv_part = [&](int part_idx) {
                         CUTE_UNROLL
@@ -486,6 +440,52 @@ KernelTemplate::sparse_attn_fwd_kernel_devfunc(const SparseAttnFwdParams &params
     } else {
         // MMA warp
         if (warp_idx == 8 && elect_one_sync()) {
+            auto issue_q_tma = [&](int s_q_idx, int qko_slot_idx) {
+                Tensor gQ = tma_params.tma_Q.get_tma_tensor(tma_params.shape_Q)(_, _, s_q_idx);
+                Tensor sQ = make_tensor(make_smem_ptr(plan.qko_slots[qko_slot_idx].data()), SmemLayoutQ{});
+                ku::launch_tma_copy(tma_params.tma_Q, gQ, sQ, plan.bar_prologue_q, TMA::CacheHintSm90::EVICT_FIRST);
+            };
+
+            auto issue_q_utccp = [&](bool outer_loop_phase, int qko_slot_idx) {
+                plan.bar_prologue_q.arrive_and_expect_tx(MMA_M*D_V*sizeof(bf16));
+                plan.bar_prologue_q.wait(outer_loop_phase);
+                ku::tcgen05_after_thread_sync();
+                UMMA::SmemDescriptor sQ_desc = UMMA::make_umma_desc<UMMA::Major::K>(
+                    make_tensor(
+                        make_smem_ptr(plan.qko_slots[qko_slot_idx].data()),
+                        tile_to_shape(
+                            UMMA::Layout_K_SW128_Atom<bf16>{},
+                            Shape<Int<MMA_M*2>, Int<64>>{}    // TODO Explain this layout and dual gemm
+                        )
+                    )
+                );
+        
+                CUTE_UNROLL
+                for (int tile_idx = 0; tile_idx < D_V/64/2; ++tile_idx) {
+                    // A tile is (2*MMA_M) (possibly x2 for MMA_M=32) rows * 64 cols (128B) (in UTCCP's view), or MMA_M rows * 128 cols (in our view)
+                    if constexpr (MMA_M == 64) {
+                        CUTE_UNROLL
+                        for (int subtile_idx = 0; subtile_idx < 4; ++subtile_idx) {
+                            // A subtile is 128 rows * 16 cols (256b, 32B) (in UTCCP's view), or 64 rows * 16 cols * 2 (in our view)
+                            SM100_UTCCP_128dp256bit_1cta::copy(
+                                sQ_desc + (tile_idx*(MMA_M*128*2) + subtile_idx*32) / 16,   // Remember that 4 LSBs are not included
+                                tmem_cols::Q + tile_idx*32 + subtile_idx*8
+                            );
+                        }
+                    } else {
+                        CUTE_UNROLL
+                        for (int subtile_idx = 0; subtile_idx < 8; ++subtile_idx) {
+                            // A subtile is 64x2 rows * 8 cols (128b, 16B) (in UTCCP's view), or 32 rows * 8 cols * 2 (in our view)
+                            SM100_UTCCP_2x64dp128bitlw0123_1cta::copy(
+                                sQ_desc + (tile_idx*(MMA_M*128*2) + subtile_idx*16) / 16,
+                                tmem_cols::Q + tile_idx*32 + subtile_idx*4
+                            );
+                        }
+                    }
+                }
+                ku::umma_arrive_noelect(plan.bar_prologue_utccp);
+            };
+
             // Allocate tmem tensors
             TiledMMA tiled_mma_P = TiledMMA_P{};
             TiledMMA tiled_mma_O = TiledMMA_O{};
@@ -505,7 +505,7 @@ KernelTemplate::sparse_attn_fwd_kernel_devfunc(const SparseAttnFwdParams &params
             
             run_outer_loop([&](const OuterloopArgs &args) {
                 // Copy Q into k["buffer idx of the 1st block"+1]
-                // NOTE. As we reach here, we must have already issued the last O gemm of the last round, which means that the penultimate O gemm must be finished (since the last O gemm |-> bar_so_ready (the last S is ready) |-> the penultimate O gemm must be finished). So the corresponding K buffer must be free.
+                // NOTE. As we reach here, we must have already issued the last O gemm of the last round, which means that the penultimate O gemm must be finished (since the last O gemm |-> bar_so_ready (the last S is ready) |-> the penultimate O gemm must be finished). So the corresponding K buffer must be free, and Q's TMA copy can be started right away.
                 int q_slot_idx = rs.offset_by(+1).get<NUM_BUFS>().first;
                 issue_q_tma(args.s_q_idx, q_slot_idx);
                 issue_q_utccp(args.outer_loop_phase, q_slot_idx);
@@ -515,7 +515,7 @@ KernelTemplate::sparse_attn_fwd_kernel_devfunc(const SparseAttnFwdParams &params
                     if (k < args.num_k_blocks) {
                         // Pi = QKi^T
                         auto [buf_idx, bar_phase] = rs.get<NUM_BUFS>();
-                        Tensor sK = make_tensor(make_smem_ptr(plan.u.qko_slots[buf_idx].data()), SmemLayoutK_TiledMMA{});
+                        Tensor sK = make_tensor(make_smem_ptr(plan.qko_slots[buf_idx].data()), SmemLayoutK_TiledMMA{});
     
                         auto [__, binary_bar_phase] = rs.get<1>();
                         plan.bar_p_free.wait(binary_bar_phase^1);
@@ -542,7 +542,7 @@ KernelTemplate::sparse_attn_fwd_kernel_devfunc(const SparseAttnFwdParams &params
                         auto [buf_idx, bar_phase] = rs.offset_by(-1).get<NUM_BUFS>();
     
                         Tensor sS = make_tensor(make_smem_ptr(plan.s), SmemLayoutS{});
-                        Tensor sV = make_tensor(make_smem_ptr(plan.u.qko_slots[buf_idx].data()), SmemLayoutV{});
+                        Tensor sV = make_tensor(make_smem_ptr(plan.qko_slots[buf_idx].data()), SmemLayoutV{});
     
                         // Wait for S(i-1) and O to be scaled
                         auto [__, binary_bar_phase] = rs.offset_by(-1).get<1>();

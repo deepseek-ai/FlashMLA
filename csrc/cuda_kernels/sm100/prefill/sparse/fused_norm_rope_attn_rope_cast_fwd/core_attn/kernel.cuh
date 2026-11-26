@@ -603,7 +603,7 @@ void Kernel<CONFIG>::devfunc(const Params &params, const TMAParams &tma_params, 
                     float2 cur_q_sqr_sum = {0.0f, 0.0f};
                     CUTE_UNROLL
                     for (uint32_t j = 0; j < TILE_SIZE; j += 2) {
-                        float2 x = __bfloat1622float2(*(nv_bfloat162*)(cached_q+local_tile_idx*TILE_SIZE+j));
+                        float2 x = bf16x2_to_float2(*(const nv_bfloat162*)(cached_q+local_tile_idx*TILE_SIZE+j));
                         if constexpr (ENABLE_Q_NORM) {
                             cur_q_sqr_sum = ku::float2_fma(x, x, cur_q_sqr_sum);
                         }

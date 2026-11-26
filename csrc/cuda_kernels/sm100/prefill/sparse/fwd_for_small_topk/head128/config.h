@@ -139,9 +139,9 @@ using TiledMMA_O = decltype(make_tiled_mma(
 
 struct barrier_ids {
     static constexpr int WG0_SYNC = 0;
-    static constexpr int WG2_SYNC = 1;
-    static constexpr int WG2_WARP02_SYNC = 2;
-    static constexpr int WG2_WARP13_SYNC = 3;
+    static constexpr int WG4_SYNC = 1;
+    static constexpr int WG4_WARP02_SYNC = 2;
+    static constexpr int WG4_WARP13_SYNC = 3;
 };
 
 static __device__ void
