@@ -1,6 +1,7 @@
 from typing import Tuple, List, Callable, Union, Optional, Dict, overload
 import csv
 import dataclasses
+import functools
 import itertools
 import os
 import pathlib
@@ -8,7 +9,6 @@ import shutil
 import tempfile
 
 import torch
-import triton
 
 from .platform import Platform, get_current_platform, requires_platform
 from .utils import is_using_profiling_tools, suppress_stdout_stderr
@@ -20,12 +20,18 @@ class empty_suppress:
     def __exit__(self, *_):
         pass
 
-@triton.jit
-def profiler_range_start_marker_kernel():
-    pass
+@functools.lru_cache(maxsize=1)
+def _get_profiler_range_start_marker_kernel():
+    import triton
+
+    @triton.jit
+    def profiler_range_start_marker_kernel():
+        pass
+
+    return profiler_range_start_marker_kernel
 
 def _run_profiler_range_start_marker_kernel():
-    profiler_range_start_marker_kernel[(1,)]()
+    _get_profiler_range_start_marker_kernel()[(1,)]()
 
 @dataclasses.dataclass
 class BenchResult:
