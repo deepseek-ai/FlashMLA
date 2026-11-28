@@ -143,7 +143,10 @@ flash_fwd_mla_combine_kernel(__grid_constant__ const SparseAttnDecodeParams para
         CUTLASS_PRAGMA_UNROLL
         for (int i = 0; i < NUM_LSE_PER_THREAD; ++i) {
             const int split_idx = i*32 + lane_idx;
-            smem_buf[warp_idx][split_idx] = exp2f(local_lse[i] - global_lse);
+            // Avoid losing the normalization term when global_lse is rounded at large offsets.
+            smem_buf[warp_idx][split_idx] = params.attn_sink == nullptr
+                ? (sum_lse == 0.f ? 0.f : exp2f(local_lse[i] - max_lse) / sum_lse)
+                : exp2f(local_lse[i] - global_lse);
         }
     }
 
