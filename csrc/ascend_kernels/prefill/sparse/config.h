@@ -122,13 +122,15 @@ struct UnifiedBufferMemoryPlan {
     float attn_sink[HAVE_ATTN_SINK ? MMA_M_PER_V : 0];
 
     // The following two row_max are NOT scaled (NOT multiplied by sm_scale)
-    float row_max[2][constexpr_max(MMA_M_PER_V*2, NUM_FLOAT_IN_VEC)];    // row0 row0 row1 row1 row2 row2 ...
-    float row_max_for_o[2][constexpr_max(MMA_M_PER_V*2, NUM_FLOAT_IN_VEC)];
+    float row_max[2][constexpr_max(MMA_M_PER_V, NUM_FLOAT_IN_VEC)];    // row0 row1 row2 ...
+    float row_max_for_o[2][constexpr_max(MMA_M_PER_V, NUM_FLOAT_IN_VEC)];
     
-    float row_sum[2][(MMA_M_PER_V/4)*NUM_FLOAT_IN_VEC];    // row_sum[:, 0:16] are partial sums that form row0, row_sum[:, 16:32] are partial sums for row1, and so on.
+    // One vector of [8 rows][8 column pairs] partial sums per 8 rows: row_sum[:, 0:8] are the pair sums that form row0,
+    // row_sum[:, 8:16] are the pair sums for row1, and so on.
+    float row_sum[2][(MMA_M_PER_V/8)*NUM_FLOAT_IN_VEC];
     float row_denorm[NUM_ROW_DENORM_BUFS][4*NUM_FLOAT_IN_VEC];  // For cases where `HAVE_Q_O_ROPE_AND_O_CAST` is true, each number is repeated for 4 times. Otherwise, no repeat. Use 4*NUM_FLOAT_IN_VEC instead of `constexpr_max` because we always write 4 `vector_float` into `row_denorm` regarding `MMA_M_PER_V`
 
-    float row_rescale_factor[2][2][NUM_FLOAT_IN_VEC];   // row0 row0 row1 row1 row2 row2 ..., not defined for KV block0 in each q token
+    float row_rescale_factor[2][2][NUM_FLOAT_IN_VEC];   // row0 row1 row2 ..., not defined for KV block0 in each q token
 
     int32_t indices[INDEX_BLOCK_SIZE];
 
@@ -173,7 +175,7 @@ struct UnifiedBufferMemoryPlan {
     alignas(32) bf16 q_frag[HAVE_Q_O_ROPE_AND_O_CAST ? NUM_UB_Q_FRAG_BUFS : 0][MMA_M_PER_V * Q_FRAG_D_QK]; // In NZ layout
 
     alignas(32) float q_norm_accum_wksp[HAVE_Q_O_ROPE_AND_O_CAST ? (MMA_M_PER_V/4) * NUM_FLOAT_IN_VEC : 0];
-    alignas(32) float sm_scale_div_rms[HAVE_Q_O_ROPE_AND_O_CAST ? NUM_SM_SCALE_DIV_RMS_BUFS : 0][constexpr_max(MMA_M_PER_V*2, NUM_FLOAT_IN_VEC)]; // Each number is repeated twice
+    alignas(32) float sm_scale_div_rms[HAVE_Q_O_ROPE_AND_O_CAST ? NUM_SM_SCALE_DIV_RMS_BUFS : 0][constexpr_max(MMA_M_PER_V, NUM_FLOAT_IN_VEC)]; // One value per head
 
     alignas(64) float row_max_max_delta[2][2];  // Must be put at the end to guarantee alignment of the previous arrays. alignas(64) makes it cover a cache line, which `asc_ub_dcci_single` requires
 };

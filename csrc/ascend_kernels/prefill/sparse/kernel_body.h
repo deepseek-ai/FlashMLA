@@ -485,7 +485,7 @@ __simd_vf__ void Kernel<CONFIG>::q_norm_vf(__ubuf__ UnifiedBufferMemoryPlan& ub_
     bool is_first_q_frag = q_frag_idx == NUM_Q_FRAGS-1;
     bool is_last_q_frag = q_frag_idx == 0;  // We loop in reversed order
     vector_bool full_mask = asc_create_mask_b16(PAT_ALL);
-    vector_bool b32_vl16_mask = asc_create_mask_b32(PAT_VL16);
+    vector_bool b32_vl8_mask = asc_create_mask_b32(PAT_VL8);
 
     static constexpr uint32_t NUM_ROWS = MMA_M_PER_V / 4;   // 4: NUM_FLOAT_IN_VEC / FRACTAL_W
     vector_float row_accum[NUM_ROWS];
@@ -510,7 +510,7 @@ __simd_vf__ void Kernel<CONFIG>::q_norm_vf(__ubuf__ UnifiedBufferMemoryPlan& ub_
 
         #pragma unroll
         for (uint32_t i = 0; i < NUM_ROWS; i += 2) {
-            vector_float cur_row_accum, t;
+            vector_float cur_row_accum;
             asc_deintlv(row_accum[i], row_accum[i+1], row_accum[i], row_accum[i+1]);
             asc_add(cur_row_accum, row_accum[i], row_accum[i+1], full_mask);
             asc_reduce_sum_datablock(cur_row_accum, cur_row_accum, full_mask);
@@ -519,8 +519,7 @@ __simd_vf__ void Kernel<CONFIG>::q_norm_vf(__ubuf__ UnifiedBufferMemoryPlan& ub_
             asc_sqrt(cur_row_accum, cur_row_accum, full_mask);
             asc_div(cur_row_accum, full_sm_scale_vec, cur_row_accum, full_mask);
 
-            asc_intlv(cur_row_accum, t, cur_row_accum, cur_row_accum);
-            asc_storealign(ub_buf.sm_scale_div_rms[job_idx % NUM_SM_SCALE_DIV_RMS_BUFS], cur_row_accum, i*8, b32_vl16_mask);
+            asc_storealign(ub_buf.sm_scale_div_rms[job_idx % NUM_SM_SCALE_DIV_RMS_BUFS], cur_row_accum, i*4, b32_vl8_mask);
         }
     } else {
         #pragma unroll
@@ -604,94 +603,75 @@ __simd_vf__ void Kernel<CONFIG>::softmax_vf(__ubuf__ UnifiedBufferMemoryPlan& ub
     auto full_mask = asc_create_mask_b16(PAT_ALL);
     auto vl8_mask = asc_create_mask_b32(PAT_VL8);
 
-    vector_float old_rows_sum;
-    if constexpr (not IS_BLOCK0) {
-        asc_loadalign(old_rows_sum, ub_buf.row_sum[job_idx&1]);
-    }
 
-    // Get `col_masks` from `smaller_indices` and `larger_indices`
-    // Each "col_mask" controls 16 columns, and the masks for those 16 columns are repeated for four times, so that it can be applied directly onto P loaded from SMEM
-    vector_bool col_valid_masks[B_TOPK / 16];
+    /*
+    Every `asc_loadalign_deintlv_postupdate` below reads 8 rows x 16 columns of P (2 UB vectors) at once and
+    de-interleaves them into 8 rows x 8 even columns + 8 rows x 8 odd columns. The register layout is
+    therefore [row][pair], where a `pair` is a pair of adjacent KV tokens (`2 * pair` and `2 * pair + 1`).
+
+    The column-valid masks are derived from `smaller_indices` / `larger_indices`: `asc_loadalign_brc_datablock`
+    repeats the 8 (pair) elements of a 16-column group 8 times, which matches the [row][pair] layout exactly.
+    They only depend on the column group, so both loops that consume P iterate the column groups in the outer
+    loop and compute the two masks once per group; each pair dies at the end of its group instead of staying
+    alive per row group (2 masks * 4 groups would overflow the 8 predicate registers).
+    */
+    static_assert(MMA_M_PER_V % 8 == 0);
+    static_assert(B_TOPK % FRACTAL_W == 0);
+    static constexpr uint32_t NUM_ROW_GROUPS = MMA_M_PER_V / 8;
+    static constexpr uint32_t NUM_COL_GROUPS = B_TOPK / FRACTAL_W;
+
     __ubuf__ uint32_t* cur_smaller_indices_ptr = ub_buf.smaller_indices[index_buf_idx] + ub_indices_arr_offset;
     __ubuf__ uint32_t* cur_larger_indices_ptr = ub_buf.larger_indices[index_buf_idx] + ub_indices_arr_offset;
-    #pragma unroll
-    for (uint32_t col_group = 0; col_group < B_TOPK / 16; ++col_group) {
-        // Load 8 smaller indices and 8 larger indices ...
-        vector_uint32_t smaller_indices, larger_indices;
-        asc_loadalign_brc_datablock_postupdate(smaller_indices, cur_smaller_indices_ptr, 8);
-        asc_loadalign_brc_datablock_postupdate(larger_indices, cur_larger_indices_ptr, 8);
-        // ... and then use asc_intlv to interleave them
-        vector_uint32_t interleaved_indices, t;
-        asc_intlv(interleaved_indices, t, smaller_indices, larger_indices);
-        // For each pair of indices, there are three cases:
-        //  1) Both indices are valid. Token with smaller index will be placed at position 0 and token with larger index will be placed at position 1
-        //  2) One index is valid and the other one is invalid. The valid token will be placed at position 0
-        //  3) Both indices are invalid
-        // In any case above, we can use `smaller_indices` and `larger_indices` to distinguish which token is valid and which one is invalid
-        asc_lt_scalar(col_valid_masks[col_group], interleaved_indices, s_kv, full_mask);
-    }
 
-    // Create a mask whose first "num valid heads in this subblock" * 2 rows are set to 1
-    vector_bool valid_rows_mask_for_row_max;
-    if constexpr (H_Q_PER_AI_CORE == 64) {
-        // MMA_M is 64. Each AIV is responsible for 32 heads, occupying all 32 * 2 lanes in SIMD reg (*2 since every row-max is repeated twice)
-        valid_rows_mask_for_row_max = full_mask;
-    } else if constexpr (H_Q_PER_AI_CORE == 32) {
-        // MMA_M is 32. Each AIV is responsible for 16 heads, occupying the first 16 * 2 = 32 lanes in SIMD reg
-        valid_rows_mask_for_row_max = asc_create_mask_b32(PAT_VL32);
-    } else {
-        uint32_t my_subblock_start_head_idx = subblock_idx * MMA_M_PER_V;
-        uint32_t num_valid_heads = H_Q_PER_AI_CORE >= my_subblock_start_head_idx ? H_Q_PER_AI_CORE - my_subblock_start_head_idx : 0u;
-        num_valid_heads = min(num_valid_heads, MMA_M_PER_V);
-        vector_int32_t arange_vec;
-        asc_arange(arange_vec, 0);
-        asc_lt_scalar(valid_rows_mask_for_row_max, arange_vec, 2 * num_valid_heads, full_mask);
-    }
-
-    __ubuf__ float* cur_p_ptr = ub_buf.p;
     __ubuf__ float* cur_row_max_ptr = ub_buf.row_max[job_idx&1];
-    static_assert(MMA_M_PER_V % 4 == 0);
-    #pragma unroll 1
-    for (uint16_t start_row = 0; start_row < MMA_M_PER_V / 4; start_row += 1) {
-        vector_float cur_rows_max;
+
+    // Merge the row max of this KV block with the row max of the previous KV blocks
+    vector_float cur_rows_max[NUM_ROW_GROUPS];
+    #pragma unroll
+    for (uint32_t rg = 0; rg < NUM_ROW_GROUPS; ++rg) {
         if constexpr (IS_BLOCK0) {
-            asc_duplicate_scalar(cur_rows_max, std::numeric_limits<float>::lowest());
+            asc_duplicate_scalar(cur_rows_max[rg], std::numeric_limits<float>::lowest());
         } else {
-            vlds(cur_rows_max, ub_buf.row_max[job_idx&1], start_row*8, E2B_B32);
+            asc_loadalign_brc_elem2datablock(cur_rows_max[rg], ub_buf.row_max[job_idx&1], rg*8);
         }
+    }
 
+    // Iterate the column groups in the outer loop so that the two column-valid masks of a group are computed only once per group.
+    // Every chunk of P is visited exactly once and in ascending address order (chunk (col_group, rg) resides at 128 * (4 * col_group + rg))
+    #pragma unroll
+    for (uint32_t col_group = 0; col_group < NUM_COL_GROUPS; ++col_group) {
+        __ubuf__ float* cur_p_ptr = ub_buf.p + 2*NUM_FLOAT_IN_VEC*NUM_ROW_GROUPS*col_group;
+        vector_bool col_valid_even, col_valid_odd;
+        {
+            vector_uint32_t smaller_indices, larger_indices;
+            asc_loadalign_brc_datablock(smaller_indices, cur_smaller_indices_ptr, col_group*8);
+            asc_loadalign_brc_datablock(larger_indices, cur_larger_indices_ptr, col_group*8);
+            // For each pair of indices, there are three cases:
+            //  1) Both indices are valid. Token with smaller index will be placed at position 0 and token with larger index will be placed at position 1
+            //  2) One index is valid and the other one is invalid. The valid token will be placed at position 0
+            //  3) Both indices are invalid
+            // In any case above, we can use `smaller_indices` and `larger_indices` to distinguish which token is valid and which one is invalid
+            asc_lt_scalar(col_valid_even, smaller_indices, s_kv, full_mask);
+            asc_lt_scalar(col_valid_odd, larger_indices, s_kv, full_mask);
+        }
         #pragma unroll
-        for (uint16_t col = 0; col < B_TOPK/FRACTAL_W; col += 1) {
-            vector_float p;
-            asc_loadalign_postupdate(
-                p,
-                cur_p_ptr,
-                col+1 == B_TOPK/FRACTAL_W ? -(B_TOPK/FRACTAL_W-1)*(MMA_M_PER_V*FRACTAL_W)+(4*FRACTAL_W) : MMA_M_PER_V * FRACTAL_W
-            );
-            vmax(cur_rows_max, cur_rows_max, p, col_valid_masks[col], MODE_MERGING);    // vmax with MODE_MERGING retains the original value of `dst` if one position is being masked-off
+        for (uint32_t rg = 0; rg < NUM_ROW_GROUPS; ++rg) {
+            vector_float p_even, p_odd;
+            asc_loadalign_deintlv(p_even, p_odd, cur_p_ptr, 2*NUM_FLOAT_IN_VEC*rg);
+            // vmax with MODE_MERGING retains the original value of `dst` if one position is being masked-off
+            vmax(cur_rows_max[rg], cur_rows_max[rg], p_even, col_valid_even, MODE_MERGING);
+            vmax(cur_rows_max[rg], cur_rows_max[rg], p_odd, col_valid_odd, MODE_MERGING);
         }
+    }
 
-        // Use `asc_reduce_max_datablock` to reduce among every 8 elements, and then use `deintlv` and another `asc_max` to reduce adjacent 2 elements
-        asc_reduce_max_datablock(cur_rows_max, cur_rows_max, full_mask);
-        vector_float datablockwise_max_lo8, datablockwise_max_hi8;
-        asc_deintlv(datablockwise_max_lo8, datablockwise_max_hi8, cur_rows_max, cur_rows_max);
-        asc_max(cur_rows_max, datablockwise_max_lo8, datablockwise_max_hi8, full_mask);
-        // NOTE: dst0 and dst1 of `asc_intlv` must NOT be the same register; otherwise the writeback of dst1 clobbers dst0
-        vector_float intlv_lo, intlv_hi;
-        asc_intlv(intlv_lo, intlv_hi, cur_rows_max, cur_rows_max);
-
-        // Now intlv_lo[0~1] is the maximum of the 0th row, intlv_lo[2~3] is the maximum of the 1th row ...
-        asc_storealign_postupdate(
-            cur_row_max_ptr,
-            intlv_lo,
-            4 * 2,   // 4 rows, 2 replicas per row
-            vl8_mask
-        );
+    #pragma unroll
+    for (uint32_t rg = 0; rg < NUM_ROW_GROUPS; ++rg) {
+        asc_reduce_max_datablock(cur_rows_max[rg], cur_rows_max[rg], full_mask);
+        asc_storealign(cur_row_max_ptr, cur_rows_max[rg], rg*8, vl8_mask);
     }
 
     asc_mem_bar(VST_VLD);
 
-    vector_float cur_scales;
     if constexpr (not IS_BLOCK0) {
         [[maybe_unused]] vector_float sm_scale_div_rms;
         if constexpr (HAVE_Q_NORM) {
@@ -707,6 +687,22 @@ __simd_vf__ void Kernel<CONFIG>::softmax_vf(__ubuf__ UnifiedBufferMemoryPlan& ub
             asc_mul(row_max_max_delta, row_max_max_delta, sm_scale_div_rms, full_mask);
         } else {
             asc_mul_scalar(row_max_max_delta, row_max_max_delta, sm_scale, full_mask);
+        }
+        // Create a mask whose first "num valid heads in this subblock" lanes are set to 1
+        vector_bool valid_rows_mask_for_row_max;
+        if constexpr (H_Q_PER_AI_CORE == 64) {
+            // MMA_M is 64. Each AIV is responsible for 32 heads, occupying the first 32 lanes in SIMD reg
+            valid_rows_mask_for_row_max = asc_create_mask_b32(PAT_VL32);
+        } else if constexpr (H_Q_PER_AI_CORE == 32) {
+            // MMA_M is 32. Each AIV is responsible for 16 heads, occupying the first 16 lanes in SIMD reg
+            valid_rows_mask_for_row_max = asc_create_mask_b32(PAT_VL16);
+        } else {
+            uint32_t my_subblock_start_head_idx = subblock_idx * MMA_M_PER_V;
+            uint32_t num_valid_heads = H_Q_PER_AI_CORE >= my_subblock_start_head_idx ? H_Q_PER_AI_CORE - my_subblock_start_head_idx : 0u;
+            num_valid_heads = min(num_valid_heads, MMA_M_PER_V);
+            vector_int32_t arange_vec;
+            asc_arange(arange_vec, 0);
+            asc_lt_scalar(valid_rows_mask_for_row_max, arange_vec, num_valid_heads, full_mask);
         }
         asc_reduce_max(row_max_max_delta, row_max_max_delta, valid_rows_mask_for_row_max);
         asc_duplicate(row_max_max_delta, row_max_max_delta, full_mask);    // The maximum of {new_rows_max[i] - old_row_max_for_o[i] | i = 0...MMA_M_PER_V-1} is broadcasted to every number in `row_max_max_delta`
@@ -738,95 +734,93 @@ __simd_vf__ void Kernel<CONFIG>::softmax_vf(__ubuf__ UnifiedBufferMemoryPlan& ub
         asc_mem_bar(VST_VLD);
     }
 
-    cur_p_ptr = ub_buf.p;
     __ubuf__ float* cur_row_sum_ptr = ub_buf.row_sum[job_idx&1];
     __ubuf__ float* cur_row_max_for_o_ptr = ub_buf.row_max_for_o[job_idx&1];
     __ubuf__ float* cur_row_sum_rescale_ptr = ub_buf.row_rescale_factor[job_idx&1][kv_block_idx&1];
     [[maybe_unused]] __ubuf__ float* cur_sm_scale_div_rms_ptr = ub_buf.sm_scale_div_rms[job_idx % NUM_SM_SCALE_DIV_RMS_BUFS];
-    static_assert(MMA_M_PER_V % 8 == 0);
-    #pragma unroll 1    // Don't unroll to reduce code size, which prevents VF's ICache miss
-    for (uint32_t start_row = 0; start_row < MMA_M_PER_V; start_row += 8) {
-        vector_float cur_rows_max_for_o[2], cur_rows_sum[2];
-        [[maybe_unused]] vector_float cur_sm_scale_div_rms[2];
-        #pragma unroll
-        for (uint32_t i = 0; i < 2; ++i) {
-            asc_loadalign_brc_elem2datablock_postupdate(cur_rows_max_for_o[i], cur_row_max_for_o_ptr, 8);
-            if constexpr (HAVE_Q_NORM) {
-                asc_loadalign_brc_elem2datablock_postupdate(cur_sm_scale_div_rms[i], cur_sm_scale_div_rms_ptr, 8);
-                asc_mul(cur_rows_max_for_o[i], cur_rows_max_for_o[i], cur_sm_scale_div_rms[i], full_mask);
-            } else {
-                asc_mul_scalar(cur_rows_max_for_o[i], cur_rows_max_for_o[i], sm_scale, full_mask);
-            }
+    static constexpr uint32_t S_GROUP_STRIDE = 2*MMA_M_PER_V*FRACTAL_W;
+    __ubuf__ bf16* cur_s_base_ptr = (__ubuf__ bf16*)ub_buf.p;
+    // The per-row values (row max for O, old row sum) are the same for all column groups, and the column-valid
+    // masks only depend on the column group. So instead of `rg` outer / `col_group` inner we iterate
+    // `col_group` outer / `rg` inner: each pair of column-valid masks is then computed once per column group
+    // instead of once per (row group, column group). The per-row values therefore have to stay live in
+    // registers across the column groups, and the inner `rg` loop must be fully unrolled because the arrays
+    // can only be indexed by a compile-time constant.
+    vector_float cur_rows_max_for_o[NUM_ROW_GROUPS];
+    vector_float cur_rows_sum[NUM_ROW_GROUPS];
+    [[maybe_unused]] vector_float cur_sm_scale_div_rms[NUM_ROW_GROUPS];
+    #pragma unroll
+    for (uint32_t rg = 0; rg < NUM_ROW_GROUPS; ++rg) {
+        uint32_t start_row = rg * 8;
+
+        // All per-row values hold one float per head: element-to-datablock gives the 8 rows x 8 lanes layout of P directly
+        asc_loadalign_brc_elem2datablock(cur_rows_max_for_o[rg], cur_row_max_for_o_ptr, start_row);
+        if constexpr (HAVE_Q_NORM) {
+            asc_loadalign_brc_elem2datablock(cur_sm_scale_div_rms[rg], cur_sm_scale_div_rms_ptr, start_row);
+            asc_mul(cur_rows_max_for_o[rg], cur_rows_max_for_o[rg], cur_sm_scale_div_rms[rg], full_mask);
+        } else {
+            asc_mul_scalar(cur_rows_max_for_o[rg], cur_rows_max_for_o[rg], sm_scale, full_mask);
         }
 
         if constexpr (IS_BLOCK0) {
-            asc_duplicate_scalar(cur_rows_sum[0], 0);
-            asc_duplicate_scalar(cur_rows_sum[1], 0);
+            asc_duplicate_scalar(cur_rows_sum[rg], 0);
         } else {
-            #pragma unroll
-            for (uint32_t i = 0; i < 2; ++i) {
-                vector_float row_sum_rescale;
-                asc_loadalign(cur_rows_sum[i], cur_row_sum_ptr, i*NUM_FLOAT_IN_VEC);
-                asc_loadalign_brc_elem2datablock_postupdate(row_sum_rescale, cur_row_sum_rescale_ptr, 8);
-                asc_mul(cur_rows_sum[i], cur_rows_sum[i], row_sum_rescale, full_mask);
-            }
+            asc_loadalign(cur_rows_sum[rg], cur_row_sum_ptr, rg*NUM_FLOAT_IN_VEC);
+            vector_float row_sum_rescale;
+            asc_loadalign_brc_elem2datablock(row_sum_rescale, cur_row_sum_rescale_ptr, start_row);
+            asc_mul(cur_rows_sum[rg], cur_rows_sum[rg], row_sum_rescale, full_mask);
+        }
+    }
+
+    #pragma unroll 1    // Don't unroll to reduce code size, which prevents VF's ICache miss
+    for (uint32_t col_group = 0; col_group < NUM_COL_GROUPS; ++col_group) {
+        vector_bool col_valid_even, col_valid_odd;
+        {
+            vector_uint32_t smaller_indices, larger_indices;
+            asc_loadalign_brc_datablock(smaller_indices, cur_smaller_indices_ptr, col_group*8);
+            asc_loadalign_brc_datablock(larger_indices, cur_larger_indices_ptr, col_group*8);
+            asc_lt_scalar(col_valid_even, smaller_indices, s_kv, full_mask);
+            asc_lt_scalar(col_valid_odd, larger_indices, s_kv, full_mask);
         }
 
-        __ubuf__ bf16* cur_s_ptr = (__ubuf__ bf16*)ub_buf.p + start_row*FRACTAL_W;
+        __ubuf__ float* cur_p_col_ptr = ub_buf.p + col_group*(MMA_M_PER_V*FRACTAL_W);
+        __ubuf__ bf16* cur_s_col_ptr = cur_s_base_ptr + col_group*S_GROUP_STRIDE;
         #pragma unroll
-        for (uint32_t start_col = 0; start_col < B_TOPK / 16; start_col += 2) {
-            vector_float p[2][2];
-            vector_bf16 s[2][2];
-            #pragma unroll
-            for (uint32_t local_col = 0; local_col < 2; ++local_col) {
-                #pragma unroll
-                for (uint32_t local_row = 0; local_row < 2; ++local_row) {
-                    // The last load of each `start_row` iteration also rewinds the pointer to the first 4-row block of the next iteration
-                    __ubuf__ float* cur_p_ptr_bkup = cur_p_ptr;
-                    asc_loadalign_postupdate(
-                        p[local_row][local_col],
-                        cur_p_ptr,
-                        local_row == 0
-                            ? 4*FRACTAL_W
-                            : MMA_M_PER_V*FRACTAL_W - 4*FRACTAL_W
-                                + (start_col+2 == B_TOPK/16 && local_col+1 == 2
-                                    ? 8*FRACTAL_W - (B_TOPK/16)*(MMA_M_PER_V*FRACTAL_W)
-                                    : 0)
-                    );
-                    if constexpr (HAVE_Q_NORM) {
-                        asc_mul(p[local_row][local_col], p[local_row][local_col], cur_sm_scale_div_rms[local_row], full_mask);
-                    } else {
-                        asc_mul_scalar(p[local_row][local_col], p[local_row][local_col], sm_scale, full_mask);
-                    }
-                    asc_exp_sub(p[local_row][local_col], p[local_row][local_col], cur_rows_max_for_o[local_row], col_valid_masks[start_col+local_col]);
-                    asc_add(cur_rows_sum[local_row], cur_rows_sum[local_row], p[local_row][local_col], full_mask);
+        for (uint32_t rg = 0; rg < NUM_ROW_GROUPS; ++rg) {
+            uint32_t start_row = rg * 8;
 
-                    if (local_col == 0) {
-                        asc_float2bfloat16_rn(s[local_row][local_col], p[local_row][local_col], full_mask);
-                    } else {
-                        asc_float2bfloat16_rn_v2(s[local_row][local_col], p[local_row][local_col], full_mask);
-                    }
-                }
+            __ubuf__ float* cur_p_chunk_ptr = cur_p_col_ptr + start_row*FRACTAL_W;
+            __ubuf__ float* cur_p_load_ptr = cur_p_chunk_ptr;
+            vector_float p_even, p_odd;
+            asc_loadalign_deintlv_postupdate(p_even, p_odd, cur_p_load_ptr, 2*NUM_FLOAT_IN_VEC);
+            if constexpr (HAVE_Q_NORM) {
+                asc_mul(p_even, p_even, cur_sm_scale_div_rms[rg], full_mask);
+                asc_mul(p_odd, p_odd, cur_sm_scale_div_rms[rg], full_mask);
+            } else {
+                asc_mul_scalar(p_even, p_even, sm_scale, full_mask);
+                asc_mul_scalar(p_odd, p_odd, sm_scale, full_mask);
             }
-            asc_or((vector_uint16_t&)s[0][0], (vector_uint16_t&)s[0][0], (vector_uint16_t&)s[0][1], full_mask);
-            asc_or((vector_uint16_t&)s[1][0], (vector_uint16_t&)s[1][0], (vector_uint16_t&)s[1][1], full_mask);
-            asc_deintlv(s[0][0], s[1][0], s[0][0], s[1][0]);
-            asc_storealign_postupdate(
-                cur_s_ptr,
-                s[0][0],
-                2*MMA_M_PER_V*FRACTAL_W,
-                full_mask
-            );
-            asc_storealign_postupdate(
-                cur_s_ptr,
-                s[1][0],
-                2*MMA_M_PER_V*FRACTAL_W,
-                full_mask
-            );
-        }
 
-        asc_storealign_postupdate(cur_row_sum_ptr, cur_rows_sum[0], NUM_FLOAT_IN_VEC, full_mask);
-        asc_storealign_postupdate(cur_row_sum_ptr, cur_rows_sum[1], NUM_FLOAT_IN_VEC, full_mask);
+
+            vector_float p_exp_even, p_exp_odd;
+            asc_exp_sub(p_exp_even, p_even, cur_rows_max_for_o[rg], col_valid_even);
+            asc_exp_sub(p_exp_odd, p_odd, cur_rows_max_for_o[rg], col_valid_odd);
+            // Add the two tokens of every pair first, so swapping the two tokens of a pair does not change `row_sum`
+            vector_float pair_sum;
+            asc_add(pair_sum, p_exp_even, p_exp_odd, full_mask);
+            asc_add(cur_rows_sum[rg], cur_rows_sum[rg], pair_sum, full_mask);
+
+            vector_bf16 s_even, s_odd, s_bf16;
+            asc_float2bfloat16_rn(s_even, p_exp_even, full_mask);
+            asc_float2bfloat16_rn_v2(s_odd, p_exp_odd, full_mask);
+            asc_or((vector_uint16_t&)s_bf16, (vector_uint16_t&)s_even, (vector_uint16_t&)s_odd, full_mask);
+            asc_storealign(cur_s_col_ptr + start_row*FRACTAL_W, s_bf16, full_mask);
+        }
+    }
+
+    #pragma unroll
+    for (uint32_t rg = 0; rg < NUM_ROW_GROUPS; ++rg) {
+        asc_storealign(cur_row_sum_ptr, cur_rows_sum[rg], rg*NUM_FLOAT_IN_VEC, full_mask);
     }
 }
 
@@ -846,29 +840,21 @@ __simd_vf__ void Kernel<CONFIG>::add_and_scale_o_vf(__ubuf__ UnifiedBufferMemory
     #pragma unroll 1
     for (uint16_t row = 0; row < MMA_M_PER_V; row += 1) {
         vector_float cur_scale;
-        asc_loadalign_brc(cur_scale, ub_buf.row_rescale_factor[job_idx&1][kv_block_idx&1], 2*row);
+        asc_loadalign_brc(cur_scale, ub_buf.row_rescale_factor[job_idx&1][kv_block_idx&1], row);
 
         static constexpr uint32_t NUM_FLOAT_IN_VEC = 256 / sizeof(float);
         #pragma unroll
         for (uint16_t col = 0; col < OUTPUT_FRAG_D_VO / NUM_FLOAT_IN_VEC; ++col) {
+            uint32_t cur_offset = row * (uint32_t)OUTPUT_FRAG_D_VO + col * NUM_FLOAT_IN_VEC;
             vector_float new_output;
-            asc_loadalign_postupdate(
-                new_output,
-                cur_cur_output_frag_ptr,
-                NUM_FLOAT_IN_VEC
-            );
+            asc_loadalign(new_output, cur_cur_output_frag_ptr, cur_offset);
             if constexpr (PERFORM_ADD) {
                 vector_float old_output;
-                asc_loadalign(old_output, cur_output_accum_ptr);
+                asc_loadalign(old_output, cur_output_accum_ptr, cur_offset);
                 asc_add(new_output, old_output, new_output, full_mask);
             }
             asc_mul(new_output, new_output, cur_scale, full_mask);
-            asc_storealign_postupdate(
-                cur_output_accum_ptr,
-                new_output,
-                NUM_FLOAT_IN_VEC,
-                full_mask
-            );
+            asc_storealign(cur_output_accum_ptr, new_output, cur_offset, full_mask);
         }
     }
 }
@@ -878,33 +864,36 @@ template<Config CONFIG>
 __simd_vf__ void Kernel<CONFIG>::get_final_lse_and_denorm_vf(__ubuf__ UnifiedBufferMemoryPlan& ub_buf, uint32_t job_idx, float sm_scale) {
     auto full_mask = asc_create_mask_b32(PAT_ALL);
     auto b32_vl8_mask = asc_create_mask_b32(PAT_VL8);
+    // Only the first MMA_M_PER_V lanes hold one value per head
+    vector_bool row_lane_mask;
+    if constexpr (MMA_M_PER_V == 32) {
+        row_lane_mask = asc_create_mask_b32(PAT_VL32);
+    } else {
+        static_assert(MMA_M_PER_V == 16);
+        row_lane_mask = asc_create_mask_b32(PAT_VL16);
+    }
 
     __ubuf__ float* cur_row_sum_ptr = ub_buf.row_sum[job_idx&1];
     __ubuf__ float* cur_row_sum_write_back_ptr = ub_buf.row_sum[job_idx&1];
-    static_assert((MMA_M_PER_V/4) % 2 == 0);
+    static_assert(MMA_M_PER_V % 8 == 0);
     #pragma unroll 1
-    for (uint32_t i = 0; i < MMA_M_PER_V/4; i += 2) {
-        vector_float row_sum, row_sum_0, row_sum_1;
-        asc_loadalign_deintlv_postupdate(row_sum_0, row_sum_1, cur_row_sum_ptr, 2*NUM_FLOAT_IN_VEC);
-        asc_add(row_sum, row_sum_0, row_sum_1, full_mask);
+    for (uint32_t i = 0; i < MMA_M_PER_V/8; i += 1) {
+        vector_float row_sum;
+        asc_loadalign(row_sum, cur_row_sum_ptr, i*NUM_FLOAT_IN_VEC);
         asc_reduce_sum_datablock(row_sum, row_sum, full_mask);
         asc_storealign_postupdate(cur_row_sum_write_back_ptr, row_sum, 8, b32_vl8_mask);
     }
     
-    vector_float row_max, row_max_for_o, t;
+    vector_float row_max, row_max_for_o;
     asc_loadalign(row_max, ub_buf.row_max[job_idx&1]);
     asc_loadalign(row_max_for_o, ub_buf.row_max_for_o[job_idx&1]);
-    
-    asc_deintlv(row_max, t, row_max, row_max);
-    asc_deintlv(row_max_for_o, t, row_max_for_o, row_max_for_o);
 
     vector_bool is_row_all_masked;
-    asc_eq_scalar(is_row_all_masked, row_max, std::numeric_limits<float>::lowest(), full_mask);
+    asc_eq_scalar(is_row_all_masked, row_max, std::numeric_limits<float>::lowest(), row_lane_mask);
 
     if constexpr (HAVE_Q_NORM) {
         vector_float sm_scale_div_rms;
         asc_loadalign(sm_scale_div_rms, ub_buf.sm_scale_div_rms[job_idx % NUM_SM_SCALE_DIV_RMS_BUFS]);
-        asc_deintlv(sm_scale_div_rms, t, sm_scale_div_rms, sm_scale_div_rms);
         asc_mul(row_max, row_max, sm_scale_div_rms, full_mask);
         asc_mul(row_max_for_o, row_max_for_o, sm_scale_div_rms, full_mask);
     } else {
@@ -982,26 +971,20 @@ __simd_vf__ void Kernel<CONFIG>::get_final_output_vf(__ubuf__ UnifiedBufferMemor
         for (uint32_t i = 0; i < 2; ++i) {
             #pragma unroll
             for (uint32_t j = 0; j < 2; ++j) {
+                // Direct addressing is faster than postupdate
+                uint32_t cur_read_offset = row * (2*OUTPUT_FRAG_D_VO) + (i*2 + j) * NUM_FLOAT_IN_VEC;
                 vector_float output_f32;
-                asc_loadalign_postupdate(
-                    output_f32,
-                    cur_output_accum_ptr,
-                    NUM_FLOAT_IN_VEC
-                );
+                asc_loadalign(output_f32, cur_output_accum_ptr, cur_read_offset);
                 if constexpr (HAVE_PREVIOUS_OUTPUT_ACCUM) {
                     vector_float old_output;
-                    asc_loadalign_postupdate(
-                        old_output,
-                        cur_cur_output_frag_ptr,
-                        NUM_FLOAT_IN_VEC
-                    );
+                    asc_loadalign(old_output, cur_cur_output_frag_ptr, cur_read_offset);
                     asc_add(output_f32, output_f32, old_output, full_mask);
                 }
                 asc_mul(output_f32, output_f32, cur_denorm[i], full_mask);
                 if (i == 0) {
                     asc_float2bfloat16_rn(output_bf16[i][j], output_f32, full_mask);
                 } else {
-                    asc_float2bfloat16_rn_v2(output_bf16[i][j], output_f32, full_mask);    // Use `_impl` since `_v2` is marked as depreciated and I cannot find a alternative
+                    asc_float2bfloat16_rn_v2(output_bf16[i][j], output_f32, full_mask);
                 }
             }
         }
@@ -1009,18 +992,9 @@ __simd_vf__ void Kernel<CONFIG>::get_final_output_vf(__ubuf__ UnifiedBufferMemor
         asc_or((vector_uint16_t&)output_bf16[0][0], (vector_uint16_t&)output_bf16[0][0], (vector_uint16_t&)output_bf16[1][0], full_mask);   // "asc_or" is one cycle less than "asc_add"
         asc_or((vector_uint16_t&)output_bf16[0][1], (vector_uint16_t&)output_bf16[0][1], (vector_uint16_t&)output_bf16[1][1], full_mask);
         asc_deintlv(output_bf16[0][0], output_bf16[0][1], output_bf16[0][0], output_bf16[0][1]);
-        asc_storealign_postupdate(
-            cur_final_output_ptr,
-            output_bf16[0][0],
-            NUM_BF16_IN_VEC,
-            full_mask
-        );
-        asc_storealign_postupdate(
-            cur_final_output_ptr,
-            output_bf16[0][1],
-            NUM_BF16_IN_VEC,
-            full_mask
-        );
+        uint32_t cur_write_offset = row * (2*OUTPUT_FRAG_D_VO);
+        asc_storealign(cur_final_output_ptr, output_bf16[0][0], cur_write_offset, full_mask);
+        asc_storealign(cur_final_output_ptr, output_bf16[0][1], cur_write_offset + NUM_BF16_IN_VEC, full_mask);
     }
 }
 
