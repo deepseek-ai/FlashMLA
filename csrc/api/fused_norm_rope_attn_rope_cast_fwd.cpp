@@ -56,12 +56,12 @@ std::vector<Tensor> fused_norm_rope_attn_rope_cast_fwd(
     const Tensor &q,
     const Tensor &kv,
     const Tensor &indices,
-    double sm_scale,
+    double sm_scale_fp64,   // Use double since Torch's stable API only accepts double instead of float
     int64_t d_v,
     const std::optional<Tensor> &attn_sink,
     const std::optional<Tensor> &topk_length,
     bool enable_q_norm,
-    double rms_norm_eps,
+    double rms_norm_eps_fp64,
     const Tensor &token_positions,
     bool is_rope_neox_style,
     int64_t rope_dim,
@@ -73,6 +73,8 @@ std::vector<Tensor> fused_norm_rope_attn_rope_cast_fwd(
     bool round_sf,
     bool use_packed_ue8m0
 ) {
+    const float sm_scale = static_cast<float>(sm_scale_fp64);
+    const float rms_norm_eps = static_cast<float>(rms_norm_eps_fp64);
 #ifdef FLASH_MLA_IS_BUILD_ON_CUDA
     Arch arch = Arch();
     bool is_sm100f = arch.is_sm100f();
@@ -174,8 +176,8 @@ std::vector<Tensor> fused_norm_rope_attn_rope_cast_fwd(
     params.d_qk = d_qk;
     params.d_v = static_cast<int>(d_v);
     params.topk = topk;
-    params.sm_scale = static_cast<float>(sm_scale);
-    params.sm_scale_div_log2 = static_cast<float>(sm_scale * LOG_2_E);
+    params.sm_scale = sm_scale;
+    params.sm_scale_div_log2 = sm_scale * LOG_2_E;
     params.q = (bf16*)q.data_ptr();
     params.kv = (bf16*)kv.data_ptr();
     params.indices = (int*)indices.data_ptr();
@@ -195,7 +197,7 @@ std::vector<Tensor> fused_norm_rope_attn_rope_cast_fwd(
     params.stream = get_current_stream();
 
     params.enable_q_norm = enable_q_norm;
-    params.rms_norm_eps = static_cast<float>(rms_norm_eps);
+    params.rms_norm_eps = rms_norm_eps;
     params.token_positions = (uint32_t*)token_positions.data_ptr();
     params.is_rope_neox_style = is_rope_neox_style;
     params.rope_dim = static_cast<uint32_t>(rope_dim);
@@ -234,7 +236,7 @@ std::vector<Tensor> fused_norm_rope_attn_rope_cast_fwd(
 #else
     Params params = {
         s_q, s_kv, h_q, h_kv, d_qk, static_cast<int>(d_v), topk,
-        static_cast<float>(sm_scale), static_cast<float>(sm_scale * LOG_2_E),
+        sm_scale, sm_scale * LOG_2_E,
 
         (bf16*)q.data_ptr(),
         (bf16*)kv.data_ptr(),
@@ -255,7 +257,7 @@ std::vector<Tensor> fused_norm_rope_attn_rope_cast_fwd(
         get_current_stream(),
 
         enable_q_norm,
-        static_cast<float>(rms_norm_eps),
+        rms_norm_eps,
         (uint32_t*)token_positions.data_ptr(),
         is_rope_neox_style,
         static_cast<uint32_t>(rope_dim),
@@ -289,7 +291,7 @@ std::vector<Tensor> fused_norm_rope_attn_rope_cast_decode(
     const Tensor &q,        // [s_q, h_q, d_qk]
     const Tensor &kv,       // [num_blocks, page_block_size, h_kv, bytes_per_token], paged quantized KV cache
     const Tensor &indices,  // [s_q, topk]
-    double sm_scale,
+    double sm_scale_fp64,
     int64_t d_v,
     const std::optional<Tensor> &attn_sink,         // [h_q]
     const std::optional<Tensor> &topk_length,       // [s_q]
@@ -297,7 +299,7 @@ std::vector<Tensor> fused_norm_rope_attn_rope_cast_decode(
     const std::optional<Tensor> &extra_indices,     // [s_q, extra_topk]
     const std::optional<Tensor> &extra_topk_length, // [s_q]
     bool enable_q_norm,
-    double rms_norm_eps,
+    double rms_norm_eps_fp64,
     const Tensor &token_positions,  // [s_q]
     bool is_rope_neox_style,
     int64_t rope_dim,
@@ -309,6 +311,8 @@ std::vector<Tensor> fused_norm_rope_attn_rope_cast_decode(
     bool round_sf,
     bool use_packed_ue8m0
 ) {
+    const float sm_scale = static_cast<float>(sm_scale_fp64);   // the canonical API's float parameter, see csrc/api/common.h
+    const float rms_norm_eps = static_cast<float>(rms_norm_eps_fp64);   // likewise, see csrc/api/common.h
 #ifdef FLASH_MLA_IS_BUILD_ON_CUDA
     Arch arch = Arch();
     STD_TORCH_CHECK(arch.is_sm100f(), "Fused Norm + RoPE + Core Attn + RoPE + Cast (fused_norm_rope_attn_rope_cast_decode) is only supported on SM100f architectures.");
@@ -459,8 +463,8 @@ std::vector<Tensor> fused_norm_rope_attn_rope_cast_decode(
     params.h_kv = h_kv;
     params.d_qk = d_qk;
     params.d_v = static_cast<int>(d_v);
-    params.sm_scale = static_cast<float>(sm_scale);
-    params.sm_scale_div_log2 = static_cast<float>(sm_scale * LOG_2_E);
+    params.sm_scale = sm_scale;
+    params.sm_scale_div_log2 = sm_scale * LOG_2_E;
     params.num_blocks = num_blocks;
     params.page_block_size = page_block_size;
     params.topk = topk;
@@ -503,7 +507,7 @@ std::vector<Tensor> fused_norm_rope_attn_rope_cast_decode(
     params.enable_split_kv = false;     // split-KV is not supported by this kernel
 
     params.enable_q_norm = enable_q_norm;
-    params.rms_norm_eps = static_cast<float>(rms_norm_eps);
+    params.rms_norm_eps = rms_norm_eps;
     params.token_positions = (uint32_t*)token_positions.data_ptr();
     params.is_rope_neox_style = is_rope_neox_style;
     params.rope_dim = static_cast<uint32_t>(rope_dim);
@@ -556,7 +560,7 @@ std::vector<Tensor> fused_norm_rope_attn_rope_cast_decode(
 #else
     SparseAttnDecodeParams base_params = {
         1 /* b */, s_q, h_q, h_kv, d_qk, static_cast<int>(d_v),
-        static_cast<float>(sm_scale), static_cast<float>(sm_scale * LOG_2_E),
+        sm_scale, sm_scale * LOG_2_E,
         num_blocks, page_block_size, topk,
         model_type, extra_model_type,
 
@@ -594,7 +598,7 @@ std::vector<Tensor> fused_norm_rope_attn_rope_cast_decode(
         base_params,
 
         enable_q_norm,
-        static_cast<float>(rms_norm_eps),
+        rms_norm_eps,
         (uint32_t*)token_positions.data_ptr(),
         is_rope_neox_style,
         static_cast<uint32_t>(rope_dim),
