@@ -18,7 +18,7 @@ def get_current_platform() -> Platform:
     if os.path.exists("/dev/davinci_manager"):
         return Platform.ASCEND
     output = subprocess.check_output(["lspci"], text=True)
-    if "3D controller: NVIDIA Corporation Device" in output:
+    if "3D controller: NVIDIA Corporation" in output:
         return Platform.CUDA
     return Platform.CPU_ONLY
 
