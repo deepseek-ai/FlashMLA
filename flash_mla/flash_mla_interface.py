@@ -262,7 +262,9 @@ def _flash_attn_varlen_forward(
         # Make lse contiguous on seqlen dim
         lse = torch.empty(num_qo_heads, qo_total_len, device=q.device, dtype=torch.float32).T
 
-    workspace_buffer = torch.empty(32 * 1024 * 1024, dtype=torch.uint8, device=q.device)
+    # The forward operator keeps the workspace argument for ABI compatibility.
+    # All current forward kernels initialize CUTLASS with a null workspace.
+    workspace_buffer = torch.empty(0, dtype=torch.uint8, device=q.device)
     _backend.dense_prefill_fwd(
         workspace_buffer,
         q,
