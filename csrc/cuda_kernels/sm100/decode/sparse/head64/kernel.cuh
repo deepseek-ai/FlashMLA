@@ -146,7 +146,6 @@ KernelTemplate<CONFIG>
             };
 
             f(args);
-            NamedBarrier(NUM_THREADS, NamedBarriers::everyone_sync).arrive_and_wait_unaligned();
         }
     };
 
