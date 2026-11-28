@@ -186,9 +186,10 @@ sparse_decode_fwd(
     const std::optional<Tensor> &extra_indices,
     const std::optional<Tensor> &extra_topk_length,
     int64_t d_v,
-    double sm_scale,
+    double sm_scale_fp64,   // Use double since Torch's stable API only accepts double instead of float
     bool enable_batch_invariant
 ) {
+    const float sm_scale = static_cast<float>(sm_scale_fp64);
 #ifdef FLASH_MLA_IS_BUILD_ON_CUDA
     // Check the architecture
     Arch arch = Arch();
@@ -347,7 +348,7 @@ sparse_decode_fwd(
 
     SparseAttnDecodeParams params = {
         b, s_q, h_q, h_kv, d_qk, static_cast<int>(d_v),
-        static_cast<float>(sm_scale), static_cast<float>(sm_scale * LOG_2_E),
+        sm_scale, sm_scale * LOG_2_E,
         num_blocks, page_block_size, topk,
         model_type, extra_model_type,
 

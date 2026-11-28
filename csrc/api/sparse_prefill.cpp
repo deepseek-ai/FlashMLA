@@ -85,11 +85,12 @@ static std::vector<Tensor> sparse_prefill_fwd(
     const Tensor &q,
     const Tensor &kv,
     const Tensor &indices,
-    double sm_scale,
+    double sm_scale_fp64,   // Use double since Torch's stable API only accepts double instead of float
     int64_t d_v,
     const std::optional<Tensor> &attn_sink,
     const std::optional<Tensor> &topk_length
 ) {
+    const float sm_scale = static_cast<float>(sm_scale_fp64);
 #ifdef FLASH_MLA_IS_BUILD_ON_CUDA
     Arch arch = Arch();
     STD_TORCH_CHECK(arch.is_sm100f(), "Sparse Attention Prefill Kernel (sparse_prefill_fwd) is only supported on SM100f architectures.");
@@ -148,7 +149,7 @@ static std::vector<Tensor> sparse_prefill_fwd(
 
     SparseAttnFwdParams params = {
         s_q, s_kv, h_q, h_kv, d_qk, static_cast<int>(d_v), topk,
-        static_cast<float>(sm_scale), static_cast<float>(sm_scale * LOG_2_E),
+        sm_scale, sm_scale * LOG_2_E,
 
         (bf16*)q.data_ptr(),
         (bf16*)kv.data_ptr(),
